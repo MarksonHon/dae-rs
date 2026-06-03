@@ -1,0 +1,19 @@
+[package]
+name = "ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+
+[features]
+default = []
+
+[lib]
+crate-type = ["lib"]
+
+# eBPF 程序需要特定编译选项
+[package.metadata.aya.build]
+# 目标架构，根据实际编译环境调整
+target = "bpfel-unknown-none"

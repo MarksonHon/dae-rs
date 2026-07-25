@@ -5,11 +5,11 @@
 //! The `run()` function is the system's main entry point, orchestrating the full
 //! startup/shutdown lifecycle.
 
+use anyhow::Context;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::signal::unix::{signal, SignalKind};
-use anyhow::Context;
+use tokio::sync::RwLock;
 
 /// Main run logic
 ///
@@ -34,7 +34,11 @@ use anyhow::Context;
 /// # Errors
 ///
 /// Failure at any stage returns [`anyhow::Error`] with context.
-pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool) -> anyhow::Result<()> {
+pub async fn run(
+    config_path: Option<PathBuf>,
+    log_level: String,
+    json_log: bool,
+) -> anyhow::Result<()> {
     // ── Phase 1: Startup banner ──
     tracing::info!("========================================");
     tracing::info!("  dae-rs v{} starting up", env!("CARGO_PKG_VERSION"));
@@ -55,8 +59,8 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
 
     // ── Phase 3: Parse configuration ──
     tracing::info!("Parsing configuration...");
-    let config = control::Config::from_daefile(&config_content)
-        .context("Failed to parse configuration")?;
+    let config =
+        control::Config::from_daefile(&config_content).context("Failed to parse configuration")?;
 
     // ── Phase 4: Print config summary ──
     tracing::info!("Configuration loaded:");
@@ -65,7 +69,14 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
     tracing::info!("  Route table: {}", config.route_table);
     tracing::info!("  Proxy mark:  {:08x}", config.fwmark_proxy);
     tracing::info!("  Bypass mark: {:08x}", config.fwmark_bypass);
-    tracing::info!("  API enabled: {}", config.api_config.as_ref().map(|a| a.enabled).unwrap_or(false));
+    tracing::info!(
+        "  API enabled: {}",
+        config
+            .api_config
+            .as_ref()
+            .map(|a| a.enabled)
+            .unwrap_or(false)
+    );
 
     // ── Phase 4.5: Write normalized config as temp JSON ──
     if let Some(ref daefile_cfg) = config.daefile_config {
@@ -82,7 +93,7 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
     const EMBEDDED_EBPF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ebpf.o"));
     cp.embedded_ebpf = Some(EMBEDDED_EBPF);
     tracing::info!("Embedded eBPF bytecode: {} bytes", EMBEDDED_EBPF.len());
-    
+
     // Set eBPF PARAM global variable
     // This must be done after netns creation but before eBPF loading
     // We'll set it in start() after netns is created
@@ -91,7 +102,7 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
     ebpf_param.control_plane_pid = std::process::id();
     // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
     cp.ebpf_param = Some(ebpf_param);
-    
+
     let control = Arc::new(RwLock::new(cp));
 
     // Store daefile content for config reload
@@ -104,7 +115,8 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
     tracing::info!("Starting control plane...");
     {
         let mut ctrl = control.write().await;
-        ctrl.start().await
+        ctrl.start()
+            .await
             .context("Failed to start control plane")?;
     }
     tracing::info!("Control plane started successfully");
@@ -115,10 +127,8 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
         if let Some(ref api_cfg) = ctrl.config.api_config {
             if api_cfg.enabled {
                 tracing::info!("Starting API server on {}...", api_cfg.listen);
-                let handle = control::ControlPlane::start_api(
-                    control.clone(),
-                    api_cfg.clone(),
-                ).await
+                let handle = control::ControlPlane::start_api(control.clone(), api_cfg.clone())
+                    .await
                     .context("Failed to start API server")?;
                 tracing::info!("API server started");
                 Some(handle)
@@ -132,39 +142,62 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
         }
     };
 
-    // ── Phase 8: Wait for exit signal ──
-    tracing::info!("dae-rs is running. Press Ctrl+C to stop.");
+    // ── Phase 8: Wait for exit signal or SIGHUP reload ──
+    tracing::info!("dae-rs is running. Press Ctrl+C to stop, SIGHUP to reload.");
 
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
 
-    tokio::select! {
-        _ = sigint.recv() => {
-            tracing::info!("Received SIGINT, initiating graceful shutdown");
-        }
-        _ = sigterm.recv() => {
-            tracing::info!("Received SIGTERM, initiating graceful shutdown");
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT, initiating graceful shutdown");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+                break;
+            }
+            _ = sighup.recv() => {
+                tracing::info!("Received SIGHUP, reloading configuration");
+                let mut ctrl = control.write().await;
+                let content = ctrl.daefile_content.clone().unwrap_or_default();
+                match ctrl.reload_config(&content) {
+                    Ok(()) => tracing::info!("SIGHUP reload completed"),
+                    Err(e) => tracing::error!("SIGHUP reload failed: {}", e),
+                }
+            }
         }
     }
 
-    // ── Phase 9: Graceful shutdown ──
-    // 9a. Stop API server
+    // ── Phase 9: Emergency BPF hook detachment ──
+    // Detach BPF hooks FIRST so network is restored immediately, even if
+    // the rest of the shutdown process is slow or gets SIGKILL'd.
+    tracing::info!("Phase 9/10: Emergency BPF hook detachment");
+    {
+        let mut ctrl = control.write().await;
+        ctrl.detach_bpf_hooks();
+    }
+    tracing::info!("BPF hooks detached, network restored");
+
+    // ── Phase 11: Graceful shutdown ──
+    // 11a. Stop API server
     if let Some(handle) = api_handle {
         tracing::info!("Stopping API server...");
         handle.abort();
         tracing::info!("API server stopped");
     }
 
-    // 9b. Stop control plane
+    // 11b. Stop control plane
     tracing::info!("Stopping control plane...");
     {
         let mut ctrl = control.write().await;
-        ctrl.stop().await
-            .context("Failed to stop control plane")?;
+        ctrl.stop().await.context("Failed to stop control plane")?;
     }
     tracing::info!("Control plane stopped");
 
-    // ── Phase 9.5: Cleanup temp JSON files ──
+    // ── Phase 12: Cleanup temp JSON files ──
     tracing::info!("Cleaning up old temp JSON files...");
     control::cleanup_temp_json(3600); // Clean files older than 1 hour
 

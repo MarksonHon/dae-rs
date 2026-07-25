@@ -1,4 +1,4 @@
-//! TProxy 监听器 + TCP 双向转发
+//! TProxy 监听器 + TCP/UDP 双向转发
 //!
 //! 本模块实现透明代理（TProxy）功能，是代理数据路径的核心组件：
 //!
@@ -25,7 +25,8 @@
 //! # 依赖
 //!
 //! * Linux `IP_TRANSPARENT` socket 选项（需要 `CAP_NET_ADMIN` 权限）
-//! * Linux `IP_FREEBIND` socket 选项
+//! * Linux `IP_RECVORIGDSTADDR` socket 选项（用于 UDP 原始目标地址获取）
+//! * Linux `SO_REUSEADDR` 和 `SO_REUSEPORT` socket 选项
 //!
 //! # 安全性
 //!
@@ -34,14 +35,14 @@
 //! * 错误不应导致整个监听器崩溃
 
 use anyhow::{Context, Result};
-use protocols::OutboundDialer;
 use protocols::socks5::Socks5Dialer;
+use protocols::OutboundDialer;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
@@ -54,10 +55,42 @@ use tracing::{debug, error, info, warn};
 /// 需要 `CAP_NET_ADMIN` 权限。
 const IP_TRANSPARENT: libc::c_int = 19;
 
+/// `IPV6_TRANSPARENT` socket 选项值（Linux）
+///
+/// IPv6 版本的 IP_TRANSPARENT，使 IPv6 socket 能透明地接受非本机地址的连接。
+const IPV6_TRANSPARENT: libc::c_int = 75;
+
 /// `IP_FREEBIND` socket 选项值（Linux）
 ///
 /// 允许 socket 绑定到当前不存在的 IP 地址，在动态 IP 环境下有用。
 const IP_FREEBIND: libc::c_int = 15;
+
+/// `IP_RECVORIGDSTADDR` socket 选项值（Linux）
+///
+/// 使 socket 在收到数据包时，通过辅助数据（cmsg）返回原始目标地址。
+/// 这是 UDP TProxy 获取原始目标地址的关键机制。
+const IP_RECVORIGDSTADDR: libc::c_int = 20;
+
+/// `IPV6_RECVORIGDSTADDR` socket 选项值（Linux）
+///
+/// IPv6 版本的 IP_RECVORIGDSTADDR。
+const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
+
+/// `SO_REUSEADDR` socket 选项值（Linux）
+///
+/// 允许重用处于 TIME_WAIT 状态的 socket 地址。
+const SO_REUSEADDR: libc::c_int = 2;
+
+/// `SO_REUSEPORT` socket 选项值（Linux）
+///
+/// 允许多个 socket 绑定到相同的端口，实现负载均衡。
+const SO_REUSEPORT: libc::c_int = 15;
+
+/// `SO_MARK` socket 选项值（Linux）
+///
+/// 设置 socket 的 fwmark，用于策略路由和 eBPF 程序识别自身流量。
+/// 原版 dae 使用 0x100 作为内部 socket 标记。
+const SO_MARK: libc::c_int = 36;
 
 // ============================================================================
 // TproxyListener
@@ -93,6 +126,10 @@ pub struct TproxyListener {
     dialer: Arc<RwLock<Socks5Dialer>>,
     /// 运行标记
     running: Arc<AtomicBool>,
+    /// socket 标记值（用于 eBPF 自排除，默认 0x100）
+    socket_mark: u32,
+    /// 停止信号（通知 accept 循环退出，无需轮询）
+    stop_signal: Arc<Notify>,
 }
 
 impl TproxyListener {
@@ -107,6 +144,19 @@ impl TproxyListener {
             listen_addr,
             dialer: Arc::new(RwLock::new(dialer)),
             running: Arc::new(AtomicBool::new(false)),
+            socket_mark: 0x100, // 原版 dae 默认值
+            stop_signal: Arc::new(Notify::new()),
+        }
+    }
+
+    /// 创建新的 TProxy 监听器，指定 socket 标记值
+    pub fn new_with_mark(listen_addr: SocketAddr, dialer: Socks5Dialer, socket_mark: u32) -> Self {
+        Self {
+            listen_addr,
+            dialer: Arc::new(RwLock::new(dialer)),
+            running: Arc::new(AtomicBool::new(false)),
+            socket_mark,
+            stop_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -130,14 +180,162 @@ impl TproxyListener {
         self.running.clone()
     }
 
-    /// 启动 TProxy 监听循环
+    /// 创建并绑定 TProxy listening socket，设置 IP_TRANSPARENT、SO_REUSEADDR、
+    /// SO_REUSEPORT、IP_RECVORIGDSTADDR 和 SO_MARK。
+    ///
+    /// 返回已配置的 TcpListener 句柄。
+    pub async fn bind(&self) -> Result<TcpListener> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::os::unix::io::AsRawFd;
+
+        let is_ipv6 = self.listen_addr.is_ipv6();
+
+        // 创建 socket2 socket，先设置选项再 bind
+        let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .context("Failed to create TProxy socket")?;
+
+        let one: libc::c_int = 1;
+        let fd = socket.as_raw_fd();
+
+        // IPv6: 设置 IPV6_V6ONLY=0 以启用双栈（在 bind 前设置）
+        if is_ipv6 {
+            let zero: libc::c_int = 0;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IPV6,
+                    libc::IPV6_V6ONLY,
+                    &zero as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        // 设置 SO_REUSEADDR
+        socket.set_reuse_address(true)?;
+
+        // 设置 SO_REUSEPORT
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+
+        // 设置 IP_TRANSPARENT / IPV6_TRANSPARENT
+        if is_ipv6 {
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IPV6,
+                    IPV6_TRANSPARENT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        } else {
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    IP_TRANSPARENT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        // 设置 IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR
+        if is_ipv6 {
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IPV6,
+                    IPV6_RECVORIGDSTADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        } else {
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    IP_RECVORIGDSTADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        // 设置 SO_MARK
+        if self.socket_mark != 0 {
+            let mark_val = self.socket_mark as libc::c_int;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    SO_MARK,
+                    &mark_val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
+        // 绑定地址
+        let sock_addr = socket2::SockAddr::from(self.listen_addr);
+        socket.bind(&sock_addr).with_context(|| {
+            format!(
+                "Failed to bind TProxy socket to {} (port may be in use)",
+                self.listen_addr
+            )
+        })?;
+
+        socket.listen(128)?;
+
+        // 转换为 tokio TcpListener
+        let std_listener: std::net::TcpListener = socket.into();
+        std_listener.set_nonblocking(true)?;
+
+        let listener = TcpListener::from_std(std_listener)
+            .context("Failed to convert to tokio TcpListener")?;
+
+        info!(
+            addr = %self.listen_addr,
+            is_ipv6 = is_ipv6,
+            socket_mark = self.socket_mark,
+            "TProxy socket bound successfully"
+        );
+
+        Ok(listener)
+    }
+
+    /// 启动 accept 循环（不执行 bind）。
+    ///
+    /// 使用预先绑定好的 `listener` 运行 accept 循环，直到 [`stop()`](TproxyListener::stop) 被调用。
+    pub async fn serve(&self, listener: TcpListener) -> Result<()> {
+        self.running.store(true, Ordering::SeqCst);
+        let proxy_addr = self
+            .dialer
+            .try_read()
+            .map(|d| d.proxy_addr.to_string())
+            .unwrap_or_else(|_| "locked".to_string());
+        info!(
+            listen_addr = %self.listen_addr,
+            proxy_addr = %proxy_addr,
+            "TProxy listener started"
+        );
+
+        self.run_accept_loop(listener).await
+    }
+
+    /// 启动 TProxy 监听循环（bind + accept 两步合一，兼容旧调用者）。
     ///
     /// # 流程
     ///
     /// 1. 创建 `TcpListener` 绑定到 [`listen_addr`](TproxyListener::listen_addr)
     /// 2. 设置 socket 选项：
     ///    - `IP_TRANSPARENT`（需要 `CAP_NET_ADMIN`）— 透明接受非本机地址连接
-    ///    - `IP_FREEBIND` — 允许绑定到不存在的 IP 地址
+    ///    - `SO_REUSEADDR` — 允许重用 TIME_WAIT 状态的地址
+    ///    - `SO_REUSEPORT` — 允许多个 socket 绑定到相同端口
+    ///    - `IP_RECVORIGDSTADDR` — 用于 UDP 原始目标地址获取
     /// 3. 进入 accept 循环
     /// 4. 每个连接到来时，`tokio::spawn` 一个 [`handle_connection`] 任务
     /// 5. 检查运行标记，收到停止信号时退出循环
@@ -147,34 +345,12 @@ impl TproxyListener {
     /// * 如果端口被占用，返回 `std::io::Error`
     /// * 如果没有 `CAP_NET_ADMIN` 权限，设置 `IP_TRANSPARENT` 时返回 `EPERM`
     pub async fn start(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.listen_addr)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to bind TProxy listener to {} (port may be in use)",
-                    self.listen_addr
-                )
-            })?;
+        let listener = self.bind().await?;
+        self.serve(listener).await
+    }
 
-        // 设置 IP_TRANSPARENT 和 IP_FREEBIND socket 选项
-        set_tproxy_socket_opts(&listener).context(format!(
-            "Failed to set TProxy socket options on {} (CAP_NET_ADMIN required)",
-            self.listen_addr
-        ))?;
-
-        self.running.store(true, Ordering::SeqCst);
-        let proxy_addr = self.dialer.try_read().map(|d| d.proxy_addr.to_string())
-            .unwrap_or_else(|_| "locked".to_string());
-        info!(
-            listen_addr = %self.listen_addr,
-            proxy_addr = %proxy_addr,
-            "TProxy listener started"
-        );
-
-        // accept 检查间隔：每 500ms 醒来检查 running 标志，实现可取消的阻塞 accept
-        const ACCEPT_POLL_INTERVAL: std::time::Duration =
-            std::time::Duration::from_millis(500);
-
+    /// Accept 循环核心（内部使用）
+    async fn run_accept_loop(&self, listener: TcpListener) -> Result<()> {
         loop {
             // 检查运行标记，用于优雅停止
             if !self.running.load(Ordering::SeqCst) {
@@ -185,51 +361,55 @@ impl TproxyListener {
                 break;
             }
 
-            // 使用 tokio::time::timeout 使 accept 可中断：
-            // - 正常 accept 到连接 → 处理连接
-            // - 超时（无连接到达）→ 回到循环顶部检查 running 标志
+            // 使用 tokio::select! 同时等待 accept 和停止信号：
+            // - accept 到连接 → 处理连接
+            // - 收到停止信号 → 立即退出循环
             // - accept 错误 → 短暂休眠后重试
-            match tokio::time::timeout(ACCEPT_POLL_INTERVAL, listener.accept()).await {
-                Ok(Ok((stream, peer_addr))) => {
-                    debug!(
-                        peer_addr = %peer_addr,
-                        listen_addr = %self.listen_addr,
-                        "Accepted new TCP connection"
-                    );
-                    let dialer = self.dialer.clone();
-                    tokio::spawn(async move {
-                        let start = std::time::Instant::now();
-                        if let Err(e) = handle_connection(stream, dialer).await {
-                            error!(
-                                peer_addr = %peer_addr,
-                                elapsed_ms = %start.elapsed().as_millis(),
-                                error = %e,
-                                "Connection handling failed"
-                            );
-                        } else {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer_addr)) => {
                             debug!(
                                 peer_addr = %peer_addr,
-                                elapsed_ms = %start.elapsed().as_millis(),
-                                "Connection completed successfully"
+                                listen_addr = %self.listen_addr,
+                                "Accepted new TCP connection"
                             );
+                            let dialer = self.dialer.clone();
+                            tokio::spawn(async move {
+                                let start = std::time::Instant::now();
+                                if let Err(e) = handle_connection(stream, dialer).await {
+                                    error!(
+                                        peer_addr = %peer_addr,
+                                        elapsed_ms = %start.elapsed().as_millis(),
+                                        error = %e,
+                                        "Connection handling failed"
+                                    );
+                                } else {
+                                    debug!(
+                                        peer_addr = %peer_addr,
+                                        elapsed_ms = %start.elapsed().as_millis(),
+                                        "Connection completed successfully"
+                                    );
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            error!(
+                                listen_addr = %self.listen_addr,
+                                error = %e,
+                                "Failed to accept connection"
+                            );
+                            // 短暂休眠避免空转
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
                 }
-                Ok(Err(e)) => {
-                    error!(
+                _ = self.stop_signal.notified() => {
+                    info!(
                         listen_addr = %self.listen_addr,
-                        error = %e,
-                        "Failed to accept connection"
+                        "TProxy listener stopping via signal"
                     );
-                    // 短暂休眠避免空转
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                Err(_elapsed) => {
-                    // accept 超时（无连接到达），回到循环顶部检查 running
-                    debug!(
-                        listen_addr = %self.listen_addr,
-                        "Accept timeout, rechecking running flag"
-                    );
+                    break;
                 }
             }
         }
@@ -239,10 +419,11 @@ impl TproxyListener {
 
     /// 停止 TProxy 监听器
     ///
-    /// 设置运行标记为 `false`，监听循环将在下一次迭代中退出。
+    /// 设置运行标记为 `false`，并通过 Notify 信号立即唤醒 accept 循环。
     /// 已经建立的连接不会中断，它们会继续运行直到完成。
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.stop_signal.notify_one();
         info!(
             listen_addr = %self.listen_addr,
             "TProxy listener stop signal sent"
@@ -323,10 +504,9 @@ async fn handle_connection(
     // ---- 步骤 3：双向数据拷贝 ----
     // copy_bidirectional 会同时从 inbound 读取写入 outbound，
     // 以及从 outbound 读取写入 inbound，直到一方关闭
-    let (n_to_upstream, n_from_upstream) =
-        copy_bidirectional(&mut inbound, &mut outbound).await.context(
-            "Bidirectional data copy between client and upstream failed",
-        )?;
+    let (n_to_upstream, n_from_upstream) = copy_bidirectional(&mut inbound, &mut outbound)
+        .await
+        .context("Bidirectional data copy between client and upstream failed")?;
 
     debug!(
         target = %orig_dst,
@@ -392,81 +572,8 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     Ok(addr)
 }
 
-/// 设置 TProxy 所需的 socket 选项
-///
-/// 对 `TcpListener` 的原始 fd 设置以下 Linux 特有 socket 选项：
-///
-/// | 选项 | 值 | 说明 |
-/// |------|-----|------|
-/// | `IP_TRANSPARENT` | 19 | 透明代理模式，允许接受非本机地址的连接 |
-/// | `IP_FREEBIND` | 15 | 允许绑定到当前不存在的 IP 地址 |
-///
-/// 使用 `libc::setsockopt()` 系统调用直接设置，因为 `socket2` crate
-/// 未直接暴露这些 Linux 特有选项。
-///
-/// # 参数
-///
-/// * `listener` — TCP 监听器
-///
-/// # 错误
-///
-/// * 如果缺少 `CAP_NET_ADMIN` 权限，设置 `IP_TRANSPARENT` 时返回 `EPERM`
-fn set_tproxy_socket_opts(listener: &TcpListener) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let fd = listener.as_raw_fd();
-    let one: libc::c_int = 1;
-
-    // ---- 设置 IP_TRANSPARENT ----
-    // 允许 socket 透明地接受发往非本机 IP 地址的 TCP 连接
-    // 这是 TProxy 的核心机制
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_IP,  // IP 协议层
-            IP_TRANSPARENT, // IP_TRANSPARENT = 19
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(anyhow::Error::from(err))
-            .context("Failed to set IP_TRANSPARENT socket option (CAP_NET_ADMIN required)");
-    }
-
-    // ---- 设置 IP_FREEBIND ----
-    // 允许 socket 绑定到当前不存在的 IP 地址
-    // 在动态 IP 环境下避免 "Cannot assign requested address" 错误
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_IP, // IP 协议层
-            IP_FREEBIND,   // IP_FREEBIND = 15
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        // IP_FREEBIND 失败不会影响 TProxy 的核心功能，记录警告而非错误
-        warn!(
-            "Failed to set IP_FREEBIND socket option: {} (non-critical)",
-            err
-        );
-    } else {
-        debug!("IP_FREEBIND set successfully");
-    }
-
-    debug!(
-        "TProxy socket options configured: IP_TRANSPARENT={}, IP_FREEBIND={}",
-        true, ret == 0
-    );
-    Ok(())
-}
-
 // ============================================================================
-// 单元测试
+// Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -526,8 +633,7 @@ mod tests {
 
             // 这里无法测试 get_original_dst 因为需要真实的 TProxy 连接，
             // 但我们至少确保函数签名和基本类型正确
-            let dialer =
-                Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000);
+            let dialer = Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000);
             let tproxy = TproxyListener::new(addr, dialer);
             assert_eq!(tproxy.listen_addr(), addr);
         });
@@ -544,4 +650,500 @@ mod tests {
         assert!(debug_str.contains("15080"));
         assert!(debug_str.contains("running"));
     }
+}
+
+// ============================================================================
+// UDP TProxy 监听器
+// ============================================================================
+
+/// UDP TProxy 监听器
+///
+/// 透明代理 UDP 流量，通过 `IP_RECVORIGDSTADDR` 获取原始目标地址。
+pub struct UdpTproxyListener {
+    /// 监听地址（如 `0.0.0.0:15080` 或 `[::]:15080`）
+    listen_addr: SocketAddr,
+    /// 出站拨号器
+    dialer: Arc<RwLock<Socks5Dialer>>,
+    /// 运行标记
+    running: Arc<AtomicBool>,
+    /// socket 标记值（用于 eBPF 自排除，默认 0x100）
+    socket_mark: u32,
+}
+
+impl UdpTproxyListener {
+    /// 创建新的 UDP TProxy 监听器
+    pub fn new(listen_addr: SocketAddr, dialer: Socks5Dialer) -> Self {
+        Self {
+            listen_addr,
+            dialer: Arc::new(RwLock::new(dialer)),
+            running: Arc::new(AtomicBool::new(false)),
+            socket_mark: 0x100, // 原版 dae 默认值
+        }
+    }
+
+    /// 创建新的 UDP TProxy 监听器，指定 socket 标记值
+    pub fn new_with_mark(listen_addr: SocketAddr, dialer: Socks5Dialer, socket_mark: u32) -> Self {
+        Self {
+            listen_addr,
+            dialer: Arc::new(RwLock::new(dialer)),
+            running: Arc::new(AtomicBool::new(false)),
+            socket_mark,
+        }
+    }
+
+    /// 获取监听地址
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
+
+    /// 检查监听器是否正在运行
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// 创建并绑定 UDP TProxy socket
+    ///
+    /// 设置 IP_TRANSPARENT、IP_RECVORIGDSTADDR 和 SO_MARK 等 socket 选项。
+    pub async fn bind(&self) -> Result<tokio::net::UdpSocket> {
+        use std::os::unix::io::AsRawFd;
+
+        let socket = tokio::net::UdpSocket::bind(self.listen_addr)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to bind UDP TProxy listener to {} (port may be in use)",
+                    self.listen_addr
+                )
+            })?;
+
+        let fd = socket.as_raw_fd();
+        let one: libc::c_int = 1;
+
+        // 设置 IP_TRANSPARENT
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                IP_TRANSPARENT,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(anyhow::Error::from(err))
+                .context("Failed to set IP_TRANSPARENT on UDP socket (CAP_NET_ADMIN required)");
+        }
+
+        // 设置 IP_RECVORIGDSTADDR（用于获取原始目标地址）
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                IP_RECVORIGDSTADDR,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!("Failed to set IP_RECVORIGDSTADDR on UDP socket: {}", err);
+        }
+
+        // 设置 IPV6_RECVORIGDSTADDR
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_IPV6,
+                IPV6_RECVORIGDSTADDR,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!("Failed to set IPV6_RECVORIGDSTADDR on UDP socket: {}", err);
+        }
+
+        // 设置 SO_REUSEADDR
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_REUSEADDR,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!("Failed to set SO_REUSEADDR on UDP socket: {}", err);
+        }
+
+        // 设置 SO_REUSEPORT
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_REUSEPORT,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!("Failed to set SO_REUSEPORT on UDP socket: {}", err);
+        }
+
+        // 设置 SO_MARK（用于 eBPF 自排除）
+        if self.socket_mark != 0 {
+            let mark_val = self.socket_mark as libc::c_int;
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    SO_MARK,
+                    &mark_val as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    "Failed to set SO_MARK={:#x} on UDP socket: {}",
+                    self.socket_mark, err
+                );
+            } else {
+                debug!("SO_MARK={:#x} set on UDP socket", self.socket_mark);
+            }
+        }
+
+        info!(
+            "UDP TProxy socket options configured for {}",
+            self.listen_addr
+        );
+        Ok(socket)
+    }
+
+    /// 启动 UDP TProxy 监听循环
+    pub async fn start(&self) -> Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let owned_fd = self.bind().await?;
+        let fd = owned_fd.as_raw_fd();
+        // Prevent OwnedFd from closing the fd (we're handing ownership to std_socket)
+        std::mem::forget(owned_fd);
+        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+        std_socket.set_nonblocking(true)?;
+        self.running.store(true, Ordering::SeqCst);
+
+        info!(
+            listen_addr = %self.listen_addr,
+            "UDP TProxy listener started"
+        );
+
+        self.run_receive_loop(std_socket).await
+    }
+
+    /// UDP 接收循环核心 — 使用 recvmsg 获取 cmsg 以解析原始目标地址，
+    /// 并通过 SOCKS5 UDP ASSOCIATE 将数据包转发到原始目标。
+    async fn run_receive_loop(&self, socket: std::net::UdpSocket) -> Result<()> {
+        use protocols::socks5::UdpAssociateSession;
+        use std::os::unix::io::AsRawFd;
+
+        const MAX_UDP_SIZE: usize = 65535;
+        const CMSG_BUFFER_SIZE: usize = 128;
+
+        let fd = socket.as_raw_fd();
+        let dialer = self.dialer.clone();
+        let running = self.running.clone();
+
+        // Pool for reusing UDP ASSOCIATE sessions per destination
+        let pool = Arc::new(protocols::socks5::UdpEndpointPool::new());
+
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                info!("UDP TProxy listener stopping");
+                break;
+            }
+
+            // Receive one UDP packet via recvmsg (blocking, to get cmsg for original dst)
+            let mut buf = vec![0u8; MAX_UDP_SIZE];
+            let mut cmsg_buf = vec![0u8; CMSG_BUFFER_SIZE];
+
+            let result = tokio::task::spawn_blocking(move || {
+                let mut iov = libc::iovec {
+                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                    iov_len: buf.len(),
+                };
+
+                let mut msg_name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let mut msg = libc::msghdr {
+                    msg_name: &mut msg_name as *mut _ as *mut libc::c_void,
+                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
+                    msg_iov: &mut iov,
+                    msg_iovlen: 1,
+                    msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+                    msg_controllen: cmsg_buf.len() as libc::size_t,
+                    msg_flags: 0,
+                };
+
+                let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        return Ok::<_, anyhow::Error>((
+                            0usize,
+                            buf,
+                            None::<SocketAddr>,
+                            None::<SocketAddr>,
+                        ));
+                    }
+                    return Err(anyhow::anyhow!("recvmsg failed: {}", err));
+                }
+
+                let n = n as usize;
+
+                // Parse peer address (source of the intercepted packet)
+                let peer_addr = match msg.msg_namelen {
+                    0 => None,
+                    _ => {
+                        let ss_ptr = msg.msg_name as *const libc::sockaddr_storage;
+                        let storage = unsafe { &*ss_ptr };
+                        match storage.ss_family as libc::c_int {
+                            libc::AF_INET => {
+                                let addr =
+                                    unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+                                let ip =
+                                    std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+                                let port = u16::from_be_bytes(addr.sin_port.to_ne_bytes());
+                                Some(SocketAddr::new(ip.into(), port))
+                            }
+                            libc::AF_INET6 => {
+                                let addr =
+                                    unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+                                let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+                                let port = u16::from_be_bytes(addr.sin6_port.to_ne_bytes());
+                                Some(SocketAddr::new(ip.into(), port))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+
+                // Parse original destination from cmsg (TProxy metadata)
+                let orig_dst = parse_orig_dst_from_cmsg(&cmsg_buf[..msg.msg_controllen]);
+
+                buf.truncate(n);
+                Ok((n, buf, peer_addr, orig_dst))
+            })
+            .await??;
+
+            let (n, mut pkt_buf, peer_addr, orig_dst) = result;
+
+            if n == 0 {
+                // WouldBlock
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+
+            let dest = match orig_dst {
+                Some(dst) => dst,
+                None => {
+                    warn!(
+                        "UDP TProxy: cannot determine original dest, peer={:?}",
+                        peer_addr
+                    );
+                    continue;
+                }
+            };
+
+            debug!(
+                peer = ?peer_addr,
+                dest = %dest,
+                bytes = n,
+                "UDP TProxy: forwarding packet"
+            );
+
+            // Spawn a task to forward this UDP packet via SOCKS5 and get response.
+            // Each task manages its own UDP ASSOCIATE session lifecycle.
+            let pool = pool.clone();
+            let dialer = dialer.clone();
+            let running = running.clone();
+            let dest_str = dest.to_string();
+
+            tokio::spawn(async move {
+                let d = dialer.read().await;
+                let target = &dest_str;
+
+                // Get or create a UDP ASSOCIATE session for this destination
+                let session_result = pool.get_or_create(target, &d).await;
+                let session = match session_result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("UDP ASSOCIATE failed for {}: {}", target, e);
+                        pool.remove(target).await;
+                        return;
+                    }
+                };
+
+                // Build SOCKS5 UDP request: header + payload
+                let header = UdpAssociateSession::build_udp_request_header(&dest, pkt_buf.len());
+                let mut send_buf = header;
+                send_buf.extend_from_slice(&pkt_buf);
+
+                // Send via the relay socket
+                let mut sess = session.lock().await;
+                if let Err(e) = sess.udp.send(&send_buf).await {
+                    warn!("UDP send to relay failed: {}", e);
+                    pool.remove(target).await;
+                    return;
+                }
+
+                // Try to read one response with a short timeout
+                let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
+                let read_fut = sess.udp.recv(&mut recv_buf);
+                match tokio::time::timeout(std::time::Duration::from_secs(5), read_fut).await {
+                    Ok(Ok(len)) => {
+                        recv_buf.truncate(len);
+                        // Parse SOCKS5 UDP response header to extract payload
+                        if let Some((_resp_peer, payload_offset)) =
+                            UdpAssociateSession::parse_udp_response_header(&recv_buf)
+                        {
+                            let payload = &recv_buf[payload_offset..];
+                            // Send response back to original client.
+                            // Open a temporary UDP socket to send the response.
+                            // We don't need IP_TRANSPARENT for sending — the client
+                            // just needs to receive the response data.
+                            if let Some(peer) = peer_addr {
+                                if let Ok(resp_sock) =
+                                    tokio::net::UdpSocket::bind(if peer.is_ipv4() {
+                                        "0.0.0.0:0"
+                                    } else {
+                                        "[::]:0"
+                                    })
+                                    .await
+                                {
+                                    if let Err(e) = resp_sock.send_to(payload, peer).await {
+                                        debug!("UDP response send failed: {}", e);
+                                    } else {
+                                        debug!("UDP response: {} bytes -> {}", payload.len(), peer,);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        debug!("UDP recv from relay: {}", e);
+                    }
+                    Err(_) => {
+                        // Timeout — this is normal, especially for DNS
+                        debug!("UDP relay response timeout for {}", dest);
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// 停止 UDP TProxy 监听器
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        info!("UDP TProxy listener stop signal sent");
+    }
+}
+
+/// 从辅助数据（cmsg/oob）中解析原始目标地址
+///
+/// 这是 UDP TProxy 获取原始目标地址的关键函数。当设置了 `IP_RECVORIGDSTADDR` 后，
+/// 内核会在 recvmsg 的辅助数据中返回数据包的原始目标地址。
+///
+/// # 参数
+///
+/// * `cmsg_data` — 辅助数据（cmsg）缓冲区
+///
+/// # 返回
+///
+/// 如果成功解析到原始目标地址，返回 `Some(SocketAddr)`。
+pub fn parse_orig_dst_from_cmsg(cmsg_data: &[u8]) -> Option<SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let mut offset = 0;
+    while offset + 16 <= cmsg_data.len() {
+        // 解析 cmsg 头部
+        // struct cmsghdr {
+        //     size_t cmsg_len;    // 8 bytes (64-bit)
+        //     int    cmsg_level;  // 4 bytes
+        //     int    cmsg_type;   // 4 bytes
+        //     // data follows...
+        // }
+        let cmsg_len = u64::from_ne_bytes([
+            cmsg_data[offset],
+            cmsg_data[offset + 1],
+            cmsg_data[offset + 2],
+            cmsg_data[offset + 3],
+            cmsg_data[offset + 4],
+            cmsg_data[offset + 5],
+            cmsg_data[offset + 6],
+            cmsg_data[offset + 7],
+        ]) as usize;
+
+        let cmsg_level = i32::from_ne_bytes([
+            cmsg_data[offset + 8],
+            cmsg_data[offset + 9],
+            cmsg_data[offset + 10],
+            cmsg_data[offset + 11],
+        ]);
+
+        let cmsg_type = i32::from_ne_bytes([
+            cmsg_data[offset + 12],
+            cmsg_data[offset + 13],
+            cmsg_data[offset + 14],
+            cmsg_data[offset + 15],
+        ]);
+
+        // 检查是否为 IP_RECVORIGDSTADDR 或 IPV6_RECVORIGDSTADDR
+        if cmsg_level == libc::SOL_IP && cmsg_type == IP_RECVORIGDSTADDR {
+            // IPv4: 数据是 struct sockaddr_in (8 字节端口 + 4 字节 IP)
+            let data_offset = offset + 16; // 头部之后
+            if data_offset + 16 <= cmsg_data.len() {
+                // 跳过 sin_family (2 bytes) + sin_port (2 bytes)
+                let port_bytes = [cmsg_data[data_offset + 2], cmsg_data[data_offset + 3]];
+                let port = u16::from_be_bytes(port_bytes);
+
+                let ip = Ipv4Addr::new(
+                    cmsg_data[data_offset + 4],
+                    cmsg_data[data_offset + 5],
+                    cmsg_data[data_offset + 6],
+                    cmsg_data[data_offset + 7],
+                );
+
+                return Some(SocketAddr::new(ip.into(), port));
+            }
+        } else if cmsg_level == libc::SOL_IPV6 && cmsg_type == IPV6_RECVORIGDSTADDR {
+            // IPv6: 数据是 struct sockaddr_in6 (2 字节端口 + 16 字节 IP)
+            let data_offset = offset + 16;
+            if data_offset + 20 <= cmsg_data.len() {
+                let port_bytes = [cmsg_data[data_offset + 2], cmsg_data[data_offset + 3]];
+                let port = u16::from_be_bytes(port_bytes);
+
+                let mut ip_bytes = [0u8; 16];
+                ip_bytes.copy_from_slice(&cmsg_data[data_offset + 4..data_offset + 20]);
+                let ip = Ipv6Addr::from(ip_bytes);
+
+                return Some(SocketAddr::new(ip.into(), port));
+            }
+        }
+
+        // 移动到下一个 cmsg
+        if cmsg_len == 0 {
+            break;
+        }
+        offset += cmsg_len;
+        // 对齐到 size_t 边界
+        offset = (offset + 7) & !7;
+    }
+
+    None
 }

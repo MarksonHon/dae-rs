@@ -35,7 +35,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Json},
-    routing::{get, put, post},
+    routing::{get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -137,10 +137,7 @@ impl ApiServer {
             // ── 出站组 ──
             .route("/api/v1/groups", get(groups_list_handler))
             .route("/api/v1/groups/{name}", get(group_detail_handler))
-            .route(
-                "/api/v1/groups/{name}/policy",
-                put(group_policy_handler),
-            )
+            .route("/api/v1/groups/{name}/policy", put(group_policy_handler))
             .route(
                 "/api/v1/groups/{name}/selected",
                 put(group_selected_handler),
@@ -153,16 +150,15 @@ impl ApiServer {
             .with_state(app_state)
             // ── 中间件（从外到内：CORS → 日志 → 认证 → 路由） ──
             .layer(middleware::from_fn(auth_middleware))
-            .layer(
-                tower_http::cors::CorsLayer::permissive()
-                    .allow_origin(tower_http::cors::Any),
-            )
+            .layer(tower_http::cors::CorsLayer::permissive().allow_origin(tower_http::cors::Any))
             .layer(
                 tower_http::trace::TraceLayer::new_for_http()
-                    .make_span_with(tower_http::trace::DefaultMakeSpan::new()
-                        .level(tracing::Level::INFO))
-                    .on_response(tower_http::trace::DefaultOnResponse::new()
-                        .level(tracing::Level::INFO)),
+                    .make_span_with(
+                        tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO),
+                    )
+                    .on_response(
+                        tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO),
+                    ),
             );
 
         Self { app, listen_addr }
@@ -283,16 +279,18 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, code, message) = match self {
-            ApiError::Unauthorized => {
-                (StatusCode::UNAUTHORIZED, "E_UNAUTHORIZED", "Unauthorized")
-            }
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "E_UNAUTHORIZED", "Unauthorized"),
             ApiError::NotFound(ref msg) => (StatusCode::NOT_FOUND, "E_NOT_FOUND", msg.as_str()),
-            ApiError::Unprocessable(ref msg) => {
-                (StatusCode::UNPROCESSABLE_ENTITY, "E_UNPROCESSABLE", msg.as_str())
-            }
-            ApiError::Internal(ref msg) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "E_INTERNAL", msg.as_str())
-            }
+            ApiError::Unprocessable(ref msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "E_UNPROCESSABLE",
+                msg.as_str(),
+            ),
+            ApiError::Internal(ref msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "E_INTERNAL",
+                msg.as_str(),
+            ),
         };
 
         let body = serde_json::json!({
@@ -433,8 +431,8 @@ async fn status_handler(
 
     let uptime = api_state.start_time.elapsed().as_secs();
 
-    let ebpf_loaded = control.ebpf_mgr.is_loaded();
-    let tc_attached = control.ebpf_mgr.is_attached();
+    let ebpf_loaded = control.ebpf_mgr.lock().unwrap().is_loaded();
+    let tc_attached = control.ebpf_mgr.lock().unwrap().is_attached();
 
     let mut programs = Vec::new();
     if tc_attached {
@@ -478,6 +476,8 @@ async fn metrics_handler(
     // 从 eBPF STATS_MAP 读取指标，如果 eBPF 未加载则返回零值
     let stats = control
         .ebpf_mgr
+        .lock()
+        .unwrap()
         .read_stats()
         .unwrap_or([0u64; crate::ebpf::STATS_MAP_SIZE as usize]);
 
@@ -889,53 +889,16 @@ async fn reload_handler(
 
     let mut control = api_state.control.write().await;
 
-    // Get daefile content
-    let content = control.daefile_content.as_ref()
+    // Get daefile content (clone to release the immutable borrow)
+    let content = control
+        .daefile_content
+        .clone()
         .ok_or_else(|| ApiError::Internal("No daefile content available for reload".into()))?;
 
-    // Re-parse and validate
-    let daefile_config = match crate::config::parse_daefile(content) {
-        Ok(c) => c,
-        Err(e) => return Err(ApiError::Internal(format!("Config parse failed: {}", e))),
-    };
-
-    let _ = crate::config::validate_config(&daefile_config)
-        .map_err(|e| ApiError::Internal(format!("Config validation failed: {}", e)))?;
-
-    // Extract config fields before mutable borrow of control
-    let process_exclusion = daefile_config.process_exclusion.clone();
-    let routing = daefile_config.routing.clone();
-    let outbounds = daefile_config.outbounds.clone();
-
-    // Update daefile_config in ControlPlane
-    control.daefile_config = Some(daefile_config);
-
-    // Write exclusion lists
-    if let Some(ref pe) = process_exclusion {
-        if pe.enabled {
-            if !pe.r#match.comm.is_empty() {
-                let hashes: Vec<u32> = pe.r#match.comm.iter()
-                    .map(|c| crate::ebpf::hash_comm(c))
-                    .collect();
-                let _ = control.ebpf_mgr.write_excluded_comm(&hashes);
-            }
-            if !pe.r#match.pid.is_empty() {
-                let _ = control.ebpf_mgr.write_excluded_pids(&pe.r#match.pid);
-            }
-            if !pe.r#match.tgid.is_empty() {
-                let _ = control.ebpf_mgr.write_excluded_pids(&pe.r#match.tgid);
-            }
-        }
-    }
-
-    // Write routing rules
-    if !routing.rules.is_empty() {
-        if let Ok(entries) = crate::compile_rules(&routing, &outbounds) {
-            if !entries.is_empty() {
-                let _ = control.ebpf_mgr.write_rules(&entries);
-            }
-        }
-    }
+    // Use the new hot-reload method
+    control
+        .reload_config(&content)
+        .map_err(|e| ApiError::Internal(format!("Config reload failed: {}", e)))?;
 
     info!("Config reload completed successfully via API");
 
@@ -974,7 +937,11 @@ fn collect_group_node_names(
                 }
             }
             config::NodeSelector::Regex { pattern } => {
-                let pat = if pattern == "*" { ".*" } else { pattern.as_str() };
+                let pat = if pattern == "*" {
+                    ".*"
+                } else {
+                    pattern.as_str()
+                };
                 if let Ok(re) = regex::Regex::new(pat) {
                     for name in &all_node_names {
                         if re.is_match(name) && !result.contains(&name.to_string()) {
@@ -1005,7 +972,12 @@ mod tests {
 
     /// 创建测试用的 ApiState
     fn test_state() -> ApiState {
-        let cp = ControlPlane::new(crate::Config::default());
+        let mut cp = ControlPlane::new(crate::Config::default());
+        let example = crate::config::default_config_example();
+        cp.daefile_content = Some(example.to_string());
+        if let Ok(parsed) = crate::config::parse_daefile(example) {
+            cp.daefile_config = Some(parsed);
+        }
 
         ApiState {
             control: Arc::new(RwLock::new(cp)),
@@ -1044,7 +1016,10 @@ mod tests {
             .route("/api/v1/groups", get(groups_list_handler))
             .route("/api/v1/groups/{name}", get(group_detail_handler))
             .route("/api/v1/groups/{name}/policy", put(group_policy_handler))
-            .route("/api/v1/groups/{name}/selected", put(group_selected_handler))
+            .route(
+                "/api/v1/groups/{name}/selected",
+                put(group_selected_handler),
+            )
             .route("/api/v1/routing", get(routing_handler))
             .route("/api/v1/reload", post(reload_handler))
             .with_state(app_state)
@@ -1098,10 +1073,7 @@ mod tests {
     async fn test_status_endpoint_returns_200() {
         let app = test_app_no_auth();
 
-        let response = app
-            .oneshot(authed_request("/api/v1/status"))
-            .await
-            .unwrap();
+        let response = app.oneshot(authed_request("/api/v1/status")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -1135,10 +1107,7 @@ mod tests {
     async fn test_nodes_endpoint_returns_200() {
         let app = test_app_no_auth();
 
-        let response = app
-            .oneshot(authed_request("/api/v1/nodes"))
-            .await
-            .unwrap();
+        let response = app.oneshot(authed_request("/api/v1/nodes")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -1147,10 +1116,7 @@ mod tests {
     async fn test_groups_endpoint_returns_200() {
         let app = test_app_no_auth();
 
-        let response = app
-            .oneshot(authed_request("/api/v1/groups"))
-            .await
-            .unwrap();
+        let response = app.oneshot(authed_request("/api/v1/groups")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
     }

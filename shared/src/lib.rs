@@ -117,8 +117,6 @@ pub struct ConfigMeta {
     pub generated_at: u64,
 }
 
-pub mod i18n;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,10 +141,7 @@ mod tests {
     fn test_action_serialization() {
         let direct = Action::Direct;
         let proxy = Action::Proxy("test_group".into());
-        assert_eq!(
-            serde_json::to_string(&direct).unwrap(),
-            r#""Direct""#
-        );
+        assert_eq!(serde_json::to_string(&direct).unwrap(), r#""Direct""#);
         assert_eq!(
             serde_json::to_string(&proxy).unwrap(),
             r#"{"Proxy":"test_group"}"#

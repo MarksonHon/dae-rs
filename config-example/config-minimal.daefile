@@ -4,7 +4,7 @@ global {
 }
 
 interface {
-  wan_interface: eno1
+  wan_interface: wlp3s0
   # lan_interface: eth1 docker0
   # bind_interface: auto
 }

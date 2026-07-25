@@ -24,10 +24,10 @@
 #include "headers/bpf_helpers.h"
 #include "ebpf_sync_defs.h"
 
+#define __DEBUG
 // #define __DEBUG_ROUTING
-// #define __PRINT_ROUTING_RESULT
+#define __PRINT_ROUTING_RESULT
 // #define __PRINT_SETUP_PROCESS_CONNNECTION
-// #define __DEBUG
 // #define __UNROLL_ROUTE_LOOP
 
 #ifndef __DEBUG
@@ -73,8 +73,8 @@
 
 // Param keys:
 static const __u32 zero_key;
-static const __u32 one_key = 1;
-static const __u32 two_key = 2;
+static const __u32 __attribute__((unused)) one_key = 1;
+static const __u32 __attribute__((unused)) two_key = 2;
 
 // Outbound Connectivity Map:
 
@@ -87,14 +87,6 @@ struct {
 	__type(value, __u32); // true, false
 	__uint(max_entries, 1536); // 256 outbounds * 3 domains * 2 ipversions
 } outbound_connectivity_map SEC(".maps");
-
-// Sockmap:
-struct {
-	__uint(type, BPF_MAP_TYPE_SOCKMAP);
-	__type(key, __u32); // 0 is tcp4, 1 is udp, 2 is tcp6.
-	__type(value, __u64); // fd of socket.
-	__uint(max_entries, 3);
-} listen_socket_map SEC(".maps");
 
 union ip6 {
 	__u8 u6_addr8[16];
@@ -1488,25 +1480,6 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 #undef _dscp
 }
 
-static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
-{
-	struct bpf_sock *sk;
-	const __u32 *key = &one_key;
-
-	if (l4proto == IPPROTO_TCP)
-		key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &two_key : &zero_key;
-
-	sk = bpf_map_lookup_elem(&listen_socket_map, key);
-
-	if (!sk)
-		return -1;
-
-	int ret = bpf_sk_assign(skb, sk, 0);
-
-	bpf_sk_release(sk);
-	return ret;
-}
-
 static __always_inline int redirect_to_control_plane_ingress(void)
 {
 	// bpf_redirect_peer requires kernel >= 6.8 (CVE-2025-37959 fix).
@@ -1519,7 +1492,10 @@ static __always_inline int redirect_to_control_plane_egress(void)
 {
 	// bpf_redirect_peer() is NOT supported in egress direction.
 	// Only use it for ingress hooks.
-	return bpf_redirect(PARAM.dae0_ifindex, 0);
+	int _ret = bpf_redirect(PARAM.dae0_ifindex, 0);
+	bpf_printk("redirect_to_control_plane_egress: ifindex=%u ret=%d",
+		   PARAM.dae0_ifindex, _ret);
+	return _ret;
 }
 
 static __always_inline bool
@@ -2603,17 +2579,14 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	}
 
 	if (!wan_egress_needs_control_plane(outbound, mark)) {
-#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-		bpf_printk("GO OUTBOUND_DIRECT");
-#endif
+		bpf_printk("wan_egress_tcp: DIRECT outbound=%u mark=%u", outbound, mark);
 		skb->mark = mark;
 		return TC_ACT_OK;
 	} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
-#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-		bpf_printk("SHOT OUTBOUND_BLOCK");
-#endif
+		bpf_printk("wan_egress_tcp: BLOCK outbound=%u", outbound);
 		return TC_ACT_SHOT;
 	}
+	bpf_printk("wan_egress_tcp: PROXY outbound=%u mark=%u", outbound, mark);
 
 	if (!wan_outbound_is_alive(skb, outbound, IPPROTO_TCP,
 				   tuples->five.dport))
@@ -2630,10 +2603,13 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	 * Publishing it later from userspace is too late for the first SYN path.
 	 */
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
-					   ethh, 1))
+					   ethh, 1)) {
+		bpf_printk("wan_egress_tcp: prep_redirect FAILED -> SHOT");
 		return TC_ACT_SHOT;
+	}
 	skb->cb[0] = TPROXY_MARK;
 	skb->cb[1] = tcp_listener_l4proto(tcph);
+	bpf_printk("wan_egress_tcp: REDIRECTING to control plane");
 	return redirect_to_control_plane_egress();
 }
 
@@ -2776,8 +2752,13 @@ fast_path_skip_routing:
 // Per-CPU scratch to stay under 512-byte stack limit across the call chain.
 static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
 {
-	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
+	bpf_printk("do_tproxy_wan_egress ENTER: ingress_ifindex=%d link_h_len=%u",
+		   skb->ingress_ifindex, link_h_len);
+	if (skb->ingress_ifindex != NOWHERE_IFINDEX) {
+		bpf_printk("wan_egress: skip (forwarded packet, ingress_ifindex=%d)",
+			   skb->ingress_ifindex);
 		return TC_ACT_OK;
+	}
 
 	__u32 scratch_key = 0;
 	struct parsed_packet *pkt =
@@ -2838,10 +2819,12 @@ int tproxy_dae0peer_ingress(struct __sk_buff *skb)
 	 * first fragments that still expose those headers). Established TCP can
 	 * return to the stack without bpf_sk_assign.
 	 */
-	__u8 l4proto = skb->cb[1];
-
-	if (l4proto != 0)
-		assign_listener(skb, l4proto);
+	/* TProxy runs in host namespace; bpf_sk_assign fails across namespaces.
+	 * Skip assign_listener — the policy routing in host NS will deliver
+	 * marked packets directly to the TProxy socket via local default dev lo.
+	 * Established TCP (l4proto == 0) and new connections (SYN) both go through
+	 * the same path.
+	 */
 	return TC_ACT_OK;
 }
 

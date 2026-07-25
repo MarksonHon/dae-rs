@@ -306,10 +306,10 @@ impl Default for NamespaceConfig {
             mode: "isolated".into(),
             host_if: "dae0".into(),
             peer_if: "dae0peer".into(),
-            host_addr: "169.254.100.1/30".into(),
-            peer_addr: "169.254.100.2/30".into(),
+            host_addr: "169.254.0.1/16".into(),
+            peer_addr: "169.254.0.11/16".into(),
             mtu: 1500,
-            route_table: 20230,
+            route_table: 2023,
         }
     }
 }
@@ -344,7 +344,7 @@ pub struct MarksConfig {
 impl Default for MarksConfig {
     fn default() -> Self {
         Self {
-            proxy: 0x02000000,
+            proxy: 0x08000000,
             bypass: 0x04000000,
             mask: 0x0f000000,
         }
@@ -1827,10 +1827,10 @@ namespace {
   mode: isolated
   veth_host: dae0
   veth_peer: dae0peer
-  host_addr: 169.254.100.1/30
-  peer_addr: 169.254.100.2/30
+  host_addr: 169.254.0.1/16
+  peer_addr: 169.254.0.11/16
   mtu: 1500
-  route_table: 20230
+  route_table: 2023
 }
 
 mark {
@@ -1913,10 +1913,10 @@ api {
         assert_eq!(ns.mode, "isolated");
         assert_eq!(ns.host_if, "dae0");
         assert_eq!(ns.peer_if, "dae0peer");
-        assert_eq!(ns.host_addr, "169.254.100.1/30");
-        assert_eq!(ns.peer_addr, "169.254.100.2/30");
+        assert_eq!(ns.host_addr, "169.254.0.1/16");
+        assert_eq!(ns.peer_addr, "169.254.0.11/16");
         assert_eq!(ns.mtu, 1500);
-        assert_eq!(ns.route_table, 20230);
+        assert_eq!(ns.route_table, 2023);
 
         // marks
         let marks = config.marks.as_ref().expect("marks should exist");

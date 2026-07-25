@@ -1,0 +1,88 @@
+global {
+  tproxy_port: 15080
+  log_level: info
+}
+
+interface {
+  wan_interface: eth0
+  # lan_interface: eth1 docker0
+  # bind_interface: auto
+}
+
+namespace {
+  mode: isolated
+  veth_host: dae0
+  veth_peer: dae0peer
+  host_addr: 169.254.0.1/16
+  peer_addr: 169.254.0.11/16
+  mtu: 1500
+  route_table: 2023
+}
+
+mark {
+  proxy: 0x8000000
+  bypass: 0x04000000
+  mask: 0x8000000
+}
+
+process_exclusion {
+  enabled: true
+  protect_self: true
+  protect_children: true
+  gc_interval_sec: 30
+  stale_after_sec: 120
+
+  match {
+    comm(dae-rs, naiveproxy)
+    #pid(1234)
+    #tgid(1234)
+  }
+}
+
+outbounds {
+  nodes {
+    main {
+      protocol: socks5
+      address: 127.0.0.1:1080
+      #username: user
+      #password: pass
+      dial_timeout_ms: 5000
+    }
+
+    backup {
+      import: 'socks5://127.0.0.1:2080'
+    }
+  }
+
+  groups {
+    proxy_primary {
+      # type: auto           # default, can be omitted
+      # policy: fixed        # always pick first node
+      # policy: random       # random node selection
+      # policy: min          # pick node with lowest last probe latency
+      # policy: min_avg10    # pick node with lowest avg10 latency
+      policy: min_moving_avg # pick node with lowest moving average latency (recommended)
+      nodes(main, backup)
+    }
+
+    a_group {
+      type: auto
+      policy: min_avg10
+      nodes(regex: '*')
+    }
+
+    # select type: node is manually switched via REST API, no auto probing
+    manual {
+      type: select
+      selected: main         # initial selected node, can be updated via API
+      nodes(main, backup)
+    }
+  }
+}
+
+routing {
+  dip(geoip:private) -> direct
+  dport(22) -> direct
+  l4proto(tcp) -> proxy(proxy_primary)
+  fallback: proxy(proxy_primary)
+}

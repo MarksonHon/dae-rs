@@ -222,6 +222,9 @@ pub struct DaefileConfig {
     /// Traffic mark configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marks: Option<MarksConfig>,
+    /// Network interface configuration (WAN/LAN)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<InterfaceConfig>,
     /// Process exclusion configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_exclusion: Option<ProcessExclusionConfig>,
@@ -241,6 +244,7 @@ impl Default for DaefileConfig {
             runtime: RuntimeConfig::default(),
             namespace: Some(NamespaceConfig::default()),
             marks: Some(MarksConfig::default()),
+            interface: None,
             process_exclusion: Some(ProcessExclusionConfig::default()),
             outbounds: OutboundsConfig::default(),
             routing: RoutingConfig::default(),
@@ -308,6 +312,21 @@ impl Default for NamespaceConfig {
             route_table: 20230,
         }
     }
+}
+
+/// Network interface configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct InterfaceConfig {
+    /// WAN interface names (space-separated in daefile)
+    #[serde(default)]
+    pub wan_interface: Vec<String>,
+    /// LAN interface names (space-separated in daefile)
+    #[serde(default)]
+    pub lan_interface: Vec<String>,
+    /// Bind interface (auto-detect if set to "auto")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_interface: Option<String>,
 }
 
 /// Traffic mark configuration
@@ -564,6 +583,8 @@ enum ParseState {
     Global,
     /// Inside namespace section
     Namespace,
+    /// Inside interface section
+    Interface,
     /// Inside mark section
     Mark,
     /// Inside process_exclusion section
@@ -646,6 +667,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     match section_name {
                         "global" => state = ParseState::Global,
                         "namespace" => state = ParseState::Namespace,
+                        "interface" => state = ParseState::Interface,
                         "mark" => state = ParseState::Mark,
                         "process_exclusion" => state = ParseState::ProcessExclusion,
                         "outbounds" => state = ParseState::Outbounds,
@@ -728,6 +750,39 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                             return Err(ConfigError::Syntax {
                                 line: line_number,
                                 message: format!("unknown namespace field: '{}'", key),
+                            });
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+
+            // ── interface ──
+            ParseState::Interface => {
+                if line == "}" {
+                    state = ParseState::Top;
+                    continue;
+                }
+                let iface = config.interface.get_or_insert_with(InterfaceConfig::default);
+                parse_kv_pair(line, line_number, |key, value| {
+                    match key {
+                        "wan_interface" => {
+                            iface.wan_interface = value.split_whitespace()
+                                .map(|s| unquote(s).to_string())
+                                .collect();
+                        }
+                        "lan_interface" => {
+                            iface.lan_interface = value.split_whitespace()
+                                .map(|s| unquote(s).to_string())
+                                .collect();
+                        }
+                        "bind_interface" => {
+                            iface.bind_interface = Some(unquote(value).to_string());
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown interface field: '{}'", key),
                             });
                         }
                     }

@@ -1,0 +1,43 @@
+global {
+  tproxy_port: 15080
+  log_level: info
+}
+
+interface {
+  wan_interface: eno1
+  # lan_interface: eth1 docker0
+  # bind_interface: auto
+}
+
+outbounds {
+  nodes {
+    main {
+      protocol: socks5
+      address: 192.168.12.1:9696
+      dial_timeout_ms: 5000
+    }
+  }
+  groups {
+    proxy_primary {
+      policy: fixed
+      nodes(main)
+    }
+
+    a_group {
+      type: auto
+      policy: min_avg10
+      nodes(regex: '*')
+    }
+
+    manual {
+      type: select
+      selected: main
+      nodes(main)
+    }
+  }
+}
+
+routing {
+  l4proto(tcp) -> proxy(proxy_primary)
+  fallback: proxy(proxy_primary)
+}

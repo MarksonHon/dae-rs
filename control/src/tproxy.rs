@@ -171,6 +171,10 @@ impl TproxyListener {
             "TProxy listener started"
         );
 
+        // accept 检查间隔：每 500ms 醒来检查 running 标志，实现可取消的阻塞 accept
+        const ACCEPT_POLL_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(500);
+
         loop {
             // 检查运行标记，用于优雅停止
             if !self.running.load(Ordering::SeqCst) {
@@ -181,8 +185,12 @@ impl TproxyListener {
                 break;
             }
 
-            match listener.accept().await {
-                Ok((stream, peer_addr)) => {
+            // 使用 tokio::time::timeout 使 accept 可中断：
+            // - 正常 accept 到连接 → 处理连接
+            // - 超时（无连接到达）→ 回到循环顶部检查 running 标志
+            // - accept 错误 → 短暂休眠后重试
+            match tokio::time::timeout(ACCEPT_POLL_INTERVAL, listener.accept()).await {
+                Ok(Ok((stream, peer_addr))) => {
                     debug!(
                         peer_addr = %peer_addr,
                         listen_addr = %self.listen_addr,
@@ -207,7 +215,7 @@ impl TproxyListener {
                         }
                     });
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!(
                         listen_addr = %self.listen_addr,
                         error = %e,
@@ -215,6 +223,13 @@ impl TproxyListener {
                     );
                     // 短暂休眠避免空转
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(_elapsed) => {
+                    // accept 超时（无连接到达），回到循环顶部检查 running
+                    debug!(
+                        listen_addr = %self.listen_addr,
+                        "Accept timeout, rechecking running flag"
+                    );
                 }
             }
         }

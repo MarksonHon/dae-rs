@@ -86,14 +86,14 @@ use tproxy::TproxyListener;
 /// | Parameter | Default | Description |
 /// |-----------|---------|-------------|
 /// | `tproxy_port` | 15080 | TProxy listen port |
-/// | `route_table` | 20230 | Policy routing table ID |
-/// | `fwmark_proxy` | 0x02000000 | Proxy traffic mark |
+/// | `route_table` | 2023 | Policy routing table ID |
+/// | `fwmark_proxy` | 0x8000000 | Proxy traffic mark (TPROXY_MARK) |
 /// | `fwmark_bypass` | 0x04000000 | Bypass mark |
-/// | `fwmark_mask` | 0x0f000000 | Mark mask |
+/// | `fwmark_mask` | 0x8000000 | Mark mask |
 /// | `veth_host` | dae0 | Host-side veth name |
 /// | `veth_peer` | dae0peer | Proxy-side veth name |
-/// | `host_addr` | 169.254.100.1/30 | Host-side address |
-/// | `peer_addr` | 169.254.100.2/30 | Proxy-side address |
+/// | `host_addr` | 169.254.0.1/16 | Host-side address |
+/// | `peer_addr` | 169.254.0.11/16 | Proxy-side address |
 /// | `mtu` | 1500 | Interface MTU |
 /// | `log_level` | "info" | Log level |
 /// | `proxy_addr` | 127.0.0.1:1080 | SOCKS5 proxy address |
@@ -138,20 +138,24 @@ pub struct Config {
     pub api_config: Option<config::ApiConfig>,
     /// Raw daefile config (for exclusion list / routing rule compilation and API queries)
     pub daefile_config: Option<config::DaefileConfig>,
+    /// WAN interface names (TC attach targets for wan_egress/wan_ingress)
+    pub wan_interface: Vec<String>,
+    /// LAN interface names (TC attach targets for lan_ingress/lan_egress)
+    pub lan_interface: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             tproxy_port: 15080,
-            route_table: 20230,
-            fwmark_proxy: 0x02000000,
+            route_table: 2023,
+            fwmark_proxy: 0x8000000,
             fwmark_bypass: 0x04000000,
-            fwmark_mask: 0x0f000000,
+            fwmark_mask: 0x8000000,
             veth_host: "dae0".into(),
             veth_peer: "dae0peer".into(),
-            host_addr: "169.254.100.1/30".into(),
-            peer_addr: "169.254.100.2/30".into(),
+            host_addr: "169.254.0.1/16".into(),
+            peer_addr: "169.254.0.11/16".into(),
             mtu: 1500,
             log_level: "info".into(),
             ebpf_path: ebpf::DEFAULT_EBPF_PATH.to_string(),
@@ -161,6 +165,8 @@ impl Default for Config {
             proxy_dial_timeout_ms: 5000,
             api_config: None,
             daefile_config: None,
+            wan_interface: Vec::new(),
+            lan_interface: Vec::new(),
         }
     }
 }
@@ -209,6 +215,7 @@ impl Config {
         let runtime = &daefile_config.runtime;
         let ns = daefile_config.namespace.as_ref();
         let marks = daefile_config.marks.as_ref();
+        let iface = daefile_config.interface.as_ref();
 
         // Get proxy address from the first node (Phase 1 simplification: take first socks5 node)
         let (proxy_addr, proxy_username, proxy_password, proxy_dial_timeout_ms) =
@@ -232,14 +239,14 @@ impl Config {
 
         Ok(Self {
             tproxy_port: runtime.tproxy_port,
-            route_table: ns.map(|n| n.route_table).unwrap_or(20230),
-            fwmark_proxy: marks.map(|m| m.proxy).unwrap_or(0x02000000),
+            route_table: ns.map(|n| n.route_table).unwrap_or(2023),
+            fwmark_proxy: marks.map(|m| m.proxy).unwrap_or(0x8000000),
             fwmark_bypass: marks.map(|m| m.bypass).unwrap_or(0x04000000),
-            fwmark_mask: marks.map(|m| m.mask).unwrap_or(0x0f000000),
+            fwmark_mask: marks.map(|m| m.mask).unwrap_or(0x8000000),
             veth_host: ns.map(|n| n.host_if.clone()).unwrap_or_else(|| "dae0".into()),
             veth_peer: ns.map(|n| n.peer_if.clone()).unwrap_or_else(|| "dae0peer".into()),
-            host_addr: ns.map(|n| n.host_addr.clone()).unwrap_or_else(|| "169.254.100.1/30".into()),
-            peer_addr: ns.map(|n| n.peer_addr.clone()).unwrap_or_else(|| "169.254.100.2/30".into()),
+            host_addr: ns.map(|n| n.host_addr.clone()).unwrap_or_else(|| "169.254.0.1/16".into()),
+            peer_addr: ns.map(|n| n.peer_addr.clone()).unwrap_or_else(|| "169.254.0.11/16".into()),
             mtu: ns.map(|n| n.mtu).unwrap_or(1500),
             log_level: runtime.log_level.clone(),
             ebpf_path: ebpf::DEFAULT_EBPF_PATH.to_string(),
@@ -249,6 +256,8 @@ impl Config {
             proxy_dial_timeout_ms,
             api_config,
             daefile_config: Some(daefile_config.clone()),
+            wan_interface: iface.map(|i| i.wan_interface.clone()).unwrap_or_default(),
+            lan_interface: iface.map(|i| i.lan_interface.clone()).unwrap_or_default(),
         })
     }
 }
@@ -303,6 +312,11 @@ pub struct ControlPlane {
     pub daefile_content: Option<String>,
     /// Tokio task handle for the API server
     pub api_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Embedded eBPF bytecode (compiled into the binary).
+    /// When set, `load()` uses this instead of reading from file.
+    pub embedded_ebpf: Option<&'static [u8]>,
+    /// Daeparam to pass to the eBPF program before loading.
+    pub ebpf_param: Option<crate::ebpf::Daeparam>,
 }
 
 impl ControlPlane {
@@ -331,6 +345,8 @@ impl ControlPlane {
             tproxy_thread: None,
             running: false,
             api_handle: None,
+            embedded_ebpf: None,
+            ebpf_param: None,
         }
     }
 
@@ -368,21 +384,113 @@ impl ControlPlane {
                 e
             })?;
 
+        // ---- Step 1.5: Set eBPF PARAM with netns information ----
+        // Now that netns is created, we can set dae0_ifindex, dae_netns_id, dae0peer_mac
+        if let Some(ref mut param) = self.ebpf_param {
+            // Get dae0 ifindex in host NS
+            match self.netns_mgr.get_host_ifindex() {
+                Ok(ifindex) => {
+                    param.dae0_ifindex = ifindex;
+                    info!("Set PARAM.dae0_ifindex = {}", ifindex);
+                }
+                Err(e) => {
+                    warn!("Failed to get dae0 ifindex: {}", e);
+                }
+            }
+            
+            // Get proxy netns inode (dae_netns_id)
+            match self.netns_mgr.get_proxy_netns_inode() {
+                Ok(inode) => {
+                    param.dae_netns_id = inode;
+                    info!("Set PARAM.dae_netns_id = {}", inode);
+                }
+                Err(e) => {
+                    warn!("Failed to get proxy netns inode: {}", e);
+                }
+            }
+            
+            // Get dae0peer MAC address
+            match self.netns_mgr.get_peer_mac() {
+                Ok(mac) => {
+                    param.dae0peer_mac = mac;
+                    info!("Set PARAM.dae0peer_mac = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                }
+                Err(e) => {
+                    warn!("Failed to get dae0peer MAC: {}", e);
+                }
+            }
+            
+            // Set tproxy_port
+            param.tproxy_port = self.config.tproxy_port as u32;
+            info!("Set PARAM.tproxy_port = {}", param.tproxy_port);
+            
+            // Set control_plane_pid
+            param.control_plane_pid = std::process::id();
+            info!("Set PARAM.control_plane_pid = {}", param.control_plane_pid);
+            
+            // Set use_redirect_peer based on kernel support
+            // For now, set to 0 (disabled) as default
+            param.use_redirect_peer = 0;
+            info!("Set PARAM.use_redirect_peer = {}", param.use_redirect_peer);
+        }
+
         // ---- Step 2: Load eBPF program ----
         info!("Step 2/5: Loading eBPF program");
-        self.ebpf_mgr.load()
-            .map_err(|e| {
-                error!("Failed to load eBPF program: {}", e);
-                e
-            })?;
+
+        // Set PARAM global variable before loading (if configured)
+        if let Some(param) = self.ebpf_param {
+            self.ebpf_mgr.set_param(&param);
+            info!("eBPF PARAM configured: tproxy_port={}", param.tproxy_port);
+        }
+
+        if let Some(ebpf_bytes) = self.embedded_ebpf {
+            info!("Using embedded eBPF bytecode ({} bytes)", ebpf_bytes.len());
+            self.ebpf_mgr.load_from_bytes(ebpf_bytes)
+                .map_err(|e| {
+                    error!("Failed to load embedded eBPF program: {}", e);
+                    e
+                })?;
+        } else {
+            self.ebpf_mgr.load()
+                .map_err(|e| {
+                    error!("Failed to load eBPF program: {}", e);
+                    e
+                })?;
+        }
 
         // ---- Step 3: Attach TC programs ----
+        // Now that the topology is fixed (dae0 in host NS, dae0peer in proxy NS),
+        // we must attach programs in the correct namespace:
+        //   - dae0_ingress → host NS (dae0 is there)
+        //   - dae0peer_ingress → proxy NS (dae0peer is there)
+        //   - wan/lan programs → host NS (physical interfaces are there)
+        //   - cgroup programs → proxy NS (sock_create/release etc.)
         info!("Step 3/5: Attaching TC programs");
-        self.ebpf_mgr.attach_tc()
+        // Attach dae0_ingress in host NS
+        self.ebpf_mgr.attach_dae0("dae0")
             .map_err(|e| {
-                error!("Failed to attach TC programs: {}", e);
+                error!("Failed to attach dae0_ingress TC: {}", e);
                 e
             })?;
+        // Attach dae0peer_ingress in proxy NS
+        // We need to switch to proxy NS to attach this program
+        {
+            self.netns_mgr.join_proxy_ns()?;
+            self.ebpf_mgr.attach_dae0peer("dae0peer")
+                .map_err(|e| {
+                    error!("Failed to attach dae0peer_ingress TC: {}", e);
+                    e
+                })?;
+            self.netns_mgr.join_host_ns()?;
+        }
+        // Attach WAN/LAN TC programs (if configured)
+        for wan_if in &self.config.wan_interface {
+            self.ebpf_mgr.attach_wan(wan_if)?;
+        }
+        for lan_if in &self.config.lan_interface {
+            self.ebpf_mgr.attach_lan(lan_if)?;
+        }
 
         // ---- Step 3.5: Write eBPF maps (exclusion list + rules) ----
         info!("Step 3.5/5: Writing eBPF maps (exclusion list + rules)");
@@ -422,6 +530,39 @@ impl ControlPlane {
                     info!("Wrote {} rules to RULES_MAP", entries.len());
                 }
             }
+        }
+
+        // ---- Step 3.7: Attach cgroup programs in proxy NS ----
+        info!("Step 3.7/5: Attaching cgroup programs in proxy namespace");
+        {
+            // Switch to proxy NS to attach cgroup programs
+            self.netns_mgr.join_proxy_ns()?;
+            
+            // Open cgroup fd for the proxy namespace
+            // Use /sys/fs/cgroup as the cgroup root
+            let cgroup_fd = unsafe {
+                libc::open(
+                    b"/sys/fs/cgroup\0".as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                )
+            };
+            
+            if cgroup_fd >= 0 {
+                match self.ebpf_mgr.attach_cgroup(cgroup_fd) {
+                    Ok(()) => {
+                        info!("cgroup programs attached successfully");
+                    }
+                    Err(e) => {
+                        warn!("Failed to attach cgroup programs: {}", e);
+                    }
+                }
+                unsafe { libc::close(cgroup_fd); }
+            } else {
+                warn!("Failed to open /sys/fs/cgroup: {}", std::io::Error::last_os_error());
+            }
+            
+            // Switch back to host NS
+            self.netns_mgr.join_host_ns()?;
         }
 
         // ---- Step 4: Start TProxy listener ----
@@ -687,10 +828,14 @@ impl ControlPlane {
         }
         self.tproxy.take();
 
-        // ---- Step 2: Detach TC programs ----
-        info!("Step 2/5: Detaching TC programs");
-        if let Err(e) = self.ebpf_mgr.detach_tc() {
-            error!("Failed to detach TC programs: {}", e);
+        // ---- Step 2: Detach all TC and cgroup programs ----
+        // The TC hooks are on interfaces in both namespaces:
+        //   - Host NS: dae0_ingress, wan_*, lan_*
+        //   - Proxy NS: dae0peer_ingress, cgroup programs
+        // detach_all() handles both sides.
+        info!("Step 2/5: Detaching all TC and cgroup programs");
+        if let Err(e) = self.ebpf_mgr.detach_all() {
+            error!("Failed to detach programs: {}", e);
             first_error.get_or_insert(e);
         }
 
@@ -914,20 +1059,22 @@ mod tests {
     fn test_config_default() {
         let config = Config::default();
         assert_eq!(config.tproxy_port, 15080);
-        assert_eq!(config.route_table, 20230);
-        assert_eq!(config.fwmark_proxy, 0x02000000);
+        assert_eq!(config.route_table, 2023);
+        assert_eq!(config.fwmark_proxy, 0x8000000);
         assert_eq!(config.fwmark_bypass, 0x04000000);
-        assert_eq!(config.fwmark_mask, 0x0f000000);
+        assert_eq!(config.fwmark_mask, 0x8000000);
         assert_eq!(config.veth_host, "dae0");
         assert_eq!(config.veth_peer, "dae0peer");
-        assert_eq!(config.host_addr, "169.254.100.1/30");
-        assert_eq!(config.peer_addr, "169.254.100.2/30");
+        assert_eq!(config.host_addr, "169.254.0.1/16");
+        assert_eq!(config.peer_addr, "169.254.0.11/16");
         assert_eq!(config.mtu, 1500);
         assert_eq!(config.log_level, "info");
         assert_eq!(config.proxy_addr, "127.0.0.1:1080");
         assert_eq!(config.proxy_username, "");
         assert_eq!(config.proxy_password, "");
         assert_eq!(config.proxy_dial_timeout_ms, 5000);
+        assert!(config.wan_interface.is_empty());
+        assert!(config.lan_interface.is_empty());
     }
 
     #[test]

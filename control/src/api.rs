@@ -481,13 +481,16 @@ async fn metrics_handler(
         .read_stats()
         .unwrap_or([0u64; crate::ebpf::STATS_MAP_SIZE as usize]);
 
+    // bpf_stats_map in tproxy.c has 2 entries: UdpConnOverflow and TcpConnOverflow.
+    // Map them to the API response; set detailed counters to 0 for now.
     Ok(Json(MetricsResponse {
-        total_packets: stats[crate::ebpf::StatIndex::TotalPkts as usize],
-        direct_decisions: stats[crate::ebpf::StatIndex::Direct as usize],
-        proxy_decisions: stats[crate::ebpf::StatIndex::Proxy as usize],
-        bypass_count: stats[crate::ebpf::StatIndex::Bypass as usize],
-        conntrack_hits: stats[crate::ebpf::StatIndex::ConntrackHit as usize],
-        active_connections: 0, // 第一阶段: 暂不实现连接跟踪计数
+        total_packets: stats[crate::ebpf::StatIndex::UdpConnOverflow as usize]
+            + stats[crate::ebpf::StatIndex::TcpConnOverflow as usize],
+        direct_decisions: 0,   // tproxy.c tracks overflow, not per-decision stats
+        proxy_decisions: 0,    // tproxy.c tracks overflow, not per-decision stats
+        bypass_count: 0,       // tproxy.c tracks overflow, not per-decision stats
+        conntrack_hits: 0,     // tproxy.c tracks overflow, not per-decision stats
+        active_connections: 0, // TODO: count from conn_state_map
     }))
 }
 

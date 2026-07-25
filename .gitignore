@@ -1,2 +1,10 @@
 target/
 *.exe
+
+# eBPF 编译产物
+*.o
+bpf/kern/*.o
+
+# Rust eBPF 构建产物（旧）
+ebpf/target/
+ebpf/Cargo.lock

@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "ebpf",
     "control",
     "protocols",
     "shared",
@@ -17,15 +16,12 @@ default-members = [
 name = "dae-rs"
 version = "0.1.0"
 edition = "2021"
-description = "An eBPF-based proxy system (Phase 1: SOCKS5 only)"
+description = "An eBPF-based proxy system - Rust rewrite of dae"
 
 [dependencies]
-# 主二进制依赖
-aya = "0.13"
-aya-log = "0.2"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.5"
-nix = { version = "0.29", features = ["net", "feature", "sched", "user"] }
+nix = { version = "0.31", features = ["net", "feature", "sched", "user"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ipnet = "2"
@@ -34,16 +30,17 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive"] }
-axum = "0.7"
+axum = "0.8"
 uuid = { version = "1", features = ["v4"] }
-tower-http = { version = "0.5", features = ["cors", "auth"]}
-socks5-proto = "0.4"  # SOCKS5 协议编解码
+tower-http = { version = "0.7", features = ["cors", "auth"] }
+socks5-proto = "0.4"
+
+# 安全地将 #[repr(C)] 结构体转换到/从字节切片
+bytemuck = { version = "1", features = ["derive"] }
 
 control = { path = "control" }
 protocols = { path = "protocols" }
 shared = { path = "shared" }
 
 [profile.release]
-lto = true
 strip = true
-codegen-units = 1

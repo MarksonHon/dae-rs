@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "runtime": {
+    "tproxy_port": 15080,
+    "log_level": "info",
+    "temp_json": true
+  },
+  "namespace": {
+    "mode": "isolated",
+    "host_if": "dae0",
+    "peer_if": "dae0peer",
+    "host_addr": "169.254.100.1/30",
+    "peer_addr": "169.254.100.2/30",
+    "mtu": 1500,
+    "route_table": 20230
+  },
+  "marks": {
+    "proxy": "0x02000000",
+    "bypass": "0x04000000",
+    "mask": "0x0f000000"
+  },
+  "process_exclusion": {
+    "enabled": true,
+    "protect_self": true,
+    "protect_children": true,
+    "gc_interval_sec": 30,
+    "stale_after_sec": 120,
+    "match": {
+      "comm": ["dae-rs", "naiveproxy"],
+      "pid": [],
+      "tgid": []
+    }
+  },
+  "outbounds": {
+    "nodes": [
+      {
+        "name": "main",
+        "protocol": "socks5",
+        "params": {
+          "address": "127.0.0.1:1080",
+          "username": "",
+          "password": "",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "backup",
+        "protocol": "socks5",
+        "params": {
+          "address": "127.0.0.1:2080",
+          "username": "",
+          "password": "",
+          "dial_timeout_ms": 5000
+        }
+      }
+    ],
+    "groups": [
+      {
+        "name": "proxy_primary",
+        "type": "auto",
+        "policy": "min_moving_avg",
+        "selectors": [
+          { "type": "list", "nodes": ["main", "backup"] }
+        ]
+      },
+      {
+        "name": "a_group",
+        "type": "auto",
+        "policy": "min_avg10",
+        "selectors": [
+          { "type": "regex", "pattern": ".*" }
+        ]
+      },
+      {
+        "name": "manual",
+        "type": "select",
+        "selected": "main",
+        "selectors": [
+          { "type": "list", "nodes": ["main", "backup"] }
+        ]
+      }
+    ]
+  },
+  "routing": {
+    "rules": [
+      { "match": "dip(geoip:private)", "action": "direct" },
+      { "match": "dport(22)", "action": "direct" },
+      { "match": "l4proto(tcp)", "action": "proxy(proxy_primary)" }
+    ],
+    "fallback": "proxy(proxy_primary)"
+  }
+}

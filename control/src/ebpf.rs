@@ -1,121 +1,47 @@
-//! eBPF 加载/卸载/附着管理器
+//! eBPF program lifecycle manager
 //!
-//! 本模块负责 eBPF 程序在用户态控制面的完整生命周期管理，包括：
-//! - 从编译后的字节码文件加载 eBPF 程序
-//! - 将 TC（Traffic Control）程序附着到目标网卡
-//! - 从网卡分离 TC 程序并卸载 eBPF
-//! - 管理 eBPF map 的读写（规则写入、统计读取等）
+//! This module manages the full lifecycle of eBPF programs in userspace,
+//! including loading from bytecode, TC attachment/detachment, and map I/O.
 //!
-//! ## 架构
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────┐
-//! │                    EbpfManager                      │
-//! │                                                     │
-//! │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-//! │  │ 加载字节码 │  │ TC 附着  │  │ Map 管理        │  │
-//! │  │          │  │          │  │                  │  │
-//! │  │ Ebpf::load│  │ ingress  │  │ RULES_MAP 写入   │  │
-//! │  │          │  │ egress   │  │ STATS_MAP 读取   │  │
-//! │  └──────────┘  └──────────┘  └──────────────────┘  │
-//! └─────────────────────┬───────────────────────────────┘
-//!                       │
-//!              ┌────────┴────────┐
-//!              │   Linux Kernel  │
-//!              │   TC hooks      │
-//!              └─────────────────┘
-//! ```
+//! Uses libbpf-rs (replacing aya-rs) to load and manage eBPF programs
+//! compiled from dae's C eBPF source (tproxy.c).
 
 use anyhow::{Context, Result};
-use aya::maps::{Array, HashMap, Map};
-use aya::programs::tc::{SchedClassifier, SchedClassifierLink, TcAttachType};
-use aya::Ebpf;
+use bytemuck::Zeroable;
+use libbpf_rs::{MapCore, MapFlags, ProgramType};
+use libbpf_rs::{ObjectBuilder, Object, TcHook, TC_INGRESS, TC_EGRESS};
+use std::os::unix::io::AsFd;
 use std::path::Path;
-use tracing::{info, warn, error};
+use std::ffi::OsStr;
+use tracing::{info, warn};
 
 // ============================================================================
-// 错误类型
+// Compat: RuleEntry (用于 compile_rules 转换层)
 // ============================================================================
 
-/// eBPF 管理错误
-#[derive(Debug, thiserror::Error)]
-pub enum EbpfError {
-    /// eBPF 程序未加载
-    #[error("eBPF program not loaded")]
-    NotLoaded,
-    /// eBPF 程序已加载
-    #[error("eBPF program already loaded")]
-    AlreadyLoaded,
-    /// Map 不存在
-    #[error("Map '{name}' not found")]
-    MapNotFound {
-        /// Map 名称
-        name: String,
-    },
-    /// Map 类型不匹配
-    #[error("Map '{name}' type mismatch: expected {expected}, got {actual}")]
-    MapTypeMismatch {
-        /// Map 名称
-        name: String,
-        /// 期望类型
-        expected: &'static str,
-        /// 实际类型
-        actual: &'static str,
-    },
-    /// TC 附着失败
-    #[error("TC attach failed on interface {iface}: {detail}")]
-    TcAttachError {
-        /// 目标网卡
-        iface: String,
-        /// 错误详情
-        detail: String,
-    },
-}
-
-// ============================================================================
-// 常量
-// ============================================================================
-
-/// 默认 eBPF 字节码文件路径
-pub const DEFAULT_EBPF_PATH: &str = "/etc/dae-rs/ebpf.o";
-/// 规则映射最大条目数（必须与 eBPF 端一致）
-pub const RULES_MAP_MAX: u32 = 1024;
-/// 统计映射大小
-pub const STATS_MAP_SIZE: u32 = 16;
-
-// ============================================================================
-// 数据结构（必须与 eBPF 端的定义完全一致）
-// ============================================================================
-
-/// 规则条目（与 [`ebpf/src/lib.rs`](ebpf/src/lib.rs) 中的定义一致）
+/// Routing rule entry compiled from daefile by userspace.
+/// This is a compatibility shim; rules are stored as MatchSet in tproxy.c's routing_map.
 ///
-/// 用户态将分流规则编译为此结构并写入 `RULES_MAP`，
-/// eBPF 程序按序匹配并执行对应动作。
+/// Layout: dip(16) + dip_prefix_len(1) + pad1(1) + dport(2) + l4proto(1) + action(1) + pad(12) = 34
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RuleEntry {
-    /// 目的 IP（大端序，IPv4 为最后 4 字节）
     pub dip: [u8; 16],
-    /// 目的 IP 前缀长度（用于 CIDR 匹配）
     pub dip_prefix_len: u8,
-    /// 目的端口（网络字节序），0 表示匹配所有端口
+    /// Explicit padding to align dport: u16 to 2-byte boundary
+    pub _pad1: u8,
     pub dport: u16,
-    /// L4 协议类型：0=任意, 1=TCP, 2=UDP
     pub l4proto: u8,
-    /// 动作：0=直连, 1=代理
     pub action: u8,
-    /// 保留字段，对齐用
     pub _pad: [u8; 12],
 }
-
-// 安全地实现 aya::Pod trait，因为 RuleEntry 是 repr(C) 且只包含原始类型
-unsafe impl aya::Pod for RuleEntry {}
 
 impl Default for RuleEntry {
     fn default() -> Self {
         Self {
             dip: [0u8; 16],
             dip_prefix_len: 0,
+            _pad1: 0,
             dport: 0,
             l4proto: 0,
             action: 0,
@@ -124,551 +50,822 @@ impl Default for RuleEntry {
     }
 }
 
-/// 连接跟踪条目（与 eBPF 端定义一致）
+impl From<&RuleEntry> for MatchSet {
+    fn from(rule: &RuleEntry) -> Self {
+        let mut ms = MatchSet::zeroed();
+        ms.outbound = rule.action;
+        ms.must = 0;
+        ms.mark = 0;
+
+        if rule.dport != 0 {
+            ms.r#type = match_type::PORT;
+            ms.value = MatchSetValue {
+                port_range: PortRange {
+                    port_start: u16::from_be(rule.dport),
+                    port_end: u16::from_be(rule.dport),
+                },
+            };
+        } else if rule.l4proto != 0 {
+            ms.r#type = match_type::L4_PROTO;
+            ms.value = MatchSetValue {
+                l4proto_type: rule.l4proto,
+            };
+        } else {
+            ms.r#type = match_type::IP_SET;
+            ms.value = MatchSetValue { index: 0 };
+        }
+        ms
+    }
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+#[derive(Debug, thiserror::Error)]
+pub enum EbpfError {
+    #[error("eBPF program not loaded")]
+    NotLoaded,
+    #[error("eBPF program already loaded")]
+    AlreadyLoaded,
+    #[error("Map '{name}' not found")]
+    MapNotFound { name: String },
+    #[error("TC attach failed on interface {iface}: {detail}")]
+    TcAttachError { iface: String, detail: String },
+    #[error("Interface {0} not found")]
+    InterfaceNotFound(String),
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const DEFAULT_EBPF_PATH: &str = "/etc/dae-rs/ebpf.o";
+pub const ROUTING_MAP_MAX: u32 = 1024;
+pub const STATS_MAP_SIZE: u32 = 2;
+
+// ============================================================================
+// Data Structures (must match tproxy.c definitions exactly)
+// ============================================================================
+
+// ---- tproxy.c: struct dae_param ----
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ConntrackEntry {
-    /// 动作：0=直连, 1=代理
-    pub action: u8,
-    /// 保留字段
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Daeparam {
+    pub tproxy_port: u32,
+    pub control_plane_pid: u32,
+    pub dae0_ifindex: u32,
+    pub dae_netns_id: u32,
+    pub dae0peer_mac: [u8; 6],
+    pub padding_after_mac: [u8; 2],
+    pub use_redirect_peer: u8,
+    pub has_bpf_get_current_task: u8,
+    pub padding2: u16,
+    pub dae_socket_mark: u32,
+}
+
+impl Default for Daeparam {
+    fn default() -> Self {
+        Self {
+            tproxy_port: 15080,
+            control_plane_pid: 0,
+            dae0_ifindex: 0,
+            dae_netns_id: 0,
+            dae0peer_mac: [0u8; 6],
+            padding_after_mac: [0u8; 2],
+            use_redirect_peer: 0,
+            has_bpf_get_current_task: 0,
+            padding2: 0,
+            dae_socket_mark: 0,
+        }
+    }
+}
+
+// ---- tproxy.c: struct tuples_key ----
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TuplesKey {
+    pub sip: [u8; 16],
+    pub dip: [u8; 16],
+    pub sport: u16,
+    pub dport: u16,
+    pub l4proto: u8,
+    pub _pad: [u8; 3],
+}
+
+impl TuplesKey {
+    pub fn from_ipv4(src_ip: &[u8; 4], dst_ip: &[u8; 4], src_port: u16, dst_port: u16, l4proto: u8) -> Self {
+        let mut sip = [0u8; 16];
+        let mut dip = [0u8; 16];
+        sip[10] = 0xff; sip[11] = 0xff;
+        sip[12..16].copy_from_slice(src_ip);
+        dip[10] = 0xff; dip[11] = 0xff;
+        dip[12..16].copy_from_slice(dst_ip);
+        Self { sip, dip, sport: src_port, dport: dst_port, l4proto, _pad: [0u8; 3] }
+    }
+    pub fn from_ipv6(src_ip: &[u8; 16], dst_ip: &[u8; 16], src_port: u16, dst_port: u16, l4proto: u8) -> Self {
+        Self { sip: *src_ip, dip: *dst_ip, sport: src_port, dport: dst_port, l4proto, _pad: [0u8; 3] }
+    }
+    pub fn reverse(&self) -> Self {
+        Self { sip: self.dip, dip: self.sip, sport: self.dport, dport: self.sport, l4proto: self.l4proto, _pad: [0u8; 3] }
+    }
+}
+
+// ---- tproxy.c: union routing_meta ----
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RoutingMeta {
+    pub mark: u32,
+    pub outbound: u8,
+    pub must: u8,
+    pub dscp: u8,
+    pub has_routing: u8,
+}
+
+// ---- tproxy.c: struct conn_state ----
+/// Size: 56 bytes (aligned to 8). Explicit tail padding for bytemuck::Pod compatibility.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ConnState {
+    pub is_wan_ingress_direction_raw: u8,
+    pub state: u8,
+    pub _pad1: [u8; 6],        // pad to align u64
+    pub last_seen_ns: u64,
+    pub meta: RoutingMeta,
+    pub mac: [u8; 6],
+    pub _pad2: [u8; 2],        // pad to align pname
+    pub pname: [u8; 16],
+    pub pid: u32,
+    pub _tail_pad: [u8; 4],    // pad total to 56 (multiple of max alignment 8)
+}
+
+impl ConnState {
+    pub fn is_wan_ingress_direction(&self) -> bool { self.is_wan_ingress_direction_raw != 0 }
+}
+
+// ---- tproxy.c: struct pid_pname ----
+/// Size: 32 bytes (aligned to 8). Explicit tail padding for bytemuck::Pod.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ProcInfo {
+    pub last_seen_ns: u64,
+    pub pid: u32,
+    pub pname: [u8; 16],
+    pub _tail_pad: [u8; 4],
+}
+
+/// Stats map indices (bpf_stats_map in tproxy.c)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatIndex {
+    UdpConnOverflow = 0,
+    TcpConnOverflow = 1,
+}
+
+// ---- tproxy.c: struct match_set ----
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PortRange {
+    pub port_start: u16,
+    pub port_end: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union MatchSetValue {
+    pub index: u32,
+    pub port_range: PortRange,
+    pub l4proto_type: u8,
+    pub ip_version: u8,
+    pub pname: [u8; 16],
+    pub dscp: u8,
+    pub raw: [u8; 16],
+}
+unsafe impl bytemuck::Zeroable for MatchSetValue {}
+unsafe impl bytemuck::Pod for MatchSetValue {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LpmKey {
+    pub prefixlen: u32,
+    pub data: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CidrEntry {
+    pub ip: [u8; 16],
+    pub prefix_len: u8,
     pub _pad: [u8; 7],
 }
 
-/// 进程信息（与 eBPF 端定义一致）
+impl std::fmt::Debug for MatchSetValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        unsafe { write!(f, "MatchSetValue {{ raw: {:?} }}", self.raw) }
+    }
+}
+
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ProcInfo {
-    /// 进程 ID
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MatchSet {
+    pub value: MatchSetValue,
+    pub not: u8,
+    pub r#type: u8,
+    pub outbound: u8,
+    pub must: u8,
+    pub mark: u32,
+}
+
+pub mod match_type {
+    pub const DOMAIN_SET: u8 = 0;   pub const IP_SET: u8 = 1;
+    pub const SOURCE_IP_SET: u8 = 2; pub const PORT: u8 = 3;
+    pub const SOURCE_PORT: u8 = 4;   pub const L4_PROTO: u8 = 5;
+    pub const IP_VERSION: u8 = 6;    pub const MAC: u8 = 7;
+    pub const PROCESS_NAME: u8 = 8;  pub const DSCP: u8 = 9;
+    pub const FALLBACK: u8 = 10;     pub const MUST_RULES: u8 = 11;
+    pub const UPSTREAM: u8 = 12;     pub const QTYPE: u8 = 13;
+}
+
+pub mod outbound {
+    pub const DIRECT: u8 = 0x0;      pub const BLOCK: u8 = 0x1;
+    pub const MUST_RULES: u8 = 0xFC; pub const CONTROL_PLANE_ROUTING: u8 = 0xFD;
+    pub const LOGICAL_OR: u8 = 0xFE; pub const LOGICAL_AND: u8 = 0xFF;
+    pub const LOGICAL_MASK: u8 = 0xFE;
+}
+
+// ---- tproxy.c: struct dae_event (for RingBuffer) ----
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Daeevent {
+    pub timestamp: u64,
+    pub type_: u32,
     pub pid: u32,
-    /// 线程组 ID
-    pub tgid: u32,
-    /// 进程名（最多 16 字节，与内核 TASK_COMM_LEN 一致）
-    pub comm: [u8; 16],
-    /// 最后更新时间戳（纳秒）
-    pub last_seen_ns: u64,
-}
-
-/// 统计计数索引（必须与 eBPF 端 STATS_MAP 索引一致）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatIndex {
-    /// 总包数
-    TotalPkts = 0,
-    /// direct 决策数
-    Direct = 1,
-    /// proxy 决策数
-    Proxy = 2,
-    /// bypass 数
-    Bypass = 3,
-    /// conntrack 命中数
-    ConntrackHit = 4,
-    /// 规则未命中数
-    RuleMiss = 5,
-    /// IPv4 包数
-    Ipv4 = 6,
-    /// IPv6 包数
-    Ipv6 = 7,
+    pub pname: [u8; 16],
+    pub outbound: u8,
+    pub l4proto: u8,
+    pub pad: [u8; 2],
+    pub sip: [u32; 4],
+    pub dip: [u32; 4],
+    pub sport: u16,
+    pub dport: u16,
 }
 
 // ============================================================================
-// EbpfManager
+// Helpers
 // ============================================================================
 
-/// eBPF 程序管理器
-///
-/// 管理 eBPF 程序的完整生命周期，包括加载、附着、分离和卸载。
-/// 支持 TC ingress/egress 双方向附着，以及 eBPF map 的读写操作。
-///
-/// # 生命周期
-///
-/// ```text
-/// new() -> load() -> attach_tc() -> ...使用中... -> detach_tc() -> unload()
-/// ```
-///
-/// # 示例
-///
-/// ```no_run
-/// use control::ebpf::EbpfManager;
-///
-/// let mut mgr = EbpfManager::new("eth0");
-/// mgr.load().expect("Failed to load eBPF");
-/// mgr.attach_tc().expect("Failed to attach TC");
-/// // ... 运行中 ...
-/// mgr.detach_tc().expect("Failed to detach TC");
-/// mgr.unload().expect("Failed to unload eBPF");
-/// ```
-pub struct EbpfManager {
-    /// 已加载的 eBPF 对象
-    ebpf: Option<Ebpf>,
-    /// TC 程序链接（用于卸载）
-    links: Vec<SchedClassifierLink>,
-    /// 目标网卡
-    iface: String,
-    /// eBPF 字节码文件路径
-    bpf_path: String,
+pub fn if_nametoindex(ifname: &str) -> Result<i32> {
+    let cstr = std::ffi::CString::new(ifname)
+        .map_err(|e| anyhow::anyhow!("Invalid interface name '{}': {}", ifname, e))?;
+    let ifindex = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+    if ifindex == 0 {
+        return Err(EbpfError::InterfaceNotFound(ifname.to_string()).into());
+    }
+    Ok(ifindex as i32)
 }
 
-impl EbpfManager {
-    /// 创建 eBPF 管理器
-    ///
-    /// 指定 eBPF 程序要附着的网卡名。
-    /// 此时不会加载 eBPF 程序，需要调用 [`load()`](EbpfManager::load)。
-    ///
-    /// # 参数
-    ///
-    /// * `iface` — 目标网卡名（如 `"eth0"`、`"dae0"`）
-    pub fn new(iface: &str) -> Self {
-        Self {
-            ebpf: None,
-            links: Vec::new(),
-            iface: iface.to_string(),
-            bpf_path: DEFAULT_EBPF_PATH.to_string(),
-        }
-    }
-
-    /// 创建 eBPF 管理器，指定自定义字节码路径
-    ///
-    /// # 参数
-    ///
-    /// * `iface` — 目标网卡名
-    /// * `bpf_path` — eBPF 字节码文件路径
-    pub fn new_with_path(iface: &str, bpf_path: &str) -> Self {
-        Self {
-            ebpf: None,
-            links: Vec::new(),
-            iface: iface.to_string(),
-            bpf_path: bpf_path.to_string(),
-        }
-    }
-
-    /// 加载 eBPF 程序
-    ///
-    /// 从字节码文件加载 eBPF 对象，aya 会自动解析 map 定义。
-    /// 加载后可以通过 map API 获取 map 句柄。
-    ///
-    /// # 加载流程
-    ///
-    /// 1. 调用 [`Ebpf::load_file`] 从字节码文件加载
-    /// 2. aya 自动验证字节码并创建 map
-    /// 3. 保存 Ebpf 对象供后续操作
-    ///
-    /// # 错误
-    ///
-    /// - 如果 eBPF 已加载，返回 [`EbpfError::AlreadyLoaded`]
-    /// - 字节码文件不存在或格式错误
-    /// - 内核拒绝加载（如 verifier 失败）
-    pub fn load(&mut self) -> Result<()> {
-        if self.ebpf.is_some() {
-            return Err(EbpfError::AlreadyLoaded.into());
-        }
-
-        let path = Path::new(&self.bpf_path);
-        info!(
-            bpf_path = %self.bpf_path,
-            iface = %self.iface,
-            "Loading eBPF program"
-        );
-
-        // 使用 aya 的 Ebpf::load_file 从编译后的 .o 文件加载
-        let ebpf = Ebpf::load_file(path)
-            .with_context(|| format!("Failed to load eBPF bytecode from {}", self.bpf_path))?;
-
-        info!("eBPF program loaded successfully from {}", self.bpf_path);
-
-        self.ebpf = Some(ebpf);
-        Ok(())
-    }
-
-    /// 从字节切片加载 eBPF 程序（替代从文件加载）
-    ///
-    /// 适用于 eBPF 字节码内嵌到二进制或从其他来源获取的场景。
-    ///
-    /// # 参数
-    ///
-    /// * `bytes` — eBPF 字节码切片
-    pub fn load_from_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        if self.ebpf.is_some() {
-            return Err(EbpfError::AlreadyLoaded.into());
-        }
-
-        info!(
-            len = bytes.len(),
-            iface = %self.iface,
-            "Loading eBPF program from byte slice"
-        );
-
-        let ebpf = Ebpf::load(bytes)
-            .context("Failed to load eBPF bytecode from memory")?;
-
-        info!("eBPF program loaded successfully from byte slice");
-
-        self.ebpf = Some(ebpf);
-        Ok(())
-    }
-
-    /// 附着 TC 程序到目标网卡
-    ///
-    /// 将 ingress 和 egress 两个 TC 程序附着到目标网卡。
-    /// 附着后，所有经过该网卡的流量都会经过 eBPF 程序处理。
-    ///
-    /// # 附着流程
-    ///
-    /// 1. 从 `Ebpf` 对象获取 `tc_ingress` 程序
-    /// 2. 使用 [`SchedClassifier::attach`] 附着到 Ingress 方向
-    /// 3. 通过 `take_link` 获取链接所有权，保存到 links 列表
-    /// 4. 从 `Ebpf` 对象获取 `tc_egress` 程序
-    /// 5. 使用 [`SchedClassifier::attach`] 附着到 Egress 方向
-    /// 6. 通过 `take_link` 获取链接所有权，保存到 links 列表
-    ///
-    /// # 错误
-    ///
-    /// - 如果 eBPF 未加载，返回 [`EbpfError::NotLoaded`]
-    /// - TC 程序名不存在或类型不匹配
-    /// - 内核拒绝附着
-    pub fn attach_tc(&mut self) -> Result<()> {
-        let ebpf = self.ebpf.as_mut()
-            .ok_or(EbpfError::NotLoaded)?;
-
-        info!(
-            iface = %self.iface,
-            "Attaching TC programs (ingress + egress)"
-        );
-
-        // ---- 附着 Ingress ----
-        let ingress_prog: &mut SchedClassifier = ebpf
-            .program_mut("tc_ingress")
-            .context("Failed to get 'tc_ingress' program from eBPF object")?
-            .try_into()
-            .context("Program 'tc_ingress' is not a SchedClassifier")?;
-
-        let ingress_link_id = ingress_prog
-            .attach(&self.iface, TcAttachType::Ingress)
-            .map_err(|e| EbpfError::TcAttachError {
-                iface: self.iface.clone(),
-                detail: format!("ingress attach failed: {}", e),
-            })?;
-
-        // 通过 take_link 获取链接所有权，确保 Drop 时自动分离
-        let ingress_link = ingress_prog
-            .take_link(ingress_link_id)
-            .context("Failed to take ownership of ingress link")?;
-
-        info!("TC ingress attached to {}", self.iface);
-
-        // ---- 附着 Egress ----
-        let egress_prog: &mut SchedClassifier = ebpf
-            .program_mut("tc_egress")
-            .context("Failed to get 'tc_egress' program from eBPF object")?
-            .try_into()
-            .context("Program 'tc_egress' is not a SchedClassifier")?;
-
-        let egress_link_id = egress_prog
-            .attach(&self.iface, TcAttachType::Egress)
-            .map_err(|e| EbpfError::TcAttachError {
-                iface: self.iface.clone(),
-                detail: format!("egress attach failed: {}", e),
-            })?;
-
-        let egress_link = egress_prog
-            .take_link(egress_link_id)
-            .context("Failed to take ownership of egress link")?;
-
-        info!("TC egress attached to {}", self.iface);
-
-        // 保存 links（Drop 时会自动 detach）
-        self.links.push(ingress_link);
-        self.links.push(egress_link);
-
-        info!("Both TC programs attached successfully to {}", self.iface);
-        Ok(())
-    }
-
-    /// 分离 TC 程序
-    ///
-    /// 从目标网卡分离 ingress 和 egress 两端的 TC 程序。
-    /// 分离后流量不再经过 eBPF 处理。
-    ///
-    /// # 分离流程
-    ///
-    /// drop 保存的 [`SchedClassifierLink`] 列表，自动分离 TC 程序。
-    pub fn detach_tc(&mut self) -> Result<()> {
-        if self.links.is_empty() {
-            info!("No TC links to detach");
-            return Ok(());
-        }
-
-        info!(
-            iface = %self.iface,
-            count = self.links.len(),
-            "Detaching TC programs"
-        );
-
-        // 清空 links 列表，SchedClassifierLink 的 Drop 实现会自动 detach
-        self.links.clear();
-
-        info!("All TC programs detached from {}", self.iface);
-        Ok(())
-    }
-
-    /// 卸载 eBPF 程序
-    ///
-    /// 完整的卸载流程：
-    /// 1. 先分离 TC 程序（如果还未分离）
-    /// 2. 销毁 `Ebpf` 对象（自动释放内核资源，包括 maps、programs）
-    ///
-    /// # 注意
-    ///
-    /// 卸载后管理器回到初始状态，可以重新调用 [`load()`](EbpfManager::load) 加载。
-    pub fn unload(&mut self) -> Result<()> {
-        info!("Unloading eBPF program");
-
-        // 先分离 TC（如果还未分离）
-        self.detach_tc()?;
-
-        // 销毁 Ebpf 对象，释放所有内核资源
-        self.ebpf.take();
-
-        info!("eBPF program unloaded successfully");
-        Ok(())
-    }
-
-    /// 获取指定的 eBPF map（只读引用）
-    ///
-    /// 获取指定的 eBPF map（只读引用）
-    ///
-    /// 按名称获取 map 的引用，用于后续读写操作。
-    ///
-    /// # 参数
-    ///
-    /// * `name` — map 名称（如 `"RULES_MAP"`、`"STATS_MAP"`）
-    ///
-    /// # 错误
-    ///
-    /// - 如果 eBPF 未加载，返回 [`EbpfError::NotLoaded`]
-    /// - map 不存在，返回 [`EbpfError::MapNotFound`]
-    pub fn get_map(&self, name: &str) -> Result<&Map> {
-        let ebpf = self.ebpf.as_ref()
-            .ok_or(EbpfError::NotLoaded)?;
-
-        ebpf.map(name)
-            .ok_or_else(|| EbpfError::MapNotFound { name: name.to_string() }.into())
-    }
-
-    /// 获取指定的 eBPF map（可变引用）
-    ///
-    /// 按名称获取 map 的可变引用，用于写入操作。
-    pub fn get_map_mut(&mut self, name: &str) -> Result<&mut Map> {
-        let ebpf = self.ebpf.as_mut()
-            .ok_or(EbpfError::NotLoaded)?;
-
-        ebpf.map_mut(name)
-            .ok_or_else(|| EbpfError::MapNotFound { name: name.to_string() }.into())
-    }
-
-    /// 将规则列表写入 RULES_MAP
-    ///
-    /// 按索引逐个写入规则条目。规则按优先级排序，索引越小优先级越高。
-    /// 写入后清空剩余槽位（写入空规则），确保旧规则不会残留。
-    ///
-    /// # 参数
-    ///
-    /// * `rules` — 规则条目列表，按优先级排序
-    pub fn write_rules(&mut self, rules: &[RuleEntry]) -> Result<()> {
-        let ebpf = self.ebpf.as_mut()
-            .ok_or(EbpfError::NotLoaded)?;
-
-        info!(
-            rule_count = rules.len(),
-            max_entries = RULES_MAP_MAX,
-            "Writing rules to RULES_MAP"
-        );
-
-        // 获取 RULES_MAP 并转换为 Array
-        let map = ebpf.map_mut("RULES_MAP")
-            .ok_or_else(|| EbpfError::MapNotFound { name: "RULES_MAP".to_string() })?;
-
-        let mut array = Array::<&mut aya::maps::MapData, RuleEntry>::try_from(map)
-            .map_err(|_| EbpfError::MapTypeMismatch {
-                name: "RULES_MAP".to_string(),
-                expected: "Array<RuleEntry>",
-                actual: "unknown",
-            })?;
-
-        // 写入规则
-        for (i, rule) in rules.iter().enumerate() {
-            let index = i as u32;
-            array.set(index, *rule, 0)
-                .with_context(|| format!("Failed to write rule at index {}", i))?;
-        }
-
-        // 清空剩余槽位
-        if rules.len() < RULES_MAP_MAX as usize {
-            let empty_rule = RuleEntry::default();
-            for i in rules.len()..RULES_MAP_MAX as usize {
-                let index = i as u32;
-                let _ = array.set(index, empty_rule, 0);
-                // 忽略错误：剩余槽位可能未初始化
-            }
-        }
-
-        info!("Successfully wrote {} rules to RULES_MAP", rules.len());
-        Ok(())
-    }
-
-    /// 写入排除进程名到 EXCLUDED_COMM_MAP
-    ///
-    /// # 参数
-    ///
-    /// * `comm_hashes` — 进程名 hash 列表
-    pub fn write_excluded_comm(&mut self, comm_hashes: &[u32]) -> Result<()> {
-        let ebpf = self.ebpf.as_mut()
-            .ok_or(EbpfError::NotLoaded)?;
-
-        let map = ebpf.map_mut("EXCLUDED_COMM_MAP")
-            .ok_or_else(|| EbpfError::MapNotFound { name: "EXCLUDED_COMM_MAP".to_string() })?;
-
-        let mut hmap = HashMap::<&mut aya::maps::MapData, u32, u8>::try_from(map)
-            .map_err(|_| EbpfError::MapTypeMismatch {
-                name: "EXCLUDED_COMM_MAP".to_string(),
-                expected: "HashMap<u32, u8>",
-                actual: "unknown",
-            })?;
-
-        for hash in comm_hashes {
-            hmap.insert(*hash, 1, 0)
-                .with_context(|| format!("Failed to insert excluded comm hash {}", hash))?;
-        }
-
-        info!("Wrote {} excluded comm hashes", comm_hashes.len());
-        Ok(())
-    }
-
-    /// 写入排除 PID 到 EXCLUDED_PID_MAP
-    ///
-    /// # 参数
-    ///
-    /// * `pids` — 要排除的 PID 列表
-    pub fn write_excluded_pids(&mut self, pids: &[u32]) -> Result<()> {
-        let ebpf = self.ebpf.as_mut()
-            .ok_or(EbpfError::NotLoaded)?;
-
-        let map = ebpf.map_mut("EXCLUDED_PID_MAP")
-            .ok_or_else(|| EbpfError::MapNotFound { name: "EXCLUDED_PID_MAP".to_string() })?;
-
-        let mut hmap = HashMap::<&mut aya::maps::MapData, u32, u8>::try_from(map)
-            .map_err(|_| EbpfError::MapTypeMismatch {
-                name: "EXCLUDED_PID_MAP".to_string(),
-                expected: "HashMap<u32, u8>",
-                actual: "unknown",
-            })?;
-
-        for pid in pids {
-            hmap.insert(*pid, 1, 0)
-                .with_context(|| format!("Failed to insert excluded pid {}", pid))?;
-        }
-
-        info!("Wrote {} excluded PIDs", pids.len());
-        Ok(())
-    }
-
-    /// 读取统计计数
-    ///
-    /// 从 STATS_MAP 读取所有统计值。
-    ///
-    /// # 返回
-    ///
-    /// 包含所有统计项的数组，索引对应 [`StatIndex`] 枚举。
-    pub fn read_stats(&mut self) -> Result<[u64; STATS_MAP_SIZE as usize]> {
-        let ebpf = self.ebpf.as_mut()
-            .ok_or(EbpfError::NotLoaded)?;
-
-        let map = ebpf.map_mut("STATS_MAP")
-            .ok_or_else(|| EbpfError::MapNotFound { name: "STATS_MAP".to_string() })?;
-
-        let array = Array::<&mut aya::maps::MapData, u64>::try_from(map)
-            .map_err(|_| EbpfError::MapTypeMismatch {
-                name: "STATS_MAP".to_string(),
-                expected: "Array<u64>",
-                actual: "unknown",
-            })?;
-
-        let mut stats = [0u64; STATS_MAP_SIZE as usize];
-        for i in 0..STATS_MAP_SIZE {
-            if let Ok(value) = array.get(&i, 0) {
-                stats[i as usize] = value;
-            }
-        }
-
-        Ok(stats)
-    }
-
-    /// 检查 eBPF 是否已加载
-    pub fn is_loaded(&self) -> bool {
-        self.ebpf.is_some()
-    }
-
-    /// 检查 TC 是否已附着
-    pub fn is_attached(&self) -> bool {
-        !self.links.is_empty()
-    }
-
-    /// 获取目标网卡名
-    pub fn iface(&self) -> &str {
-        &self.iface
-    }
-
-    /// 获取 TC 链接数量
-    pub fn link_count(&self) -> usize {
-        self.links.len()
-    }
-}
-
-impl Drop for EbpfManager {
-    /// Drop 时自动卸载
-    ///
-    /// 如果用户忘记调用 [`unload()`](EbpfManager::unload)，
-    /// Drop 实现会自动分离 TC 并释放 eBPF 资源。
-    fn drop(&mut self) {
-        if self.ebpf.is_some() || !self.links.is_empty() {
-            warn!("EbpfManager dropped without explicit unload(), cleaning up");
-            let _ = self.unload();
-        }
-    }
-}
-
-// ============================================================================
-// 辅助函数
-// ============================================================================
-
-/// 计算进程名的 djb2 hash（与 eBPF 端的 hash_comm 完全一致）
-///
-/// 使用与内核 TASK_COMM_LEN 一致的 16 字节限制。
 pub fn hash_comm(comm: &str) -> u32 {
     let mut hash: u32 = 5381;
     let bytes = comm.as_bytes();
     let mut i = 0;
     while i < 16 && i < bytes.len() {
         let c = bytes[i];
-        if c == 0 {
-            break;
-        }
+        if c == 0 { break; }
         hash = hash.wrapping_mul(33).wrapping_add(c as u32);
         i += 1;
     }
     hash
 }
 
-/// 构建默认的 eBPF 字节码路径
-///
-/// 在目标系统上，eBPF .o 文件通常安装到以下路径之一：
-/// - `/etc/dae-rs/ebpf.o`（系统安装）
-/// - `/usr/local/lib/dae-rs/ebpf.o`（本地安装）
-/// - 相对于可执行文件的路径（开发阶段）
-pub fn default_bpf_path() -> String {
-    DEFAULT_EBPF_PATH.to_string()
+/// Find a program by name in the loaded object.
+fn find_prog<'a>(obj: &'a Object, name: &str) -> Result<libbpf_rs::ProgramMut<'a>> {
+    let name_os = OsStr::new(name);
+    obj.progs_mut()
+        .find(|p| p.name() == name_os)
+        .ok_or_else(|| anyhow::anyhow!("Program '{}' not found", name))
+}
+
+/// Find a map by name in the loaded object (mutable).
+fn find_map_mut<'a>(obj: &'a mut Object, name: &str) -> Result<libbpf_rs::MapMut<'a>> {
+    let name_os = OsStr::new(name);
+    obj.maps_mut()
+        .find(|m| m.name() == name_os)
+        .ok_or_else(|| EbpfError::MapNotFound { name: name.to_string() }.into())
+}
+
+/// Find a map by name in the loaded object (immutable).
+fn find_map<'a>(obj: &'a Object, name: &str) -> Result<libbpf_rs::Map<'a>> {
+    let name_os = OsStr::new(name);
+    obj.maps()
+        .find(|m| m.name() == name_os)
+        .ok_or_else(|| EbpfError::MapNotFound { name: name.to_string() }.into())
 }
 
 // ============================================================================
-// 单元测试
+// Helpers: set program types for non-standard SEC() names
+// ============================================================================
+
+/// The C eBPF source (tproxy.c) uses non-standard TC section names like
+/// `SEC("tc/lan_egress_l2")`, `SEC("tc/dae0_ingress")`, etc.
+/// Standard libbpf only auto-detects `tc/ingress` and `tc/egress`.
+/// This function sets the correct program type for each unrecognized TC section
+/// so that `bpf_object__load()` will succeed.
+fn set_tc_prog_types(open_obj: &mut libbpf_rs::OpenObject) {
+    for mut prog in open_obj.progs_mut() {
+        let section = prog.section().to_str().unwrap_or("").to_string();
+        let name = prog.name().to_str().unwrap_or("").to_string();
+        if section.starts_with("tc/") {
+            let old_type = prog.prog_type();
+            if matches!(old_type, ProgramType::Unspec) {
+                prog.set_prog_type(ProgramType::SchedCls);
+                info!(
+                    "Set program type: '{}' (section '{}'): {:?} -> SchedCls",
+                    name, section, old_type
+                );
+            } else {
+                info!(
+                    "Program '{}' (section '{}') already has type {:?}, skipping",
+                    name, section, old_type
+                );
+            }
+        } else {
+            info!(
+                "Program '{}' (section '{}'): type is {:?} (auto-detected)",
+                name,
+                section,
+                prog.prog_type()
+            );
+        }
+    }
+}
+
+// ============================================================================
+// EbpfManager
+// ============================================================================
+
+/// Metadata for a TC hook attachment
+#[derive(Debug)]
+struct TcAttachInfo {
+    hook: TcHook,
+    iface: String,
+    prog_name: String,
+}
+
+/// eBPF program lifecycle manager.
+pub struct EbpfManager {
+    obj: Option<Object>,
+    tc_hooks: Vec<TcAttachInfo>,
+    cgroup_links: Vec<libbpf_rs::Link>,
+    iface: String,
+    bpf_path: String,
+    param: Option<Daeparam>,
+}
+
+// Safety: EbpfManager is only accessed through RwLock<ControlPlane>
+unsafe impl Sync for EbpfManager {}
+unsafe impl Send for EbpfManager {}
+
+impl EbpfManager {
+    pub fn new(iface: &str) -> Self {
+        Self {
+            obj: None,
+            tc_hooks: Vec::new(),
+            cgroup_links: Vec::new(),
+            iface: iface.to_string(),
+            bpf_path: DEFAULT_EBPF_PATH.to_string(),
+            param: None,
+        }
+    }
+
+    pub fn new_with_path(iface: &str, bpf_path: &str) -> Self {
+        Self {
+            obj: None,
+            tc_hooks: Vec::new(),
+            cgroup_links: Vec::new(),
+            iface: iface.to_string(),
+            bpf_path: bpf_path.to_string(),
+            param: None,
+        }
+    }
+
+    pub fn set_param(&mut self, param: &Daeparam) {
+        self.param = Some(*param);
+    }
+
+    /// Load eBPF from file using libbpf ObjectBuilder.
+    pub fn load(&mut self) -> Result<()> {
+        if self.obj.is_some() {
+            return Err(EbpfError::AlreadyLoaded.into());
+        }
+
+        let path = Path::new(&self.bpf_path);
+        info!(bpf_path = %self.bpf_path, iface = %self.iface, "Loading eBPF program via libbpf-rs");
+
+        let mut builder = ObjectBuilder::default();
+        let mut open_obj = builder
+            .open_file(path)
+            .with_context(|| format!("Failed to open eBPF object from {}", self.bpf_path))?;
+
+        // Set PARAM in .rodata map before loading
+        if let Some(ref param) = self.param {
+            let param_bytes = bytemuck::bytes_of(param);
+            for mut map in open_obj.maps_mut() {
+                if map.name() == OsStr::new(".rodata") {
+                    map.set_initial_value(param_bytes)
+                        .with_context(|| "Failed to set .rodata initial value")?;
+                    info!("PARAM set in .rodata ({} bytes)", param_bytes.len());
+                    break;
+                }
+            }
+        }
+
+        // Fix program types for non-standard TC section names before loading
+        set_tc_prog_types(&mut open_obj);
+
+        let obj = open_obj.load().context("Failed to load eBPF object into kernel")?;
+        info!("eBPF program loaded successfully via libbpf-rs");
+        self.obj = Some(obj);
+        Ok(())
+    }
+
+    /// Load eBPF from memory buffer.
+    pub fn load_from_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.obj.is_some() {
+            return Err(EbpfError::AlreadyLoaded.into());
+        }
+
+        info!(len = bytes.len(), "Loading eBPF from byte slice via libbpf-rs");
+
+        let mut builder = ObjectBuilder::default();
+        let mut open_obj = builder
+            .open_memory(bytes)
+            .context("Failed to open eBPF object from memory")?;
+
+        if let Some(ref param) = self.param {
+            let param_bytes = bytemuck::bytes_of(param);
+            for mut map in open_obj.maps_mut() {
+                if map.name() == OsStr::new(".rodata") {
+                    map.set_initial_value(param_bytes)
+                        .with_context(|| "Failed to set .rodata initial value")?;
+                    info!("PARAM set in .rodata ({} bytes)", param_bytes.len());
+                    break;
+                }
+            }
+        }
+
+        // Fix program types for non-standard TC section names before loading
+        set_tc_prog_types(&mut open_obj);
+
+        let obj = open_obj.load().context("Failed to load eBPF object from memory into kernel")?;
+        info!("eBPF program loaded from byte slice via libbpf-rs");
+        self.obj = Some(obj);
+        Ok(())
+    }
+
+    // ========================================================================
+    // 通用 TC attach — 将指定程序列表挂载到目标接口
+    // ========================================================================
+
+    /// 通用 TC attach：将指定的程序列表挂载到目标接口
+    ///
+    /// # 参数
+    ///
+    /// * `ifname` — 目标接口名称
+    /// * `progs` — 程序列表，每项为 (程序名, attach_point)
+    ///   attach_point 使用 libbpf_rs::TC_INGRESS 或 libbpf_rs::TC_EGRESS
+    pub fn attach_tc(&mut self, ifname: &str, progs: &[(&str, u32)]) -> Result<()> {
+        let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
+        let ifindex = if_nametoindex(ifname)
+            .map_err(|e| EbpfError::TcAttachError {
+                iface: ifname.into(),
+                detail: format!("if_nametoindex: {}", e),
+            })?;
+
+        info!(iface = %ifname, ifindex = %ifindex, count = %progs.len(), "Attaching TC programs");
+
+        for (prog_name, attach_point) in progs {
+            let prog = match find_prog(obj, prog_name) {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!("TC program '{}' not found, skipping", prog_name);
+                    continue;
+                }
+            };
+
+            let mut hook = TcHook::new(prog.as_fd());
+            hook.ifindex(ifindex);
+            hook.attach_point(*attach_point);
+
+            // Create clsact qdisc (no-op if already exists)
+            hook.create()
+                .map_err(|e| EbpfError::TcAttachError {
+                    iface: ifname.into(),
+                    detail: format!("create({}): {}", prog_name, e),
+                })?;
+
+            // Attach the program
+            let attached = hook.attach()
+                .map_err(|e| EbpfError::TcAttachError {
+                    iface: ifname.into(),
+                    detail: format!("attach({}): {}", prog_name, e),
+                })?;
+
+            self.tc_hooks.push(TcAttachInfo {
+                hook: attached,
+                iface: ifname.into(),
+                prog_name: prog_name.to_string(),
+            });
+            info!("TC program '{}' attached to {} (ifindex={})", prog_name, ifname, ifindex);
+        }
+
+        info!("TC programs attached to {} (total hooks: {})", ifname, self.tc_hooks.len());
+        Ok(())
+    }
+
+    // ========================================================================
+    // 按接口分组 TC attach
+    // ========================================================================
+
+    /// WAN 接口：挂载 wan_egress + wan_ingress（各 L2/L3 两版本）
+    ///
+    /// 程序列表：
+    /// - tproxy_wan_egress_l2 (EGRESS), tproxy_wan_egress_l3 (EGRESS)
+    /// - tproxy_wan_ingress_l2 (INGRESS), tproxy_wan_ingress_l3 (INGRESS)
+    pub fn attach_wan(&mut self, ifname: &str) -> Result<()> {
+        info!("Attaching WAN TC programs to {}", ifname);
+        self.attach_tc(ifname, &[
+            ("tproxy_wan_egress_l2", TC_EGRESS),
+            ("tproxy_wan_egress_l3", TC_EGRESS),
+            ("tproxy_wan_ingress_l2", TC_INGRESS),
+            ("tproxy_wan_ingress_l3", TC_INGRESS),
+        ])
+    }
+
+    /// LAN 接口：挂载 lan_ingress + lan_egress（各 L2/L3 两版本）
+    ///
+    /// 程序列表：
+    /// - tproxy_lan_ingress_l2 (INGRESS), tproxy_lan_ingress_l3 (INGRESS)
+    /// - tproxy_lan_egress_l2 (EGRESS), tproxy_lan_egress_l3 (EGRESS)
+    pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
+        info!("Attaching LAN TC programs to {}", ifname);
+        self.attach_tc(ifname, &[
+            ("tproxy_lan_ingress_l2", TC_INGRESS),
+            ("tproxy_lan_ingress_l3", TC_INGRESS),
+            ("tproxy_lan_egress_l2", TC_EGRESS),
+            ("tproxy_lan_egress_l3", TC_EGRESS),
+        ])
+    }
+
+    /// dae0（宿主 NS）：挂载 tproxy_dae0_ingress
+    pub fn attach_dae0(&mut self, ifname: &str) -> Result<()> {
+        info!("Attaching dae0 TC program to {}", ifname);
+        self.attach_tc(ifname, &[
+            ("tproxy_dae0_ingress", TC_INGRESS),
+        ])
+    }
+
+    /// dae0peer（代理 NS）：挂载 tproxy_dae0peer_ingress
+    pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
+        info!("Attaching dae0peer TC program to {}", ifname);
+        self.attach_tc(ifname, &[
+            ("tproxy_dae0peer_ingress", TC_INGRESS),
+        ])
+    }
+
+    // ========================================================================
+    // cgroup 程序 attach
+    // ========================================================================
+
+    /// 在代理 NS 中 attach cgroup 程序
+    ///
+    /// tproxy.c 中有 6 个 cgroup 程序需要 attach：
+    /// - tproxy_wan_cg_sock_create (cgroup/sock_create)
+    /// - tproxy_wan_cg_sock_release (cgroup/sock_release)
+    /// - tproxy_wan_cg_connect4 (cgroup/connect4)
+    /// - tproxy_wan_cg_connect6 (cgroup/connect6)
+    /// - tproxy_wan_cg_sendmsg4 (cgroup/sendmsg4)
+    /// - tproxy_wan_cg_sendmsg6 (cgroup/sendmsg6)
+    ///
+    /// # 参数
+    ///
+    /// * `cgroup_fd` — cgroup 文件描述符（通常为 /sys/fs/cgroup 的 fd）
+    pub fn attach_cgroup(&mut self, cgroup_fd: std::os::unix::io::RawFd) -> Result<()> {
+        let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
+
+        let cgroup_progs = [
+            "tproxy_wan_cg_sock_create",
+            "tproxy_wan_cg_sock_release",
+            "tproxy_wan_cg_connect4",
+            "tproxy_wan_cg_connect6",
+            "tproxy_wan_cg_sendmsg4",
+            "tproxy_wan_cg_sendmsg6",
+        ];
+
+        for name in &cgroup_progs {
+            let prog = match find_prog(obj, name) {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!("cgroup program '{}' not found, skipping", name);
+                    continue;
+                }
+            };
+
+            // libbpf-rs ProgramMut::attach_cgroup takes a raw fd (i32)
+            match prog.attach_cgroup(cgroup_fd) {
+                Ok(link) => {
+                    self.cgroup_links.push(link);
+                    info!("cgroup program '{}' attached", name);
+                }
+                Err(e) => {
+                    warn!("Failed to attach cgroup program '{}': {}", name, e);
+                }
+            }
+        }
+
+        info!("cgroup programs attached ({} links)", self.cgroup_links.len());
+        Ok(())
+    }
+
+    // ========================================================================
+    // 分离 & 卸载
+    // ========================================================================
+
+    /// 分离所有 TC 程序和 cgroup 程序
+    pub fn detach_all(&mut self) -> Result<()> {
+        // Detach TC hooks
+        if !self.tc_hooks.is_empty() {
+            info!(count = self.tc_hooks.len(), "Detaching TC programs");
+            for info in self.tc_hooks.iter_mut() {
+                if let Err(e) = info.hook.detach() {
+                    warn!("Failed to detach TC hook '{}' on {}: {}",
+                        info.prog_name, info.iface, e);
+                }
+            }
+            self.tc_hooks.clear();
+        }
+
+        // Detach cgroup links (drop the ProgramAttachment)
+        if !self.cgroup_links.is_empty() {
+            info!(count = self.cgroup_links.len(), "Detaching cgroup programs");
+            self.cgroup_links.clear();
+        }
+
+        Ok(())
+    }
+
+    /// 卸载 eBPF 程序（先分离所有 hook，再释放对象）
+    pub fn unload(&mut self) -> Result<()> {
+        info!("Unloading eBPF program");
+        self.detach_all()?;
+        self.obj.take();
+        Ok(())
+    }
+
+    // ============================================================================
+    // Map Operations
+    // ============================================================================
+
+    fn get_map_mut(&mut self, name: &str) -> Result<libbpf_rs::MapMut<'_>> {
+        let obj = self.obj.as_mut().ok_or(EbpfError::NotLoaded)?;
+        find_map_mut(obj, name)
+    }
+
+    /// Write rules (RuleEntry → MatchSet conversion) to routing_map.
+    pub fn write_rules(&mut self, rules: &[RuleEntry]) -> Result<()> {
+        let match_sets: Vec<MatchSet> = rules.iter().map(MatchSet::from).collect();
+        self.write_routing_rules(&match_sets)
+    }
+
+    /// Write MatchSet entries to routing_map.
+    pub fn write_routing_rules(&mut self, match_sets: &[MatchSet]) -> Result<()> {
+        info!(count = match_sets.len(), "Writing routing rules to routing_map");
+        let mut map = self.get_map_mut("routing_map")?;
+
+        for (i, ms) in match_sets.iter().enumerate() {
+            let key = (i as u32).to_ne_bytes();
+            map.update(&key, bytemuck::bytes_of(ms), MapFlags::empty())
+                .with_context(|| format!("Failed to write match_set at index {}", i))?;
+        }
+
+        let empty = MatchSet::zeroed();
+        for i in match_sets.len()..ROUTING_MAP_MAX as usize {
+            let key = (i as u32).to_ne_bytes();
+            let _ = map.update(&key, bytemuck::bytes_of(&empty), MapFlags::empty())?;
+        }
+
+        let mut meta_map = self.get_map_mut("routing_meta_map")?;
+        let meta_key = 0u32.to_ne_bytes();
+        let active_len = match_sets.len() as u32;
+        meta_map.update(&meta_key, &active_len.to_ne_bytes(), MapFlags::empty())?;
+        info!("Wrote {} match sets, active_len={}", match_sets.len(), active_len);
+        Ok(())
+    }
+
+    /// Write CIDR entries to lpm_array_map.
+    pub fn write_cidr_table(&mut self, entries: &[(u32, CidrEntry)]) -> Result<()> {
+        info!(count = entries.len(), "Writing CIDR entries");
+        let mut map = self.get_map_mut("lpm_array_map")?;
+        for (index, entry) in entries {
+            let key = bytemuck::bytes_of(index);
+            let val = bytemuck::bytes_of(entry);
+            map.update(key, val, MapFlags::empty()).with_context(|| format!("CIDR entry at index {}", index))?;
+        }
+        info!("Wrote {} CIDR entries", entries.len());
+        Ok(())
+    }
+
+    /// Read conntrack entry from conn_state_map.
+    pub fn read_conntrack(&mut self, key: &TuplesKey) -> Result<Option<ConnState>> {
+        let mut map = self.get_map_mut("conn_state_map")?;
+        let key_bytes = bytemuck::bytes_of(key);
+        match map.lookup(key_bytes, MapFlags::empty()) {
+            Ok(Some(val)) => Ok(Some(bytemuck::pod_read_unaligned(&val))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("conn_state_map lookup: {}", e)),
+        }
+    }
+
+    /// Delete conntrack entry from conn_state_map.
+    pub fn delete_conntrack(&mut self, key: &TuplesKey) -> Result<()> {
+        let mut map = self.get_map_mut("conn_state_map")?;
+        let _ = map.delete(bytemuck::bytes_of(key));
+        Ok(())
+    }
+
+    /// Read stats from bpf_stats_map.
+    pub fn read_stats(&mut self) -> Result<[u64; STATS_MAP_SIZE as usize]> {
+        let mut map = self.get_map_mut("bpf_stats_map")?;
+        let mut stats = [0u64; STATS_MAP_SIZE as usize];
+        for i in 0..STATS_MAP_SIZE {
+            let key = i.to_ne_bytes();
+            if let Ok(Some(val_bytes)) = map.lookup(&key, MapFlags::empty()) {
+                if val_bytes.len() >= 8 {
+                    stats[i as usize] = u64::from_ne_bytes(val_bytes[..8].try_into().unwrap());
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Write excluded comm hashes to cookie_pid_map.
+    pub fn write_excluded_comm(&mut self, comm_hashes: &[u32]) -> Result<()> {
+        info!(count = comm_hashes.len(), "Writing excluded comm hashes");
+        let mut map = self.get_map_mut("cookie_pid_map")?;
+        for hash in comm_hashes {
+            let key = (*hash as u64).to_ne_bytes();
+            let val = ProcInfo::zeroed();
+            map.update(&key, bytemuck::bytes_of(&val), MapFlags::empty())
+                .with_context(|| format!("insert comm hash {}", hash))?;
+        }
+        Ok(())
+    }
+
+    /// Write excluded PIDs to cookie_pid_map.
+    pub fn write_excluded_pids(&mut self, pids: &[u32]) -> Result<()> {
+        info!(count = pids.len(), "Writing excluded PIDs");
+        let mut map = self.get_map_mut("cookie_pid_map")?;
+        for pid in pids {
+            let key = (*pid as u64).to_ne_bytes();
+            let val = ProcInfo { last_seen_ns: 0, pid: *pid, pname: [0u8; 16], _tail_pad: [0u8; 4] };
+            map.update(&key, bytemuck::bytes_of(&val), MapFlags::empty())
+                .with_context(|| format!("insert PID {}", pid))?;
+        }
+        Ok(())
+    }
+
+    // ============================================================================
+    // Status Queries
+    // ============================================================================
+
+    /// eBPF 程序是否已加载
+    pub fn is_loaded(&self) -> bool { self.obj.is_some() }
+
+    /// 是否有任何 TC 程序已 attach
+    pub fn is_attached(&self) -> bool { !self.tc_hooks.is_empty() }
+
+    /// 默认接口名（兼容旧代码）
+    pub fn iface(&self) -> &str { &self.iface }
+
+    /// TC hook 总数
+    pub fn tc_link_count(&self) -> usize { self.tc_hooks.len() }
+
+    /// cgroup link 总数
+    pub fn cgroup_link_count(&self) -> usize { self.cgroup_links.len() }
+
+    /// 所有 link 总数（TC + cgroup）
+    pub fn link_count(&self) -> usize { self.tc_hooks.len() + self.cgroup_links.len() }
+}
+
+impl Drop for EbpfManager {
+    fn drop(&mut self) {
+        if self.obj.is_some() || !self.tc_hooks.is_empty() || !self.cgroup_links.is_empty() {
+            warn!("EbpfManager dropped without explicit unload()");
+            let _ = self.unload();
+        }
+    }
+}
+
+// ============================================================================
+// Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -676,47 +873,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ebpf_manager_new() {
-        let mgr = EbpfManager::new("eth0");
-        assert_eq!(mgr.iface, "eth0");
-        assert_eq!(mgr.bpf_path, DEFAULT_EBPF_PATH);
-        assert!(!mgr.is_loaded());
-        assert!(!mgr.is_attached());
-        assert_eq!(mgr.link_count(), 0);
+    fn test_tuples_key_size() { assert_eq!(std::mem::size_of::<TuplesKey>(), 40); }
+    #[test]
+    fn test_conn_state_size() { assert_eq!(std::mem::size_of::<ConnState>(), 56); }
+    #[test]
+    fn test_routing_meta_size() { assert_eq!(std::mem::size_of::<RoutingMeta>(), 8); }
+    #[test]
+    fn test_cidr_entry_size() { assert_eq!(std::mem::size_of::<CidrEntry>(), 24); }
+    #[test]
+    fn test_daeparam_size() { assert_eq!(std::mem::size_of::<Daeparam>(), 32); }
+    #[test]
+    fn test_rule_entry_size() { assert_eq!(std::mem::size_of::<RuleEntry>(), 34); }
+    #[test]
+    fn test_match_set_size() { assert_eq!(std::mem::size_of::<MatchSet>(), 24); }
+
+    #[test]
+    fn test_tuples_key_reverse() {
+        let key = TuplesKey::from_ipv4(&[10,0,0,1], &[8,8,8,8], 12345, 443, 6);
+        let rev = key.reverse();
+        assert_eq!(rev.sip, key.dip);
+        assert_eq!(rev.sport, key.dport);
     }
 
     #[test]
-    fn test_ebpf_manager_new_with_path() {
-        let mgr = EbpfManager::new_with_path("dae0", "/tmp/test_ebpf.o");
-        assert_eq!(mgr.iface, "dae0");
-        assert_eq!(mgr.bpf_path, "/tmp/test_ebpf.o");
+    fn test_hash_comm() {
+        assert_eq!(hash_comm(""), 5381);
+        assert_eq!(hash_comm("a"), 5381 * 33 + 97);
     }
 
     #[test]
-    fn test_rule_entry_default() {
-        let rule = RuleEntry::default();
-        assert_eq!(rule.dip, [0u8; 16]);
-        assert_eq!(rule.dip_prefix_len, 0);
-        assert_eq!(rule.dport, 0);
-        assert_eq!(rule.l4proto, 0);
-        assert_eq!(rule.action, 0);
+    fn test_rule_entry_to_match_set_port() {
+        let rule = RuleEntry { dip: [0u8;16], dip_prefix_len:0, _pad1:0, dport:80u16.to_be(), l4proto:0, action:0, _pad:[0u8;12] };
+        let ms = MatchSet::from(&rule);
+        assert_eq!(ms.r#type, match_type::PORT);
+        unsafe { assert_eq!(ms.value.port_range.port_start, 80); }
     }
 
     #[test]
-    fn test_rule_entry_size() {
-        // 检查 RuleEntry 的内存布局
-        // dip=[u8;16]=16, dip_prefix_len=1, [padding=1], dport=2, l4proto=1, action=1, _pad=12
-        // 总 = 16+1+1+2+1+1+12 = 34, 对齐到 4 => 36
-        assert_eq!(std::mem::size_of::<RuleEntry>(), 36);
-    }
-
-    #[test]
-    fn test_conntrack_entry_size() {
-        assert_eq!(std::mem::size_of::<ConntrackEntry>(), 8);
-    }
-
-    #[test]
-    fn test_proc_info_size() {
-        assert_eq!(std::mem::size_of::<ProcInfo>(), 32);
+    fn test_rule_entry_to_match_set_l4proto() {
+        let rule = RuleEntry { dip: [0u8;16], dip_prefix_len:0, _pad1:0, dport:0, l4proto:6, action:1, _pad:[0u8;12] };
+        let ms = MatchSet::from(&rule);
+        assert_eq!(ms.r#type, match_type::L4_PROTO);
+        unsafe { assert_eq!(ms.value.l4proto_type, 6); }
     }
 }

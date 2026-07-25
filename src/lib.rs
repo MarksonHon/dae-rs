@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::signal::unix::{signal, SignalKind};
 use anyhow::Context;
 
 /// Main run logic
@@ -76,9 +77,22 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
 
     // ── Phase 5: Create control plane ──
     tracing::info!("Initializing control plane...");
-    let control = Arc::new(RwLock::new(
-        control::ControlPlane::new(config)
-    ));
+    let mut cp = control::ControlPlane::new(config.clone());
+    // Embed eBPF bytecode compiled by build.rs
+    const EMBEDDED_EBPF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ebpf.o"));
+    cp.embedded_ebpf = Some(EMBEDDED_EBPF);
+    tracing::info!("Embedded eBPF bytecode: {} bytes", EMBEDDED_EBPF.len());
+    
+    // Set eBPF PARAM global variable
+    // This must be done after netns creation but before eBPF loading
+    // We'll set it in start() after netns is created
+    let mut ebpf_param = control::ebpf::Daeparam::default();
+    ebpf_param.tproxy_port = config.tproxy_port as u32;
+    ebpf_param.control_plane_pid = std::process::id();
+    // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
+    cp.ebpf_param = Some(ebpf_param);
+    
+    let control = Arc::new(RwLock::new(cp));
 
     // Store daefile content for config reload
     {
@@ -120,8 +134,18 @@ pub async fn run(config_path: Option<PathBuf>, log_level: String, json_log: bool
 
     // ── Phase 8: Wait for exit signal ──
     tracing::info!("dae-rs is running. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Shutdown signal received");
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = sigint.recv() => {
+            tracing::info!("Received SIGINT, initiating graceful shutdown");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("Received SIGTERM, initiating graceful shutdown");
+        }
+    }
 
     // ── Phase 9: Graceful shutdown ──
     // 9a. Stop API server

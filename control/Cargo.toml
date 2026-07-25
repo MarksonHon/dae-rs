@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aya = "0.13"
-aya-log = "0.2"
+# libbpf-rs: 用户空间 eBPF 管理（替代 aya）
+libbpf-rs = "0.24"
+# libbpf-sys: libbpf C 库的 Rust FFI 绑定
+libbpf-sys = "1.4"
+# 安全地进行结构体↔字节转换
+bytemuck = { version = "1", features = ["derive"] }
+
 tokio = { version = "1", features = ["full"] }
-nix = { version = "0.29", features = ["net", "sched", "signal", "process"] }
+nix = { version = "0.31", features = ["net", "sched", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -17,11 +22,14 @@ socket2 = "0.5"
 ipnet = "2"
 libc = "0.2"
 regex = "1"
-axum = "0.7"
-tower-http = { version = "0.5", features = ["cors", "auth", "trace"] }
+axum = "0.8"
+tower-http = { version = "0.7", features = ["cors", "auth", "trace"] }
 chrono = "0.4"
 shared = { path = "../shared" }
 protocols = { path = "../protocols" }
+
+[build-dependencies]
+libbpf-cargo = "0.24"
 
 [dev-dependencies]
 tower = "0.5"

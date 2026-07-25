@@ -1,4 +1,4 @@
-//! 匿名网络命名空间 + veth pair 管理
+//! 匿名网络命名空间 + veth/netkit pair 管理
 //!
 //! 本模块负责创建和管理匿名网络命名空间及 veth 对，用于将代理流量
 //! 从宿主命名空间导入到代理命名空间进行处理。
@@ -6,25 +6,34 @@
 //! ## 架构
 //!
 //! ```text
-//! ┌──────────────────────────────────────────┐
-//! │          宿主网络命名空间                  │
-//! │                                          │
-//! │  ┌─────────────┐      ┌──────────────┐   │
-//! │  │   eth0      │      │   dae0peer   │   │
-//! │  │  (外网)     │      │ 169.254.100.2│   │
-//! │  └─────────────┘      └──────┬───────┘   │
-//! │                               │           │
-//! ├───────────────────────────────┼───────────┤
-//! │           veth pair           │           │
-//! ├───────────────────────────────┼───────────┤
-//! │                               │           │
-//! │  ┌────────────────────────┐ ┌─┴────────┐  │
-//! │  │       dae0             │ │  lo       │  │
-//! │  │  169.254.100.1/30      │ │  (loop)   │  │
-//! │  └────────────────────────┘ └──────────┘  │
-//! │        代理网络命名空间                     │
-//! └──────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────┐
+//! │                   宿主网络命名空间                         │
+//! │                                                          │
+//! │  ┌─────────────┐  ┌──────────────┐                       │
+//! │  │   eth0      │  │   dae0       │                       │
+//! │  │  (外网)     │  │ 169.254.0.1  │                       │
+//! │  └─────────────┘  └──────┬───────┘                       │
+//! │                           │                               │
+//! ├───────────────────────────┼───────────────────────────────┤
+//! │       veth/netkit pair    │                               │
+//! ├───────────────────────────┼───────────────────────────────┤
+//! │                           │                               │
+//! │  ┌────────────────────┐ ┌─┴──────────────┐               │
+//! │  │   lo               │ │ dae0peer       │               │
+//! │  │   route table 2023 │ │169.254.0.11/16 │               │
+//! │  └────────────────────┘ └────────────────┘               │
+//! │                   代理网络命名空间                          │
+//! └──────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! ## 设计决策
+//!
+//! - `dae0` 在宿主 NS — 作为 veth/netkit 的主端，TC(tproxy_dae0_ingress) 在这里
+//! - `dae0peer` 在代理 NS — 作为对端，TC(tproxy_dae0peer_ingress) 在这里
+//! - IPv4: `169.254.0.1/16`（宿主）和 `169.254.0.11/16`（代理）
+//! - IPv6: 内核自动分配链路本地地址（`fe80::/10`）
+//! - 策略路由表 2023：fwmark `0x8000000` → table 2023 → local default dev lo
+//! - netkit 优先（内核 ≥ 6.7），失败回退 veth
 //!
 //! ## MVP 策略
 //!
@@ -37,6 +46,7 @@
 use crate::Config;
 use anyhow::{Context, Result};
 use std::fs::File;
+use std::os::linux::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::process::{Child, Command};
 use std::os::unix::process::CommandExt;
@@ -79,6 +89,28 @@ pub enum NetnsError {
 const PROC_SELF_NETNS: &str = "/proc/self/ns/net";
 
 // ============================================================================
+// 辅助函数
+// ============================================================================
+
+/// 从 /sys/class/net/<ifname>/address 读取 MAC 地址
+fn read_mac_from_sysfs(ifname: &str) -> Result<[u8; 6]> {
+    let path = format!("/sys/class/net/{}/address", ifname);
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read MAC from {}", path))?;
+    let content = content.trim();
+    let parts: Vec<&str> = content.split(':').collect();
+    if parts.len() != 6 {
+        return Err(anyhow::anyhow!("Invalid MAC address format: {}", content));
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16)
+            .map_err(|e| anyhow::anyhow!("Invalid MAC byte '{}': {}", part, e))?;
+    }
+    Ok(mac)
+}
+
+// ============================================================================
 // NetnsManager
 // ============================================================================
 
@@ -87,7 +119,8 @@ const PROC_SELF_NETNS: &str = "/proc/self/ns/net";
 /// 管理匿名网络命名空间的生命周期，包括：
 /// - 保存宿主 netns fd（持有引用防止 GC 回收）
 /// - 使用 `unshare(CLONE_NEWNET)` 创建匿名命名空间
-/// - 创建并配置 veth pair
+/// - 创建并配置 veth/netkit pair（netkit 优先）
+/// - 配置 IPv4 地址
 /// - 配置策略路由将代理流量导入代理命名空间
 /// - 在代理命名空间中启动子进程
 /// - 销毁时完整清理所有资源
@@ -105,22 +138,24 @@ const PROC_SELF_NETNS: &str = "/proc/self/ns/net";
 /// mgr.destroy().expect("Failed to destroy netns");
 /// ```
 pub struct NetnsManager {
-    /// veth 宿主侧接口名（默认 dae0）
+    /// veth 宿主侧接口名（默认 dae0）— 位于宿主 NS
     host_if: String,
-    /// veth 代理侧接口名（默认 dae0peer）
+    /// veth 代理侧接口名（默认 dae0peer）— 位于代理 NS
     peer_if: String,
-    /// 宿主侧地址（CIDR，默认 169.254.100.1/30）
+    /// 宿主侧 IPv4 地址（CIDR，默认 169.254.0.1/16）
     host_addr: String,
-    /// 代理侧地址（CIDR，默认 169.254.100.2/30）
+    /// 代理侧 IPv4 地址（CIDR，默认 169.254.0.11/16）
     peer_addr: String,
     /// MTU（默认 1500）
     mtu: u32,
-    /// 策略路由表 ID（默认 20230）
+    /// 策略路由表 ID（默认 2023）
     route_table: u32,
-    /// 代理 mark 值
+    /// TPROXY_MARK（默认 0x8000000）
     proxy_mark: u32,
-    /// 代理 mark 掩码
+    /// TPROXY_MARK 掩码（默认 0x8000000）
     proxy_mask: u32,
+    /// 是否使用了 netkit（而非 veth）
+    use_netkit: bool,
     /// 宿主侧 netns fd（持有引用防止 GC）
     host_ns_fd: Option<OwnedFd>,
     /// 代理命名空间 fd（在 unshare 后、setns 回宿主前保存）
@@ -144,26 +179,32 @@ impl NetnsManager {
             route_table: config.route_table,
             proxy_mark: config.fwmark_proxy,
             proxy_mask: config.fwmark_mask,
+            use_netkit: false,
             host_ns_fd: None,
             proxy_ns_fd: None,
             child_pid: None,
         }
     }
 
-    /// 创建匿名网络命名空间和 veth pair
+    /// 创建匿名网络命名空间和 veth/netkit pair
     ///
-    /// 完整流程：
-    /// 1. **保存宿主 netns fd**：打开 `/proc/self/ns/net` 并持有引用
-    /// 2. **`unshare(CLONE_NEWNET)`**：创建新网络命名空间（当前进程进入新 ns）
-    /// 3. **在新命名空间内**：
-    ///    - 创建 veth pair：`dae0 <-> dae0peer`
-    ///    - 将 `dae0peer` 移动到宿主命名空间
-    ///    - 设置 `dae0` 的 IP 地址、MTU，启用接口
-    /// 4. **`setns` 回到宿主命名空间**：
-    ///    - 设置 `dae0peer` 的 IP 地址、MTU，启用接口
-    /// 5. **配置策略路由**：
-    ///    - `ip rule add fwmark <proxy_mark>/<proxy_mask> table <route_table>`
-    ///    - `ip route add local default dev lo table <route_table>`
+    /// # 拓扑
+    ///
+    /// 与原始 dae 一致：
+    /// - `dae0`（主端）留在**宿主 NS**
+    /// - `dae0peer`（对端）留在**代理 NS**
+    ///
+    /// # 完整流程
+    ///
+    /// 1. 保存宿主 netns fd
+    /// 2. `unshare(CLONE_NEWNET)` → 进入代理 NS
+    /// 3. **在代理 NS 中**创建 link pair（netkit 优先，veth 回退）
+    /// 4. 保存代理 netns fd
+    /// 5. 将 `dae0`（主端）移回宿主 NS：`ip link set dae0 netns 1`
+    /// 6. 配置 `dae0peer`（代理 NS）：IPv4 + MTU + up
+    /// 7. `setns` 回到宿主 NS
+    /// 8. 配置 `dae0`（宿主 NS）：IPv4 + MTU + up
+    /// 9. 配置策略路由（IPv4 + IPv6）
     ///
     /// # 错误
     ///
@@ -174,6 +215,11 @@ impl NetnsManager {
             return Err(NetnsError::AlreadyCreated.into());
         }
 
+        // === 崩溃安全：启动时清理上次可能残留的接口 ===
+        // 无论上次运行如何退出（正常、崩溃、SIGKILL），
+        // 确保同名接口不存在，使 create() 幂等。
+        self.cleanup_stale_interfaces();
+
         info!(
             host_if = %self.host_if,
             peer_if = %self.peer_if,
@@ -181,135 +227,371 @@ impl NetnsManager {
             peer_addr = %self.peer_addr,
             mtu = %self.mtu,
             route_table = %self.route_table,
-            "Creating anonymous network namespace and veth pair"
+            proxy_mark = %format!("{:#x}", self.proxy_mark),
+            "Creating anonymous network namespace and veth/netkit pair"
         );
 
-        // ---- 步骤 1：保存宿主 netns fd ----
-        let host_ns_file = File::open(PROC_SELF_NETNS)
-            .context("Failed to open /proc/self/ns/net to save host netns fd")?;
-        let host_ns_fd = OwnedFd::from(host_ns_file);
-        info!("Saved host netns fd: {}", host_ns_fd.as_raw_fd());
+        // ----------------------------------------------------------------
+        // 核心创建逻辑包装在 IIFE 中，以便在任一步骤失败时统一回滚
+        // ----------------------------------------------------------------
+        let mut host_ns_fd: Option<OwnedFd> = None;
+        let mut proxy_ns_fd: Option<OwnedFd> = None;
+        let mut link_created = false;
+        let mut host_moved = false;
 
-        // ---- 步骤 2：创建新网络命名空间 ----
-        sched::unshare(CloneFlags::CLONE_NEWNET)
-            .context("Failed to create new network namespace via unshare(CLONE_NEWNET)")?;
-        info!("Created new anonymous network namespace");
+        let result = (|| -> Result<()> {
+            // ---- Step 1: 保存宿主 netns fd ----
+            {
+                let host_ns_file = File::open(PROC_SELF_NETNS)
+                    .context("Failed to open /proc/self/ns/net to save host netns fd")?;
+                host_ns_fd = Some(OwnedFd::from(host_ns_file));
+                info!("Saved host netns fd: {}", host_ns_fd.as_ref().unwrap().as_raw_fd());
+            }
 
-        // ---- 步骤 3：在新命名空间内操作 ----
-        // 此时当前进程已在新 netns 中
+            // ---- Step 2: 创建新网络命名空间（进入代理 NS） ----
+            sched::unshare(CloneFlags::CLONE_NEWNET)
+                .context("Failed to create new network namespace via unshare(CLONE_NEWNET)")?;
+            info!("Created new anonymous network namespace");
 
-        // 3a. 创建 veth pair
+            // ---- Step 3: 在代理 NS 中创建 link pair（netkit 优先） ----
+            // 此时我们在新创建的代理 NS 中，创建的 veth pair 两端都位于代理 NS。
+            // 后续通过 `ip link set dae0 netns 1` 将 dae0 移回宿主 NS。
+            let use_netkit = self.try_create_netkit().unwrap_or_else(|_| {
+                info!("netkit not available, falling back to veth");
+                self.create_veth()
+                    .expect("Failed to create veth pair as fallback");
+                false
+            });
+            self.use_netkit = use_netkit;
+            link_created = true;
+            info!(
+                "Created link pair in proxy network namespace: {} <-> {}",
+                self.host_if, self.peer_if
+            );
+
+            // ---- Step 4: 保存代理 netns fd ----
+            {
+                let proxy_ns_file = File::open(PROC_SELF_NETNS)
+                    .context("Failed to open /proc/self/ns/net to save proxy netns fd")?;
+                proxy_ns_fd = Some(OwnedFd::from(proxy_ns_file));
+                info!("Saved proxy netns fd: {}", proxy_ns_fd.as_ref().unwrap().as_raw_fd());
+            }
+
+            // ---- Step 5: 将 dae0（主端）移回宿主 NS ----
+            // 此时我们在代理 NS 中，PID 1 始终位于宿主（init）NS。
+            // 因此 `ip link set dae0 netns 1` 将 dae0 从代理 NS 移到宿主 NS。
+            self.run_ip(&[
+                "link", "set", "dev", &self.host_if, "netns", "1",
+            ])
+            .context(format!(
+                "Failed to move {} to host network namespace",
+                self.host_if
+            ))?;
+            host_moved = true;
+            info!(
+                "Moved {} (host side) to host network namespace",
+                self.host_if
+            );
+
+            // ---- Step 6: 配置 dae0peer（代理 NS） ----
+            // IPv4
+            self.run_ip(&["addr", "add", &self.peer_addr, "dev", &self.peer_if])
+                .context("Failed to set peer interface IPv4 address")?;
+            // MTU + up
+            self.run_ip(&["link", "set", "dev", &self.peer_if, "mtu", &self.mtu.to_string()])
+                .context("Failed to set peer interface MTU")?;
+            self.run_ip(&["link", "set", &self.peer_if, "up"])
+                .context("Failed to bring up peer interface")?;
+            info!(
+                "Configured {} (proxy NS): ipv4={}, mtu={}, up",
+                self.peer_if, self.peer_addr, self.mtu
+            );
+
+            // ---- Step 7: setns 回到宿主 NS ----
+            sched::setns(
+                host_ns_fd.as_ref().ok_or(NetnsError::NotCreated)?,
+                CloneFlags::CLONE_NEWNET,
+            )
+            .context("Failed to switch back to host network namespace")?;
+            info!("Switched back to host network namespace");
+
+            // ---- Step 8: 配置 dae0（宿主 NS） ----
+            // IPv4
+            self.run_ip(&["addr", "add", &self.host_addr, "dev", &self.host_if])
+                .context("Failed to set host interface IPv4 address")?;
+            // MTU + up
+            self.run_ip(&["link", "set", "dev", &self.host_if, "mtu", &self.mtu.to_string()])
+                .context("Failed to set host interface MTU")?;
+            self.run_ip(&["link", "set", &self.host_if, "up"])
+                .context("Failed to bring up host interface")?;
+            info!(
+                "Configured {} (host NS): ipv4={}, mtu={}, up",
+                self.host_if, self.host_addr, self.mtu
+            );
+
+            // ---- Step 9: 配置策略路由（IPv4 + IPv6） ----
+            self.add_policy_routing()?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.host_ns_fd = host_ns_fd.take();
+                self.proxy_ns_fd = proxy_ns_fd.take();
+                info!("Network namespace and veth/netkit pair created successfully");
+                Ok(())
+            }
+            Err(e) => {
+                // 回滚：清理已创建的中间资源
+                self.rollback_create(
+                    host_ns_fd.as_ref(),
+                    link_created,
+                    host_moved,
+                );
+                error!("Failed to create network namespace: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    /// 尝试创建 netkit pair
+    ///
+    /// 内核 ≥ 6.7 支持 netkit，失败返回错误以触发 veth 回退。
+    fn try_create_netkit(&self) -> Result<bool> {
+        match self.run_ip(&[
+            "link", "add", "dev", &self.host_if, "type", "netkit",
+            "peer", "name", &self.peer_if,
+        ]) {
+            Ok(_) => {
+                info!("Created netkit pair: {} <-> {}", self.host_if, self.peer_if);
+                Ok(true)
+            }
+            Err(e) => {
+                info!("netkit creation failed (kernel < 6.7?): {}", e);
+                Err(anyhow::anyhow!("netkit not supported"))
+            }
+        }
+    }
+
+    /// 创建 veth pair（netkit 回退方案）
+    fn create_veth(&self) -> Result<()> {
         self.run_ip(&[
-            "link", "add", &self.host_if, "type", "veth", "peer", "name", &self.peer_if,
+            "link", "add", "dev", &self.host_if, "type", "veth",
+            "peer", "name", &self.peer_if,
         ])
         .context("Failed to create veth pair")?;
         info!("Created veth pair: {} <-> {}", self.host_if, self.peer_if);
-
-        // 3b. 将 peer_if 移动到宿主命名空间
-        // 使用 init（PID 1）的 netns 作为宿主命名空间的引用
-        // 注意：这要求宿主进程有权限访问 /proc/1/ns/net
-        self.run_ip(&[
-            "link", "set", &self.peer_if, "netns", "1",
-        ])
-        .context("Failed to move peer interface to host netns")?;
-        info!("Moved {} to host network namespace", self.peer_if);
-
-        // 3c. 配置 host_if
-        self.run_ip(&["addr", "add", &self.host_addr, "dev", &self.host_if])
-            .context("Failed to set host interface address")?;
-        self.run_ip(&["link", "set", "dev", &self.host_if, "mtu", &self.mtu.to_string()])
-            .context("Failed to set host interface MTU")?;
-        self.run_ip(&["link", "set", &self.host_if, "up"])
-            .context("Failed to bring up host interface")?;
-        info!(
-            "Configured {}: addr={}, mtu={}, up",
-            self.host_if, self.host_addr, self.mtu
-        );
-
-        // ---- 保存代理 netns fd（在切换回宿主前） ----
-        // 打开 /proc/self/ns/net 保存当前（代理）命名空间的 fd
-        // 以便后续在代理命名空间中启动 TProxy 等进程
-        let proxy_ns_file = File::open(PROC_SELF_NETNS)
-            .context("Failed to open /proc/self/ns/net to save proxy netns fd")?;
-        let proxy_ns_fd = OwnedFd::from(proxy_ns_file);
-        info!("Saved proxy netns fd: {}", proxy_ns_fd.as_raw_fd());
-
-        // ---- 步骤 4：回到宿主命名空间 ----
-        sched::setns(&host_ns_fd, CloneFlags::CLONE_NEWNET)
-            .context("Failed to switch back to host network namespace")?;
-        info!("Switched back to host network namespace");
-
-        // ---- 步骤 5：在宿主命名空间中配置 peer_if ----
-        self.run_ip(&["addr", "add", &self.peer_addr, "dev", &self.peer_if])
-            .context("Failed to set peer interface address")?;
-        self.run_ip(&["link", "set", "dev", &self.peer_if, "mtu", &self.mtu.to_string()])
-            .context("Failed to set peer interface MTU")?;
-        self.run_ip(&["link", "set", &self.peer_if, "up"])
-            .context("Failed to bring up peer interface")?;
-        info!(
-            "Configured {}: addr={}, mtu={}, up",
-            self.peer_if, self.peer_addr, self.mtu
-        );
-
-        // ---- 步骤 6：配置策略路由 ----
-        // 添加策略路由规则：将带有 fwmark 的流量路由到指定路由表
-        self.run_ip(&[
-            "rule",
-            "add",
-            "fwmark",
-            &format!("{:#x}/{:#x}", self.proxy_mark, self.proxy_mask),
-            "table",
-            &self.route_table.to_string(),
-        ])
-        .context("Failed to add policy routing rule")?;
-        info!(
-            "Added policy rule: fwmark {:#x}/{:#x} table {}",
-            self.proxy_mark, self.proxy_mask, self.route_table
-        );
-
-        // 添加路由表条目：将路由表中的所有流量指向本地回环
-        self.run_ip(&[
-            "route",
-            "add",
-            "local",
-            "default",
-            "dev",
-            "lo",
-            "table",
-            &self.route_table.to_string(),
-        ])
-        .context("Failed to add route to policy routing table")?;
-        info!(
-            "Added route: local default dev lo table {}",
-            self.route_table
-        );
-
-        // ---- 保存 host ns fd 和 proxy ns fd ----
-        self.host_ns_fd = Some(host_ns_fd);
-        self.proxy_ns_fd = Some(proxy_ns_fd);
-
-        info!("Network namespace and veth pair created successfully");
         Ok(())
     }
 
-    /// 销毁网络命名空间和 veth pair
+    /// 添加策略路由规则（IPv4 + IPv6）
+    ///
+    /// 幂等操作：先尝试删除可能残留的相同规则，再添加。
+    fn add_policy_routing(&self) -> Result<()> {
+        let mark_str = format!("{:#x}/{:#x}", self.proxy_mark, self.proxy_mask);
+        let table_str = self.route_table.to_string();
+
+        // ---- IPv4 策略路由 ----
+        // 删除可能残留的规则
+        let _ = self.run_ip(&["rule", "del", "fwmark", &mark_str, "table", &table_str]);
+        let _ = self.run_ip(&["route", "del", "local", "default", "dev", "lo", "table", &table_str]);
+
+        // 添加规则
+        self.run_ip(&["rule", "add", "fwmark", &mark_str, "table", &table_str])
+            .context("Failed to add IPv4 policy routing rule")?;
+        self.run_ip(&["route", "add", "local", "default", "dev", "lo", "table", &table_str])
+            .context("Failed to add IPv4 policy route")?;
+        info!(
+            "Added IPv4 policy: fwmark {} table {} -> local default dev lo",
+            mark_str, table_str
+        );
+
+        // ---- IPv6 策略路由 ----
+        let _ = self.run_ip(&["-6", "rule", "del", "fwmark", &mark_str, "table", &table_str]);
+        let _ = self.run_ip(&["-6", "route", "del", "local", "default", "dev", "lo", "table", &table_str]);
+
+        self.run_ip(&["-6", "rule", "add", "fwmark", &mark_str, "table", &table_str])
+            .context("Failed to add IPv6 policy routing rule")?;
+        self.run_ip(&["-6", "route", "add", "local", "default", "dev", "lo", "table", &table_str])
+            .context("Failed to add IPv6 policy route")?;
+        info!(
+            "Added IPv6 policy: fwmark {} table {} -> local default dev lo",
+            mark_str, table_str
+        );
+
+        Ok(())
+    }
+
+    // ================================================================
+    // 清理残留接口（崩溃安全）
+    // ================================================================
+
+    /// 清理可能残留的旧接口
+    ///
+    /// **崩溃安全核心**：无论上次运行如何退出（正常、崩溃、SIGKILL），
+    /// 在创建新接口前先清理可能残留的同名接口。这使得 `create()` 幂等。
+    ///
+    /// ## 清理策略
+    ///
+    /// 同时尝试从宿主 NS 和代理 NS 两侧删除：
+    /// - `dae0`（宿主侧）：上次崩溃后可能残留在宿主 NS 中
+    /// - `dae0peer`（代理侧）：上次崩溃后代理 NS 被销毁时随之消失，
+    ///   但安全起见也尝试删除
+    ///
+    /// 所有错误被忽略（接口不存在是正常情况）。
+    fn cleanup_stale_interfaces(&self) {
+        // 在宿主 NS 中删除残留接口
+        // 删除 host_if（如 dae0）会自动销毁整个 veth pair
+        let _ = self.run_ip(&["link", "del", &self.host_if]);
+        let _ = self.run_ip(&["link", "del", &self.peer_if]);
+        info!(
+            "Cleaned up stale interfaces: {} / {}",
+            self.host_if, self.peer_if
+        );
+    }
+
+    /// 回滚 create() 中已创建的中间资源
+    ///
+    /// 当 [`create()`](NetnsManager::create) 中间步骤失败时，清理所有已创建的资源。
+    /// 处理两种场景：
+    /// 1. **仍在代理 NS 中**（步骤 2~7 之间失败）：从代理 NS 删除 link pair，然后切回宿主 NS
+    /// 2. **已回到宿主 NS**（步骤 8~9 失败）：直接从宿主 NS 删除 link pair
+    ///
+    /// # 参数
+    ///
+    /// * `host_ns_fd` — 宿主 NS 的 fd（用于 `setns` 切回宿主 NS）
+    /// * `link_created` — link pair 是否已创建
+    /// * `host_moved` — `dae0`（host_if）是否已移到宿主 NS
+    fn rollback_create(
+        &self,
+        host_ns_fd: Option<&OwnedFd>,
+        link_created: bool,
+        host_moved: bool,
+    ) {
+        if !link_created && !host_moved {
+            // 未创建任何资源，无需回滚
+            return;
+        }
+
+        warn!("Rolling back partially created resources");
+
+        if host_moved {
+            // dae0 已在宿主 NS 中，切换到宿主 NS 删除它
+            // 这也会自动销毁 veth pair 的对端（dae0peer 在代理 NS 中）
+            if let Some(fd) = host_ns_fd {
+                let _ = sched::setns(fd, CloneFlags::CLONE_NEWNET);
+            }
+            let _ = self.run_ip(&["link", "del", &self.host_if]);
+            info!("Rollback: deleted {} from host NS", self.host_if);
+        } else if link_created {
+            // 仍在代理 NS 中，从代理 NS 删除 link pair
+            let _ = self.run_ip(&["link", "del", &self.host_if]);
+            let _ = self.run_ip(&["link", "del", &self.peer_if]);
+            // 切回宿主 NS
+            if let Some(fd) = host_ns_fd {
+                let _ = sched::setns(fd, CloneFlags::CLONE_NEWNET);
+            }
+            info!("Rollback: deleted link pair from proxy NS and returned to host NS");
+        }
+
+        // 最终保险：始终尝试从宿主 NS 清理可能残留的接口
+        let _ = self.run_ip(&["link", "del", &self.host_if]);
+        let _ = self.run_ip(&["link", "del", &self.peer_if]);
+    }
+
+    // ================================================================
+    // 接口信息获取方法
+    // ================================================================
+
+    /// 获取 dae0 在宿主 NS 中的 ifindex
+    pub fn get_host_ifindex(&self) -> Result<u32> {
+        let cstr = std::ffi::CString::new(self.host_if.as_str())
+            .map_err(|e| anyhow::anyhow!("Invalid interface name: {}", e))?;
+        let ifindex = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+        if ifindex == 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to get ifindex for {} in host netns",
+                self.host_if
+            ));
+        }
+        info!("{} ifindex in host NS: {}", self.host_if, ifindex);
+        Ok(ifindex)
+    }
+
+    /// 获取 dae0peer 在代理 NS 中的 MAC 地址
+    ///
+    /// 需要短暂切换到代理 NS 读取 sysfs，然后切换回来。
+    /// 即使读取失败，也保证切换回宿主 NS（防止命名空间泄漏）。
+    pub fn get_peer_mac(&self) -> Result<[u8; 6]> {
+        self.join_proxy_ns()?;
+        let mac_result = read_mac_from_sysfs(&self.peer_if)
+            .with_context(|| format!("Failed to read MAC of {} in proxy NS", self.peer_if));
+        // 无论成功失败，都必须切回宿主 NS
+        let _ = self.join_host_ns();
+        let mac = mac_result?;
+        info!("{} MAC in proxy NS: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.peer_if, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        Ok(mac)
+    }
+
+    /// 获取 dae0peer 在代理 NS 中的 ifindex
+    pub fn get_peer_ifindex(&self) -> Result<u32> {
+        self.join_proxy_ns()?;
+        let cstr = std::ffi::CString::new(self.peer_if.as_str())
+            .map_err(|e| anyhow::anyhow!("Invalid interface name: {}", e))?;
+        let ifindex = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+        // 无论成功失败，都必须切回宿主 NS
+        let _ = self.join_host_ns();
+        if ifindex == 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to get ifindex for {} in proxy netns",
+                self.peer_if
+            ));
+        }
+        info!("{} ifindex in proxy NS: {}", self.peer_if, ifindex);
+        Ok(ifindex)
+    }
+
+    /// 获取代理命名空间的 inode 号（用于 PARAM.dae_netns_id）
+    pub fn get_proxy_netns_inode(&self) -> Result<u32> {
+        let fd = self.proxy_ns_fd.as_ref()
+            .ok_or(NetnsError::NotCreated)?;
+        let fd_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        let metadata = std::fs::metadata(&fd_path)
+            .with_context(|| format!("Failed to stat {}", fd_path))?;
+        let inode = metadata.st_ino() as u32;
+        info!("Proxy netns inode (dae_netns_id): {}", inode);
+        Ok(inode)
+    }
+
+    /// 检查是否使用了 netkit
+    pub fn is_netkit(&self) -> bool {
+        self.use_netkit
+    }
+
+    // ================================================================
+    // 销毁
+    // ================================================================
+
+    /// 销毁网络命名空间和 veth/netkit pair
     ///
     /// 完整清理流程：
     /// 1. 终止子进程（先 SIGTERM 优雅终止，1 秒后 SIGKILL 强制终止）
-    /// 2. 删除策略路由规则和路由表条目
-    /// 3. 删除 veth pair（删除宿主侧的 peer_if 即可删除整个 pair）
-    /// 4. 关闭持有宿主 netns 的 fd
+    /// 2. 删除策略路由规则和路由表条目（IPv4 + IPv6）
+    /// 3. 删除 veth/netkit pair（删除宿主侧的 host_if 即可删除整个 pair）
+    /// 4. 关闭持有 netns 的 fd
     ///
     /// # 错误处理策略
     ///
     /// 即使中间步骤失败，也继续尝试后续清理步骤。
     /// 确保尽可能多的资源被释放。
     pub fn destroy(&mut self) -> Result<()> {
-        info!("Destroying network namespace and veth pair");
+        info!("Destroying network namespace and veth/netkit pair");
 
         let mut has_error = false;
 
-        // ---- 步骤 1：终止子进程 ----
+        // ---- Step 1：终止子进程 ----
         if let Some(pid) = self.child_pid.take() {
             if let Err(e) = self.kill_child_process(pid) {
                 warn!("Failed to kill child process {}: {}", pid, e);
@@ -317,68 +599,49 @@ impl NetnsManager {
             }
         }
 
-        // ---- 步骤 2：删除策略路由规则和路由表条目 ----
-        // 先删除路由表条目
-        let delete_route_result = self.run_ip(&[
-            "route",
-            "del",
-            "local",
-            "default",
-            "dev",
-            "lo",
-            "table",
-            &self.route_table.to_string(),
-        ]);
-        if let Err(e) = delete_route_result {
-            warn!("Failed to delete policy route: {}", e);
-            // 路由表条目可能不存在（如果之前未配置成功），不视为严重错误
-        }
+        // ---- Step 2：删除策略路由规则（IPv4 + IPv6） ----
+        let mark_str = format!("{:#x}/{:#x}", self.proxy_mark, self.proxy_mask);
+        let table_str = self.route_table.to_string();
 
-        // 删除策略路由规则
-        let delete_rule_result = self.run_ip(&[
-            "rule",
-            "del",
-            "fwmark",
-            &format!("{:#x}/{:#x}", self.proxy_mark, self.proxy_mask),
-            "table",
-            &self.route_table.to_string(),
-        ]);
-        if let Err(e) = delete_rule_result {
-            warn!("Failed to delete policy routing rule: {}", e);
-            // 规则可能不存在，不视为严重错误
-        }
+        // IPv6 路由和规则
+        let _ = self.run_ip(&["-6", "route", "del", "local", "default", "dev", "lo", "table", &table_str]);
+        let _ = self.run_ip(&["-6", "rule", "del", "fwmark", &mark_str, "table", &table_str]);
 
-        // ---- 步骤 3：删除 veth pair ----
-        // 删除宿主侧的 peer_if（会自动删除 pair 的另一端）
-        // 注意：我们现在在宿主命名空间中，所以直接删除 peer_if
-        let delete_veth_result = self.run_ip(&["link", "delete", &self.peer_if]);
-        if let Err(e) = delete_veth_result {
-            // 也尝试删除 host_if（可能 peer_if 已被删除）
+        // IPv4 路由和规则
+        let _ = self.run_ip(&["route", "del", "local", "default", "dev", "lo", "table", &table_str]);
+        let _ = self.run_ip(&["rule", "del", "fwmark", &mark_str, "table", &table_str]);
+
+        // ---- Step 3：删除 link pair ----
+        // 现在我们位于宿主 NS，直接删除 host_if（dae0）
+        // 这会自动删除 pair 的另一端（dae0peer 在代理 NS 中也会被删除）
+        let delete_link_result = self.run_ip(&["link", "delete", &self.host_if]);
+        if let Err(e) = delete_link_result {
+            // 也尝试删除 peer_if（可能 host_if 已被删除或 netkit 残留）
             warn!(
-                "Failed to delete veth {} (trying {}): {}",
-                self.peer_if, self.host_if, e
+                "Failed to delete {} (trying {}): {}",
+                self.host_if, self.peer_if, e
             );
-            if let Err(e2) = self.run_ip(&["link", "delete", &self.host_if]) {
-                warn!("Failed to delete veth {}: {}", self.host_if, e2);
+            if let Err(e2) = self.run_ip(&["link", "delete", &self.peer_if]) {
+                warn!("Failed to delete {}: {}", self.peer_if, e2);
                 has_error = true;
             }
         } else {
-            info!("Deleted veth pair (via {})", self.peer_if);
+            info!("Deleted link pair (via {})", self.host_if);
         }
 
-        // ---- 步骤 4：关闭 netns fd ----
+        // ---- Step 4：关闭 netns fd ----
         self.host_ns_fd.take();
         info!("Closed host netns fd");
         self.proxy_ns_fd.take();
         info!("Closed proxy netns fd");
 
-        // ---- 重置子进程 PID ----
+        // ---- 重置状态 ----
         self.child_pid = None;
 
         if has_error {
             warn!("Network namespace destruction completed with some errors");
         } else {
-            info!("Network namespace and veth pair destroyed successfully");
+            info!("Network namespace and veth/netkit pair destroyed successfully");
         }
 
         Ok(())
@@ -424,7 +687,6 @@ impl NetnsManager {
         );
 
         // 使用 nsenter 在代理命名空间中启动子进程
-        // pre_exec 闭包设置 PR_SET_PDEATHSIG，确保父进程退出时子进程收到 SIGTERM
         let child = unsafe {
             Command::new("nsenter")
                 .arg("--net")
@@ -452,6 +714,10 @@ impl NetnsManager {
 
         Ok(child)
     }
+
+    // ================================================================
+    // 查询方法
+    // ================================================================
 
     /// 获取当前管理的子进程 PID
     pub fn child_pid(&self) -> Option<u32> {
@@ -609,14 +875,44 @@ impl NetnsManager {
 impl Drop for NetnsManager {
     /// Drop 时自动清理资源
     ///
-    /// 如果命名空间已创建但用户忘记调用 [`destroy()`](NetnsManager::destroy)，
-    /// Drop 实现会尝试清理。但需要注意的是，Drop 中不应 panic 或传播错误，
-    /// 所以清理失败时会静默记录警告日志。
+    /// ## 清理策略
+    ///
+    /// 1. **检查每个资源的状态** — 不依赖单一标志，而是分别检查
+    ///    `host_ns_fd`、`proxy_ns_fd`、`child_pid`，确保任何泄漏都能被捕获
+    /// 2. **调用 `destroy()`** — 如果发现未清理的资源，尝试执行完整销毁流程
+    /// 3. **最终保险** — 无论 `destroy()` 是否已调用，都尝试从宿主机删除
+    ///    残留接口（幂等操作，崩溃安全）
+    ///
+    /// ## 注意事项
+    ///
+    /// Drop 中不应 panic 或传播错误，所有失败都被静默记录为 `warn!` 日志。
+    /// 此实现符合 RAII 原则，确保 NetnsManager 在以下场景都能释放资源：
+    /// - 正常作用域结束
+    /// - 提前 return 忘记调用 destroy()
+    /// - panic 栈展开（只要不是 double panic）
     fn drop(&mut self) {
-        if self.host_ns_fd.is_some() || self.proxy_ns_fd.is_some() || self.child_pid.is_some() {
-            warn!("NetnsManager dropped without explicit destroy() call, cleaning up");
+        // ---- Step 1: 检查每个资源的状态 ----
+        let has_host_ns = self.host_ns_fd.is_some();
+        let has_proxy_ns = self.proxy_ns_fd.is_some();
+        let has_child = self.child_pid.is_some();
+        let has_resources = has_host_ns || has_proxy_ns || has_child;
+
+        if has_resources {
+            warn!(
+                has_host_ns_fd = has_host_ns,
+                has_proxy_ns_fd = has_proxy_ns,
+                child_pid = self.child_pid,
+                "NetnsManager dropped without explicit destroy(), cleaning up"
+            );
+            // ---- Step 2: 执行完整销毁流程 ----
             let _ = self.destroy();
         }
+
+        // ---- Step 3: 最终保险：尝试清理宿主机上可能残留的接口 ----
+        // 即使 destroy() 已成功调用，此操作也是幂等的。
+        // 这是崩溃安全的最后一道防线：确保无论如何退出，
+        // 宿主机命名空间中不会残留 dae0/dae0peer 接口。
+        self.cleanup_stale_interfaces();
     }
 }
 
@@ -641,7 +937,9 @@ mod tests {
         assert_eq!(mgr.route_table, 20230);
         assert_eq!(mgr.proxy_mark, 0x02000000);
         assert_eq!(mgr.proxy_mask, 0x0f000000);
+        assert!(!mgr.use_netkit);
         assert!(mgr.host_ns_fd.is_none());
+        assert!(mgr.proxy_ns_fd.is_none());
         assert!(mgr.child_pid.is_none());
         assert!(!mgr.is_created());
     }
@@ -678,5 +976,22 @@ mod tests {
 
         // destroy() 应该在不创建的情况下安全调用
         assert!(mgr.destroy().is_ok());
+    }
+
+    #[test]
+    fn test_read_mac_from_sysfs_format() {
+        // 仅测试 MAC 解析逻辑（不需要 root）
+        let content = "00:11:22:33:44:55\n";
+        let path = "/tmp/_test_mac_addr";
+        std::fs::write(path, content).unwrap();
+        let result = std::fs::read_to_string(path).unwrap();
+        let parts: Vec<&str> = result.trim().split(':').collect();
+        assert_eq!(parts.len(), 6);
+        let mut mac = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            mac[i] = u8::from_str_radix(part, 16).unwrap();
+        }
+        assert_eq!(mac, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        let _ = std::fs::remove_file("/tmp/_test_mac_addr");
     }
 }

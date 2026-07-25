@@ -1,4 +1,2 @@
 [toolchain]
-channel = "nightly-2024-12-01"  # 使用较新的 nightly 以支持 BPF 编译
-components = ["rust-src", "llvm-tools", "rustc-dev"]
-targets = ["bpfel-unknown-none"]
+channel = "stable"

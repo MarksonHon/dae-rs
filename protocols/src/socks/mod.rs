@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,6 +45,7 @@ pub enum Socks5Error {
 /// SOCKS5 拨号器
 ///
 /// 负责与 SOCKS5 上游服务器建立连接并转发流量。
+/// 自动设置 SO_MARK=self_mark 以防止 eBPF 拦截自身流量。
 pub struct Socks5Dialer {
     /// 上游 SOCKS5 代理服务器地址
     pub proxy_addr: SocketAddr,
@@ -53,6 +55,8 @@ pub struct Socks5Dialer {
     pub username: String,
     /// 认证密码
     pub password: String,
+    /// fwmark 用于 eBPF 自排除（0 表示不设置）
+    pub self_mark: u32,
 }
 
 impl Socks5Dialer {
@@ -74,7 +78,101 @@ impl Socks5Dialer {
             dial_timeout: Duration::from_millis(dial_timeout_ms),
             username: username.into(),
             password: password.into(),
+            self_mark: 0,
         }
+    }
+
+    /// Create a dialer with a self-mark for eBPF self-exclusion.
+    pub fn new_with_mark(
+        proxy_addr: SocketAddr,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        dial_timeout_ms: u64,
+        self_mark: u32,
+    ) -> Self {
+        Self {
+            proxy_addr,
+            dial_timeout: Duration::from_millis(dial_timeout_ms),
+            username: username.into(),
+            password: password.into(),
+            self_mark,
+        }
+    }
+
+    /// Connect to the SOCKS5 proxy with SO_MARK set before the TCP SYN is sent.
+    ///
+    /// Uses a raw libc socket to set SO_MARK before connect(), then hands
+    /// the fd to tokio for async completion monitoring.
+    async fn connect_with_mark(&self) -> Result<TcpStream, Socks5Error> {
+        if self.self_mark == 0 {
+            return timeout(self.dial_timeout, TcpStream::connect(&self.proxy_addr))
+                .await
+                .map_err(|_| Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr)))?
+                .map_err(Socks5Error::Io);
+        }
+
+        let domain = if self.proxy_addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+
+        // Create socket, set SO_MARK, start non-blocking connect
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+        if fd < 0 {
+            return Err(Socks5Error::Io(std::io::Error::last_os_error()));
+        }
+
+        let mark_val = self.self_mark as libc::c_int;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                &mark_val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(Socks5Error::Io(std::io::Error::last_os_error()));
+        }
+
+        // Connect (non-blocking, returns EINPROGRESS)
+        let sockaddr = socket2::SockAddr::from(self.proxy_addr);
+        let sockaddr_ptr = sockaddr.as_ptr();
+        let sockaddr_len = sockaddr.len();
+        let ret = unsafe { libc::connect(fd, sockaddr_ptr as *const libc::sockaddr, sockaddr_len) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINPROGRESS) {
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(Socks5Error::Io(err));
+            }
+        }
+
+        // Wrap in std TcpStream, then tokio TcpStream.
+        // tokio will register the fd with epoll and wait for writability
+        // (connected) or error.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let tokio_stream = tokio::net::TcpStream::from_std(std_stream).map_err(Socks5Error::Io)?;
+
+        // Wait for the connection to complete (timeout applied by caller)
+        tokio_stream
+            .writable()
+            .await
+            .map_err(|e| Socks5Error::Io(e))?;
+
+        // Check for connection errors (e.g., ECONNREFUSED, ECONNRESET)
+        if let Ok(Some(err)) = tokio_stream.take_error() {
+            return Err(Socks5Error::Io(err));
+        }
+
+        Ok(tokio_stream)
     }
 
     /// 执行 SOCKS5 握手
@@ -131,17 +229,9 @@ impl Socks5Dialer {
 
         // 步骤 2：发送连接请求
         // 解析目标地址（支持域名和 IP）
-        let addr_parts: Vec<&str> = target.rsplitn(2, ':').collect();
-        if addr_parts.len() != 2 {
-            return Err(Socks5Error::ProtocolError(format!(
-                "invalid target address: {}",
-                target
-            )));
-        }
-        let host = addr_parts[1];
-        let port: u16 = addr_parts[0]
-            .parse()
-            .map_err(|_| Socks5Error::ProtocolError(format!("invalid target port: {}", target)))?;
+        // 注意: target 格式为 "host:port"，IPv6 为 "[::1]:80"
+        let port = parse_port_from_target(target)?;
+        let host = parse_host_from_target(target);
 
         // 构建连接请求
         let mut request = Vec::with_capacity(256);
@@ -154,8 +244,12 @@ impl Socks5Dialer {
             request.push(0x01); // IPv4 地址类型
             request.extend_from_slice(&ip.octets());
         }
-        // 尝试解析为 IPv6 地址
-        else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        // 尝试解析为 IPv6 地址（需去除方括号）
+        else if let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::Ipv6Addr>()
+        {
             request.push(0x04); // IPv6 地址类型
             request.extend_from_slice(&ip.octets());
         }
@@ -409,10 +503,7 @@ impl Socks5Dialer {
     /// 5. Bind a local UDP socket
     /// 6. Return session with control TCP + data UDP
     pub async fn udp_associate(&self) -> Result<UdpAssociateSession, Socks5Error> {
-        let mut control = timeout(self.dial_timeout, TcpStream::connect(&self.proxy_addr))
-            .await
-            .map_err(|_| Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr)))?
-            .map_err(Socks5Error::Io)?;
+        let mut control = self.connect_with_mark().await?;
 
         // Perform auth handshake
         self.handshake_inner(&mut control, false).await?;
@@ -627,6 +718,46 @@ impl Socks5Dialer {
 }
 
 // ============================================================================
+// Target address parsing helpers
+// ============================================================================
+
+/// Parse port from "host:port" or "[ipv6]:port" string.
+fn parse_port_from_target(target: &str) -> Result<u16, Socks5Error> {
+    // For IPv6 like "[::1]:80", find ']' first
+    if let Some(bracket_end) = target.rfind(']') {
+        let port_str = target[bracket_end + 1..].trim_start_matches(':');
+        return port_str.parse().map_err(|_| {
+            Socks5Error::ProtocolError(format!("invalid target (IPv6 parse): {}", target))
+        });
+    }
+    // IPv4 or hostname: split at last colon
+    let parts: Vec<&str> = target.rsplitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err(Socks5Error::ProtocolError(format!(
+            "invalid target address: {}",
+            target
+        )));
+    }
+    parts[0]
+        .parse()
+        .map_err(|_| Socks5Error::ProtocolError(format!("invalid target port: {}", target)))
+}
+
+/// Parse host from "host:port" or "[ipv6]:port" string (returns bare host without brackets).
+fn parse_host_from_target(target: &str) -> &str {
+    if let Some(bracket_end) = target.rfind(']') {
+        // IPv6: extract content between brackets
+        let start = target.find('[').unwrap_or(bracket_end);
+        &target[start + 1..bracket_end]
+    } else if let Some(colon_pos) = target.rfind(':') {
+        // IPv4 or hostname: extract before last colon
+        &target[..colon_pos]
+    } else {
+        target
+    }
+}
+
+// ============================================================================
 // OutboundDialer trait implementation
 // ============================================================================
 
@@ -634,11 +765,7 @@ impl Socks5Dialer {
 impl OutboundDialer for Socks5Dialer {
     /// 通过 SOCKS5 代理拨号到目标地址
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
-        let stream = timeout(self.dial_timeout, TcpStream::connect(&self.proxy_addr))
-            .await
-            .map_err(|_| Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr)))?
-            .map_err(|e| Socks5Error::Io(e))?;
-
+        let stream = self.connect_with_mark().await?;
         let mut proxy_conn = ProxyConn::new(stream)?;
 
         // 执行 SOCKS5 握手

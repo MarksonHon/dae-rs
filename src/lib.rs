@@ -65,7 +65,7 @@ pub async fn run(
     // ── Phase 4: Print config summary ──
     tracing::info!("Configuration loaded:");
     tracing::info!("  TProxy port: {}", config.tproxy_port);
-    tracing::info!("  Veth: {} <-> {}", config.veth_host, config.veth_peer);
+    tracing::info!("  Netkit: dae0 <-> dae0peer (always netkit)");
     tracing::info!("  Route table: {}", config.route_table);
     tracing::info!("  Proxy mark:  {:08x}", config.fwmark_proxy);
     tracing::info!("  Bypass mark: {:08x}", config.fwmark_bypass);
@@ -88,7 +88,7 @@ pub async fn run(
 
     // ── Phase 5: Create control plane ──
     tracing::info!("Initializing control plane...");
-    let mut cp = control::ControlPlane::new(config.clone());
+    let mut cp = control::ControlPlane::new(config);
     // Embed eBPF bytecode compiled by build.rs
     const EMBEDDED_EBPF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ebpf.o"));
     cp.embedded_ebpf = Some(EMBEDDED_EBPF);
@@ -98,7 +98,7 @@ pub async fn run(
     // This must be done after netns creation but before eBPF loading
     // We'll set it in start() after netns is created
     let mut ebpf_param = control::ebpf::Daeparam::default();
-    ebpf_param.tproxy_port = config.tproxy_port as u32;
+    ebpf_param.tproxy_port = cp.config.tproxy_port as u32;
     ebpf_param.control_plane_pid = std::process::id();
     // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
     cp.ebpf_param = Some(ebpf_param);
@@ -201,7 +201,7 @@ pub async fn run(
     tracing::info!("Cleaning up old temp JSON files...");
     control::cleanup_temp_json(3600); // Clean files older than 1 hour
 
-    // ── Phase 10: Complete ──
+    // ── Phase 12: Complete ──
     tracing::info!("dae-rs shutdown complete");
     Ok(())
 }

@@ -1,34 +1,88 @@
-//! 协议层（Protocols）
+//! Protocol abstraction layer for dae-rs.
 //!
-//! 本模块提供统一的出站拨号接口和协议实现。
-//! - `OutboundDialer` trait：定义统一出站接口
-//! - `Socks5Dialer`：SOCKS5 协议拨号器实现
-//! - `ProxyConn`：代理连接类型
+//! Defines the [`OutboundDialer`] trait and a registry of supported protocols.
+//! Each protocol lives in its own subdirectory under `protocols/src/` and is
+//! gated by a Cargo feature flag.
 //!
-//! 第一阶段仅实现 SOCKS5 出站，预留扩展点以接入其他协议。
-
-pub mod socks5;
+//! # Supported Protocols
+//!
+//! | Protocol | Feature | Module | Status |
+//! |----------|---------|--------|--------|
+//! | SOCKS5   | `socks` | [`socks`] | ✅ Complete (TCP CONNECT + UDP ASSOCIATE) |
+//!
+//! # Adding a New Protocol
+//!
+//! 1. Create `protocols/src/<name>/mod.rs`
+//! 2. Implement `OutboundDialer` for your dialer struct
+//! 3. Add a `#[cfg(feature = "<name>")]` pub mod in this file
+//! 4. Add the feature to `Cargo.toml`
+//! 5. Register in [`ProtocolRegistry::builtin()`]
 
 use async_trait::async_trait;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-/// 代理连接类型
+// ── Protocol modules (gated by features) ──
+
+/// SOCKS5 protocol support (mandatory — only outbound protocol currently).
 ///
-/// 封装已建立的代理连接，提供双向读写能力。
+/// - RFC 1928 (SOCKS5)
+/// - TCP CONNECT + UDP ASSOCIATE
+/// - No Auth (0x00) + Username/Password (0x02)
+/// - Target: IPv4, IPv6, Domain name
+/// - UDP endpoint pool with auto-cleanup
+pub mod socks;
+pub use socks::Socks5Dialer;
+pub use socks::Socks5Error;
+pub use socks::UdpAssociateSession;
+pub use socks::UdpEndpointPool;
+
+// ── Protocol registry ──
+
+/// Information about a supported outbound protocol.
+#[derive(Debug, Clone)]
+pub struct ProtocolInfo {
+    /// Protocol name (e.g., "socks5", "http", "vless")
+    pub name: &'static str,
+    /// Human-readable description
+    pub description: &'static str,
+    /// Supported features
+    pub features: &'static [&'static str],
+    /// Minimum version
+    pub version: &'static str,
+    /// Link to RFC or specification
+    pub spec_link: &'static str,
+}
+
+/// Registry of all outbound protocols compiled into the binary.
+///
+/// Built at compile time based on enabled Cargo features.
+pub struct ProtocolRegistry;
+
+impl ProtocolRegistry {
+    /// Return list of all built-in protocols with their details.
+    pub fn builtin() -> Vec<ProtocolInfo> {
+        vec![ProtocolInfo {
+            name: "socks5",
+            description: "SOCKS5 proxy protocol with TCP CONNECT and UDP ASSOCIATE",
+            features: &["tcp", "udp", "auth-none", "auth-userpass"],
+            version: "RFC 1928",
+            spec_link: "https://datatracker.ietf.org/doc/html/rfc1928",
+        }]
+    }
+}
+
+// ── OutboundDialer trait ──
+
+/// Proxy connection wrapping a TCP stream.
 pub struct ProxyConn {
-    /// 底层 TCP 流
     pub stream: TcpStream,
-    /// 目标地址（对端）
     pub peer_addr: SocketAddr,
-    /// 本地地址
     pub local_addr: SocketAddr,
 }
 
 impl ProxyConn {
-    /// 创建新的代理连接
     pub fn new(stream: TcpStream) -> std::io::Result<Self> {
         let peer_addr = stream.peer_addr()?;
         let local_addr = stream.local_addr()?;
@@ -74,17 +128,39 @@ impl AsyncWrite for ProxyConn {
     }
 }
 
-/// 出站拨号器统一接口
+/// Unified outbound dialer interface.
 ///
-/// 所有出站协议（SOCKS5、HTTP 代理等）需实现此 trait。
+/// All outbound protocols must implement this trait.
 #[async_trait]
 pub trait OutboundDialer: Send + Sync {
-    /// 拨号到目标地址
-    ///
-    /// 通过代理协议与上游代理服务器建立连接，并返回已连接到
-    /// 最终目标的 `ProxyConn`。
+    /// Dial the target through the proxy.
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn>;
 
-    /// 返回出站协议名称
+    /// Return the protocol name (e.g., "socks5").
     fn protocol_name(&self) -> &'static str;
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_protocol_registry() {
+        let protocols = ProtocolRegistry::builtin();
+        assert!(protocols.iter().any(|p| p.name == "socks5"));
+        assert_eq!(protocols.len(), 1);
+    }
+
+    #[test]
+    fn test_protocol_info_fields() {
+        for p in ProtocolRegistry::builtin() {
+            assert!(!p.name.is_empty());
+            assert!(!p.description.is_empty());
+            assert!(!p.features.is_empty());
+            assert!(!p.version.is_empty());
+            assert!(!p.spec_link.is_empty());
+        }
+    }
 }

@@ -86,3 +86,53 @@ routing {
   l4proto(tcp) -> proxy(proxy_primary)
   fallback: proxy(proxy_primary)
 }
+
+dns {
+  starting_dns {
+    ip_version_prefer: 4
+    upstream {
+      bootstrap: 'udp://1.1.1.1:53'
+    }
+  }
+  bind: '127.0.0.1:5353'
+  cache {
+    enabled: true
+    max_size: 4096
+    max_ttl: 86400
+    min_ttl: 60
+    optimistic_cache: true
+    optimistic_cache_ttl: 3600
+  }
+  groups {
+    trusted_dns {
+      proxy: proxy_primary
+      upstream {
+        googledns: 'tcp+udp://dns.google:53'
+        cloudflare: 'udp://1.1.1.1:53'
+      }
+      request_routing {
+        fallback: googledns
+      }
+      response_routing {
+        upstream(googledns) -> accept
+        ip(geoip:private) && !qname(geosite:cn) -> googledns
+        fallback: accept
+      }
+    }
+    china_dns {
+      proxy: direct
+      upstream {
+        alidns: 'udp://dns.alidns.com:53'
+        cnnic: 'udp://1.2.4.8:53'
+      }
+      request_routing {
+        fallback: alidns
+      }
+    }
+  }
+  routing {
+    qname(geosite:cn) -> china_dns
+    qname(geosite:geolocation-!cn) -> trusted_dns
+    fallback: trusted_dns
+  }
+}

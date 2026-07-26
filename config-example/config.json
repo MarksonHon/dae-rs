@@ -88,5 +88,90 @@
       { "match": "l4proto(tcp)", "action": "proxy(proxy_primary)" }
     ],
     "fallback": "proxy(proxy_primary)"
+  },
+  "dns": {
+    "starting_dns": {
+      "ip_version_prefer": 4,
+      "upstream": [
+        {
+          "label": "bootstrap",
+          "address": "udp://1.1.1.1:53"
+        }
+      ]
+    },
+    "bind": "127.0.0.1:5353",
+    "cache": {
+      "enabled": true,
+      "max_size": 4096,
+      "max_ttl": 86400,
+      "min_ttl": 60,
+      "optimistic_cache": true,
+      "optimistic_cache_ttl": 3600
+    },
+    "groups": [
+      {
+        "name": "trusted_dns",
+        "proxy": "proxy(proxy_primary)",
+        "upstream": [
+          {
+            "label": "googledns",
+            "address": "tcp+udp://dns.google:53"
+          },
+          {
+            "label": "cloudflare",
+            "address": "udp://1.1.1.1:53"
+          }
+        ],
+        "request_routing": {
+          "rules": [],
+          "fallback": "googledns"
+        },
+        "response_routing": {
+          "rules": [
+            {
+              "match": "upstream(googledns)",
+              "action": "accept"
+            },
+            {
+              "match": "ip(geoip:private) && !qname(geosite:cn)",
+              "action": "googledns"
+            }
+          ],
+          "fallback": "accept"
+        }
+      },
+      {
+        "name": "china_dns",
+        "proxy": "direct",
+        "upstream": [
+          {
+            "label": "alidns",
+            "address": "udp://dns.alidns.com:53"
+          },
+          {
+            "label": "cnnic",
+            "address": "udp://1.2.4.8:53"
+          }
+        ],
+        "request_routing": {
+          "rules": [],
+          "fallback": "alidns"
+        },
+        "response_routing": null
+      }
+    ],
+    "routing": {
+      "rules": [
+        {
+          "match": "qname(geosite:cn)",
+          "action": "china_dns"
+        },
+        {
+          "match": "qname(geosite:geolocation-!cn)",
+          "action": "trusted_dns"
+        }
+      ],
+      "fallback": "trusted_dns"
+    }
   }
 }

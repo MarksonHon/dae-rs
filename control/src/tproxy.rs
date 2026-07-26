@@ -35,14 +35,15 @@
 //! * 错误不应导致整个监听器崩溃
 
 use anyhow::{Context, Result};
-use protocols::socks5::Socks5Dialer;
 use protocols::OutboundDialer;
+use protocols::Socks5Dialer;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::Notify;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
@@ -105,7 +106,7 @@ const SO_MARK: libc::c_int = 36;
 ///
 /// ```no_run
 /// use control::tproxy::TproxyListener;
-/// use protocols::socks5::Socks5Dialer;
+/// use protocols::Socks5Dialer;
 /// use std::net::SocketAddr;
 ///
 /// # async fn example() -> anyhow::Result<()> {
@@ -470,50 +471,68 @@ async fn handle_connection(
     mut inbound: TcpStream,
     dialer: Arc<RwLock<Socks5Dialer>>,
 ) -> Result<()> {
+    let start = std::time::Instant::now();
+    let peer_addr = inbound.peer_addr().ok();
+
     // ---- 步骤 1：获取原始目标地址 ----
-    // 在 IP_TRANSPARENT 模式下，getsockname() 返回的不是本地地址，
-    // 而是客户端连接的原始目标地址
     let orig_dst = get_original_dst(&inbound).context(
         "Failed to get original destination address from TProxy connection \
          (ensure IP_TRANSPARENT is set and CAP_NET_ADMIN is available)",
     )?;
-    debug!(target = %orig_dst, "TProxy connection target resolved");
 
     // ---- 步骤 2：通过 SOCKS5 拨号到目标 ----
-    // 获取读锁以调用 dial()
     let dialer_guard = dialer.read().await;
     let proxy_addr = dialer_guard.proxy_addr;
-    let mut outbound = dialer_guard
-        .dial(&orig_dst.to_string())
-        .await
-        .with_context(|| {
-            format!(
-                "SOCKS5 dial to target {} via proxy {} failed",
-                orig_dst, proxy_addr
-            )
-        })?;
-    // 尽早释放读锁，避免阻塞其他需要读锁的操作
+    let dial_result = dialer_guard.dial(&orig_dst.to_string()).await;
     drop(dialer_guard);
 
-    debug!(
-        target = %orig_dst,
-        proxy = %proxy_addr,
-        "SOCKS5 upstream connection established"
-    );
+    let mut outbound = match dial_result {
+        Ok(stream) => stream,
+        Err(e) => {
+            info!(
+                "TCP  {}:{} -> {} [PROXY] FAIL dial: {}",
+                peer_addr
+                    .map(|a| a.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                peer_addr.map(|a| a.port()).unwrap_or(0),
+                orig_dst,
+                e,
+            );
+            return Err(e).context("SOCKS5 dial failed");
+        }
+    };
 
     // ---- 步骤 3：双向数据拷贝 ----
-    // copy_bidirectional 会同时从 inbound 读取写入 outbound，
-    // 以及从 outbound 读取写入 inbound，直到一方关闭
-    let (n_to_upstream, n_from_upstream) = copy_bidirectional(&mut inbound, &mut outbound)
-        .await
-        .context("Bidirectional data copy between client and upstream failed")?;
+    let result = copy_bidirectional(&mut inbound, &mut outbound).await;
+    let elapsed_ms = start.elapsed().as_micros() as f64 / 1000.0;
 
-    debug!(
-        target = %orig_dst,
-        bytes_sent = n_to_upstream,
-        bytes_received = n_from_upstream,
-        "TProxy connection closed"
-    );
+    match result {
+        Ok((to_up, from_up)) => {
+            info!(
+                "TCP  {}:{} -> {} [PROXY] up={} down={} {:.1}ms",
+                peer_addr
+                    .map(|a| a.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                peer_addr.map(|a| a.port()).unwrap_or(0),
+                orig_dst,
+                to_up,
+                from_up,
+                elapsed_ms,
+            );
+        }
+        Err(e) => {
+            info!(
+                "TCP  {}:{} -> {} [PROXY] CLOSE {:.1}ms: {}",
+                peer_addr
+                    .map(|a| a.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                peer_addr.map(|a| a.port()).unwrap_or(0),
+                orig_dst,
+                elapsed_ms,
+                e,
+            );
+        }
+    }
 
     Ok(())
 }
@@ -570,6 +589,48 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     }
 
     Ok(addr)
+}
+
+// ============================================================================
+// DNS Query Name Extraction
+// ============================================================================
+
+/// Extract the query name from a DNS packet (question section).
+/// Handles uncompressed names (simple label sequence).
+pub fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut labels = Vec::new();
+    loop {
+        if pos >= packet.len() {
+            return None;
+        }
+        let len = packet[pos] as usize;
+        if len == 0 {
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            // DNS compression pointer — stop
+            break;
+        }
+        pos += 1;
+        if pos + len > packet.len() {
+            return None;
+        }
+        if let Ok(label) = std::str::from_utf8(&packet[pos..pos + len]) {
+            labels.push(label.to_string());
+        } else {
+            return None;
+        }
+        pos += len;
+    }
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels.join("."))
+    }
 }
 
 // ============================================================================
@@ -650,6 +711,28 @@ mod tests {
         assert!(debug_str.contains("15080"));
         assert!(debug_str.contains("running"));
     }
+
+    #[test]
+    fn test_extract_dns_query_name() {
+        // Simple A record query for "google.com"
+        // Transaction ID: 0x1234, Flags: 0x0100 (standard query, recursion desired)
+        // Questions: 1, Answer RRs: 0
+        let dns_query: Vec<u8> = vec![
+            0x12, 0x34, // Transaction ID
+            0x01, 0x00, // Flags: standard query
+            0x00, 0x01, // Questions: 1
+            0x00, 0x00, // Answer RRs: 0
+            0x00, 0x00, // Authority RRs: 0
+            0x00, 0x00, // Additional RRs: 0
+            6, b'g', b'o', b'o', b'g', b'l', b'e', // "google" (len=6)
+            3, b'c', b'o', b'm', // "com" (len=3)
+            0,    // End of domain name
+            0x00, 0x01, // QTYPE: A
+            0x00, 0x01, // QCLASS: IN
+        ];
+        let name = extract_dns_query_name(&dns_query);
+        assert_eq!(name.as_deref(), Some("google.com"));
+    }
 }
 
 // ============================================================================
@@ -668,6 +751,8 @@ pub struct UdpTproxyListener {
     running: Arc<AtomicBool>,
     /// socket 标记值（用于 eBPF 自排除，默认 0x100）
     socket_mark: u32,
+    /// 停止信号（通知接收循环立即退出）
+    stop_signal: Arc<Notify>,
 }
 
 impl UdpTproxyListener {
@@ -677,7 +762,8 @@ impl UdpTproxyListener {
             listen_addr,
             dialer: Arc::new(RwLock::new(dialer)),
             running: Arc::new(AtomicBool::new(false)),
-            socket_mark: 0x100, // 原版 dae 默认值
+            socket_mark: 0x100,
+            stop_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -688,6 +774,7 @@ impl UdpTproxyListener {
             dialer: Arc::new(RwLock::new(dialer)),
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
+            stop_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -826,13 +913,27 @@ impl UdpTproxyListener {
     }
 
     /// 启动 UDP TProxy 监听循环
-    pub async fn start(&self) -> Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd};
+    pub async fn start(
+        &self,
+        ebpf_mgr: Option<Arc<Mutex<crate::ebpf::EbpfManager>>>,
+    ) -> Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
-        let owned_fd = self.bind().await?;
-        let fd = owned_fd.as_raw_fd();
-        // Prevent OwnedFd from closing the fd (we're handing ownership to std_socket)
-        std::mem::forget(owned_fd);
+        let tokio_socket = self.bind().await?;
+        let fd = tokio_socket.as_raw_fd();
+
+        // ---- Populate listen_socket_map for bpf_sk_assign (UDP, key=1) ----
+        if let Some(ref mgr) = ebpf_mgr {
+            if let Err(e) = mgr.lock().unwrap().update_listen_socket_map(1, fd) {
+                error!("Failed to update listen_socket_map for udp: {}", e);
+            }
+        }
+
+        // Convert to std socket and take ownership of the raw fd (prevents double-close)
+        let std_socket = tokio_socket
+            .into_std()
+            .context("Failed to convert tokio socket to std")?;
+        let fd = std_socket.into_raw_fd();
         let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
         std_socket.set_nonblocking(true)?;
         self.running.store(true, Ordering::SeqCst);
@@ -848,7 +949,7 @@ impl UdpTproxyListener {
     /// UDP 接收循环核心 — 使用 recvmsg 获取 cmsg 以解析原始目标地址，
     /// 并通过 SOCKS5 UDP ASSOCIATE 将数据包转发到原始目标。
     async fn run_receive_loop(&self, socket: std::net::UdpSocket) -> Result<()> {
-        use protocols::socks5::UdpAssociateSession;
+        use protocols::UdpAssociateSession;
         use std::os::unix::io::AsRawFd;
 
         const MAX_UDP_SIZE: usize = 65535;
@@ -857,21 +958,18 @@ impl UdpTproxyListener {
         let fd = socket.as_raw_fd();
         let dialer = self.dialer.clone();
         let running = self.running.clone();
+        let stop_signal = self.stop_signal.clone();
 
         // Pool for reusing UDP ASSOCIATE sessions per destination
-        let pool = Arc::new(protocols::socks5::UdpEndpointPool::new());
+        let pool = Arc::new(protocols::UdpEndpointPool::new());
 
         loop {
-            if !running.load(Ordering::SeqCst) {
-                info!("UDP TProxy listener stopping");
-                break;
-            }
-
             // Receive one UDP packet via recvmsg (blocking, to get cmsg for original dst)
             let mut buf = vec![0u8; MAX_UDP_SIZE];
             let mut cmsg_buf = vec![0u8; CMSG_BUFFER_SIZE];
 
-            let result = tokio::task::spawn_blocking(move || {
+            // Use select! to allow immediate shutdown even when blocked on recvmsg
+            let recv_fut = tokio::task::spawn_blocking(move || {
                 let mut iov = libc::iovec {
                     iov_base: buf.as_mut_ptr() as *mut libc::c_void,
                     iov_len: buf.len(),
@@ -936,10 +1034,28 @@ impl UdpTproxyListener {
 
                 buf.truncate(n);
                 Ok((n, buf, peer_addr, orig_dst))
-            })
-            .await??;
+            });
 
-            let (n, mut pkt_buf, peer_addr, orig_dst) = result;
+            // Wait for either a packet or a stop signal
+            let result = tokio::select! {
+                result = recv_fut => result,
+                _ = stop_signal.notified() => {
+                    info!("UDP TProxy listener stopping via signal");
+                    break;
+                }
+            };
+
+            let (n, mut pkt_buf, peer_addr, orig_dst) = match result {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    warn!("UDP recvmsg error: {}", e);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("UDP spawn_blocking join error: {}", e);
+                    continue;
+                }
+            };
 
             if n == 0 {
                 // WouldBlock
@@ -958,12 +1074,31 @@ impl UdpTproxyListener {
                 }
             };
 
-            debug!(
-                peer = ?peer_addr,
-                dest = %dest,
-                bytes = n,
-                "UDP TProxy: forwarding packet"
-            );
+            // Log every UDP packet: DNS queries get special treatment
+            let is_dns = dest.port() == 53 && n > 12;
+            if is_dns {
+                // Try to extract the query domain name from the DNS packet
+                let qname = extract_dns_query_name(&pkt_buf);
+                info!(
+                    "DNS  {}:{} -> {} QUERY {}",
+                    peer_addr
+                        .map(|a| a.ip())
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    peer_addr.map(|a| a.port()).unwrap_or(0),
+                    dest,
+                    qname.as_deref().unwrap_or("<parse-failed>"),
+                );
+            } else {
+                info!(
+                    "UDP  {}:{} -> {} {}bytes",
+                    peer_addr
+                        .map(|a| a.ip())
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    peer_addr.map(|a| a.port()).unwrap_or(0),
+                    dest,
+                    n,
+                );
+            }
 
             // Spawn a task to forward this UDP packet via SOCKS5 and get response.
             // Each task manages its own UDP ASSOCIATE session lifecycle.
@@ -1007,14 +1142,25 @@ impl UdpTproxyListener {
                     Ok(Ok(len)) => {
                         recv_buf.truncate(len);
                         // Parse SOCKS5 UDP response header to extract payload
-                        if let Some((_resp_peer, payload_offset)) =
+                        if let Some((resp_peer, payload_offset)) =
                             UdpAssociateSession::parse_udp_response_header(&recv_buf)
                         {
                             let payload = &recv_buf[payload_offset..];
+
+                            // DNS response logging
+                            if dest.port() == 53 && payload.len() > 12 {
+                                let qname = extract_dns_query_name(payload);
+                                info!(
+                                    "DNS  {} -> {}:{}",
+                                    qname.as_deref().unwrap_or("<parse-failed>"),
+                                    peer_addr.map(|a| a.ip()).unwrap_or(std::net::IpAddr::V4(
+                                        std::net::Ipv4Addr::UNSPECIFIED
+                                    )),
+                                    peer_addr.map(|a| a.port()).unwrap_or(0),
+                                );
+                            }
+
                             // Send response back to original client.
-                            // Open a temporary UDP socket to send the response.
-                            // We don't need IP_TRANSPARENT for sending — the client
-                            // just needs to receive the response data.
                             if let Some(peer) = peer_addr {
                                 if let Ok(resp_sock) =
                                     tokio::net::UdpSocket::bind(if peer.is_ipv4() {
@@ -1026,8 +1172,6 @@ impl UdpTproxyListener {
                                 {
                                     if let Err(e) = resp_sock.send_to(payload, peer).await {
                                         debug!("UDP response send failed: {}", e);
-                                    } else {
-                                        debug!("UDP response: {} bytes -> {}", payload.len(), peer,);
                                     }
                                 }
                             }
@@ -1050,6 +1194,7 @@ impl UdpTproxyListener {
     /// 停止 UDP TProxy 监听器
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        self.stop_signal.notify_one();
         info!("UDP TProxy listener stop signal sent");
     }
 }

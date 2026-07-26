@@ -13,6 +13,7 @@ use libbpf_rs::{Object, ObjectBuilder, TcHook, TC_EGRESS, TC_INGRESS};
 use std::ffi::OsStr;
 use std::os::unix::io::AsFd;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -43,6 +44,31 @@ pub const DEFAULT_EBPF_PATH: &str = "/etc/dae-rs/ebpf.o";
 pub const ROUTING_MAP_MAX: u32 = 1024;
 pub const STATS_MAP_SIZE: u32 = 2;
 pub const MAX_MATCH_SET_LEN: usize = 32 * 32; // 1024, must match tproxy.c
+
+/// eBPF 文件系统 pinning 路径
+pub const BPFFS_PATH: &str = "/sys/fs/bpf/dae";
+
+// ---- Map capacity constants (must match tproxy.c) ----
+/// conn_state_map max_entries (MAX_CONN_STATE_NUM = 65536 * 4)
+pub const CONN_STATE_MAX_ENTRIES: u32 = 262144;
+/// redirect_track max_entries
+pub const REDIRECT_TRACK_MAX_ENTRIES: u32 = 65536;
+/// cookie_pid_map max_entries
+pub const COOKIE_PID_MAP_MAX_ENTRIES: u32 = 65536;
+
+// ---- Timeout constants (nanoseconds) ----
+/// redirect_track TTL: 5 minutes
+pub const REDIRECT_TRACK_TIMEOUT_NS: u64 = 300_000_000_000;
+/// cookie_pid_map TTL: 5 minutes
+pub const COOKIE_PID_MAP_TIMEOUT_NS: u64 = 300_000_000_000;
+
+// ---- Pressure detection thresholds ----
+/// conn_state_map usage above this triggers pressure mode
+pub const PRESSURE_ENTER_USAGE: f64 = 0.70;
+/// conn_state_map usage below this exits pressure mode
+pub const PRESSURE_EXIT_USAGE: f64 = 0.50;
+/// Number of consecutive rounds below exit threshold to leave pressure mode
+pub const PRESSURE_EXIT_ROUNDS: u32 = 3;
 
 // ============================================================================
 // Data Structures (must match tproxy.c definitions exactly)
@@ -146,6 +172,30 @@ impl TuplesKey {
             _pad: [0u8; 3],
         }
     }
+}
+
+// ---- tproxy.c: struct redirect_tuple ----
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RedirectTuple {
+    pub sip: [u8; 16],
+    pub dip: [u8; 16],
+}
+
+// ---- tproxy.c: struct redirect_entry ----
+/// Size: 32 bytes. The original C struct has __u8 padding[3] followed
+/// by __u64 last_seen_ns; the C compiler adds 4 bytes of implicit alignment
+/// padding. We expand _pad to 7 bytes so bytemuck::Pod is satisfied.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RedirectEntry {
+    pub ifindex: u32,
+    pub smac: [u8; 6],
+    pub dmac: [u8; 6],
+    pub from_wan: u8,
+    /// Combined: explicit C padding (3) + alignment padding to u64 (4)
+    pub _pad: [u8; 7],
+    pub last_seen_ns: u64,
 }
 
 // ---- tproxy.c: union routing_meta ----
@@ -301,6 +351,34 @@ pub struct Daeevent {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// 确保 bpffs 已挂载到 /sys/fs/bpf。
+/// 如果未挂载则尝试挂载。
+fn ensure_bpffs_mounted() -> std::io::Result<()> {
+    let bpffs_path = std::path::Path::new("/sys/fs/bpf");
+    if !bpffs_path.exists() {
+        std::fs::create_dir_all(bpffs_path)?;
+    }
+    // 检查是否已挂载
+    let mounts = std::fs::read_to_string("/proc/mounts")?;
+    if mounts.lines().any(|line| line.contains("/sys/fs/bpf")) {
+        return Ok(());
+    }
+    // 挂载 bpffs
+    unsafe {
+        let ret = libc::mount(
+            std::ffi::CString::new("bpffs").unwrap().as_ptr(),
+            std::ffi::CString::new("/sys/fs/bpf").unwrap().as_ptr(),
+            std::ffi::CString::new("bpf").unwrap().as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 pub fn if_nametoindex(ifname: &str) -> Result<i32> {
     let cstr = std::ffi::CString::new(ifname)
@@ -466,6 +544,12 @@ pub struct EbpfManager {
     iface: String,
     bpf_path: String,
     param: Option<Daeparam>,
+    /// eBPF map pinning 路径，如果设置则在 load 后自动 pin maps
+    pin_path: Option<String>,
+    /// Flip 位，用于 TC handle 翻转（热重载时切换 filter）
+    flip: u32,
+    /// conn_state_map 最大条目数（从 tproxy.c MAX_CONN_STATE_NUM 同步）
+    conn_state_map_max_entries: u32,
 }
 
 // Safety: EbpfManager is only accessed through RwLock<ControlPlane>
@@ -481,6 +565,9 @@ impl EbpfManager {
             iface: iface.to_string(),
             bpf_path: DEFAULT_EBPF_PATH.to_string(),
             param: None,
+            pin_path: None,
+            flip: 0,
+            conn_state_map_max_entries: CONN_STATE_MAX_ENTRIES,
         }
     }
 
@@ -492,11 +579,76 @@ impl EbpfManager {
             iface: iface.to_string(),
             bpf_path: bpf_path.to_string(),
             param: None,
+            pin_path: None,
+            flip: 0,
+            conn_state_map_max_entries: CONN_STATE_MAX_ENTRIES,
         }
+    }
+
+    /// 获取当前 flip 位
+    pub fn flip(&self) -> u32 {
+        self.flip
+    }
+
+    /// 设置 flip 位（热重载时用于 TC handle 翻转）
+    pub fn set_flip(&mut self, flip: u32) {
+        self.flip = flip;
+        info!("Flip set to {}", flip);
     }
 
     pub fn set_param(&mut self, param: &Daeparam) {
         self.param = Some(*param);
+    }
+
+    /// 设置 eBPF map pinning 路径。
+    /// 设置后，调用 load() 或 load_from_bytes() 时会自动将 maps pin 到该路径。
+    pub fn set_pin_path(&mut self, path: String) {
+        self.pin_path = Some(path);
+    }
+
+    /// 设置 conn_state_map 的最大条目数。
+    /// 必须在 load() 前调用才生效。
+    pub fn set_conn_state_max_entries(&mut self, n: u32) {
+        self.conn_state_map_max_entries = n;
+        info!("conn_state_map max_entries set to {}", n);
+    }
+
+    /// 在 OpenObject 阶段调整 eBPF maps 的参数（load 前）。
+    /// 包括：
+    /// - fast_sock: 设置 max_entries=1 禁用 sockhash 路径
+    /// - conn_state_map: 设置可配置的 max_entries
+    fn adjust_maps_pre_load(&self, open_obj: &mut libbpf_rs::OpenObject) {
+        // fast_sock: 设置 max_entries=1 以禁用 sockhash 路径
+        if let Some(mut map) = open_obj.maps_mut().find(|m| {
+            m.name().to_str().unwrap_or("") == "fast_sock"
+        }) {
+            if let Err(e) = map.set_max_entries(1) {
+                warn!("Failed to set fast_sock max_entries=1: {}", e);
+            } else {
+                info!("fast_sock max_entries set to 1 (sockhash path disabled)");
+            }
+        } else {
+            debug!("fast_sock map not found in eBPF object (may be removed)");
+        }
+
+        // conn_state_map: 使用可配置的 max_entries
+        if let Some(mut map) = open_obj.maps_mut().find(|m| {
+            m.name().to_str().unwrap_or("") == "conn_state_map"
+        }) {
+            if let Err(e) = map.set_max_entries(self.conn_state_map_max_entries) {
+                warn!(
+                    "Failed to set conn_state_map max_entries={}: {}",
+                    self.conn_state_map_max_entries, e
+                );
+            } else {
+                info!(
+                    "conn_state_map max_entries set to {}",
+                    self.conn_state_map_max_entries
+                );
+            }
+        } else {
+            warn!("conn_state_map not found in eBPF object");
+        }
     }
 
     /// Load eBPF from file using libbpf ObjectBuilder.
@@ -513,18 +665,11 @@ impl EbpfManager {
             .open_file(path)
             .with_context(|| format!("Failed to open eBPF object from {}", self.bpf_path))?;
 
-        // Set PARAM in .rodata map before loading
-        if let Some(ref param) = self.param {
-            let param_bytes = bytemuck::bytes_of(param);
-            for mut map in open_obj.maps_mut() {
-                if map.name() == OsStr::new(".rodata") {
-                    map.set_initial_value(param_bytes)
-                        .with_context(|| "Failed to set .rodata initial value")?;
-                    info!("PARAM set in .rodata ({} bytes)", param_bytes.len());
-                    break;
-                }
-            }
-        }
+        // Adjust map parameters before loading
+        self.adjust_maps_pre_load(&mut open_obj);
+
+        // Write PARAM to .rodata BEFORE loading (read-only after load)
+        self.update_param_pre_load(&mut open_obj)?;
 
         // Fix program types for non-standard TC section names before loading
         set_tc_prog_types(&mut open_obj);
@@ -533,7 +678,16 @@ impl EbpfManager {
             .load()
             .context("Failed to load eBPF object into kernel")?;
         info!("eBPF program loaded successfully via libbpf-rs");
+
         self.obj = Some(obj);
+
+        // Auto-pin maps if pin_path is configured
+        if let Some(ref bpffs_path) = self.pin_path.clone() {
+            if let Err(e) = self.pin_maps(bpffs_path) {
+                warn!("Failed to pin eBPF maps: {}", e);
+            }
+        }
+
         Ok(())
     }
 
@@ -553,17 +707,12 @@ impl EbpfManager {
             .open_memory(bytes)
             .context("Failed to open eBPF object from memory")?;
 
-        if let Some(ref param) = self.param {
-            let param_bytes = bytemuck::bytes_of(param);
-            for mut map in open_obj.maps_mut() {
-                if map.name() == OsStr::new(".rodata") {
-                    map.set_initial_value(param_bytes)
-                        .with_context(|| "Failed to set .rodata initial value")?;
-                    info!("PARAM set in .rodata ({} bytes)", param_bytes.len());
-                    break;
-                }
-            }
-        }
+        // Adjust map parameters before loading
+        self.adjust_maps_pre_load(&mut open_obj);
+
+        // Write PARAM to .rodata BEFORE loading — .rodata becomes read-only
+        // after bpf_object__load(), so post-load writes get EPERM.
+        self.update_param_pre_load(&mut open_obj)?;
 
         // Fix program types for non-standard TC section names before loading
         set_tc_prog_types(&mut open_obj);
@@ -572,73 +721,316 @@ impl EbpfManager {
             .load()
             .context("Failed to load eBPF object from memory into kernel")?;
         info!("eBPF program loaded from byte slice via libbpf-rs");
+
+        // Store the loaded object first so update_param_post_load can access it
         self.obj = Some(obj);
+
+        // After loading, PARAM was already written via update_param_pre_load.
+        // No post-load update needed (rodata is read-only after load).
+
+        // Auto-pin maps if pin_path is configured
+        if let Some(ref bpffs_path) = self.pin_path.clone() {
+            if let Err(e) = self.pin_maps(bpffs_path) {
+                warn!("Failed to pin eBPF maps: {}", e);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Write PARAM to the .rodata map BEFORE loading.
+    /// Must be called on the OpenObject — .rodata is writable before load.
+    fn update_param_pre_load(&self, open_obj: &mut libbpf_rs::OpenObject) -> Result<()> {
+        let param = match self.param.as_ref() {
+            Some(p) => p,
+            None => {
+                warn!("Cannot update PARAM: no PARAM configured");
+                return Ok(());
+            }
+        };
+        let param_bytes = bytemuck::bytes_of(param);
+        let rodata_map = open_obj.maps_mut().find(|m| {
+            let name = m.name().to_str().unwrap_or("");
+            name == ".rodata" || name == "rodata" || name.ends_with(".rodata")
+        });
+        if let Some(mut map) = rodata_map {
+            // Use initial_value_mut to read/write the pre-load .rodata buffer
+            if let Some(initial) = map.initial_value_mut() {
+                if param_bytes.len() <= initial.len() {
+                    initial[..param_bytes.len()].copy_from_slice(param_bytes);
+                    info!(
+                        "PARAM written to .rodata pre-load ({} bytes, initial_value size: {} bytes)",
+                        param_bytes.len(),
+                        initial.len()
+                    );
+                } else {
+                    warn!(
+                        "PARAM size ({}) exceeds .rodata initial_value size ({})",
+                        param_bytes.len(),
+                        initial.len()
+                    );
+                }
+            } else {
+                // No initial value buffer; use set_initial_value with full patched content
+                let value_size = 1024; // reasonable default for rodata
+                let mut full_value = vec![0u8; value_size];
+                full_value[..param_bytes.len().min(value_size)].copy_from_slice(
+                    &param_bytes[..param_bytes.len().min(value_size)],
+                );
+                map.set_initial_value(&full_value)?;
+                info!(
+                    "PARAM written to .rodata via set_initial_value ({} bytes)",
+                    param_bytes.len()
+                );
+            }
+        } else {
+            warn!("Could not find .rodata map to write PARAM");
+        }
+        Ok(())
+    }
+
+    /// Update PARAM in the .rodata map after loading (fallback, may fail with EPERM).
+    fn update_param_post_load(&self) {
+        let obj = match self.obj.as_ref() {
+            Some(obj) => obj,
+            None => {
+                warn!("Cannot update PARAM: eBPF object not loaded");
+                return;
+            }
+        };
+        let param = match self.param.as_ref() {
+            Some(p) => p,
+            None => {
+                warn!("Cannot update PARAM: no PARAM configured");
+                return;
+            }
+        };
+        let param_bytes = bytemuck::bytes_of(param);
+        let rodata_map = obj.maps().find(|m| {
+            let name = m.name().to_str().unwrap_or("");
+            name == ".rodata" || name == "rodata" || name.ends_with(".rodata")
+        });
+        if let Some(map) = rodata_map {
+            // Read current .rodata value
+            let current = match map.lookup(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::empty()) {
+                Ok(Some(v)) => v,
+                _ => {
+                    warn!(".rodata map lookup failed, PARAM not updated");
+                    return;
+                }
+            };
+            let mut full_value = current;
+            if full_value.len() < param_bytes.len() {
+                warn!(
+                    ".rodata map too small ({} bytes) for PARAM ({} bytes)",
+                    full_value.len(),
+                    param_bytes.len()
+                );
+                return;
+            }
+            // Patch PARAM bytes at the beginning of .rodata
+            full_value[..param_bytes.len()].copy_from_slice(param_bytes);
+            if let Err(e) = map.update(
+                &0u32.to_ne_bytes(),
+                &full_value,
+                libbpf_rs::MapFlags::empty(),
+            ) {
+                warn!("Failed to update .rodata map with PARAM: {}", e);
+            } else {
+                info!(
+                    "PARAM updated via .rodata map ({} bytes, map value size: {} bytes)",
+                    param_bytes.len(),
+                    full_value.len()
+                );
+            }
+        } else {
+            warn!("Could not find .rodata map after load to update PARAM");
+        }
+    }
+
+    // ============================================================================
+    // eBPF Map Pinning
+    // ============================================================================
+
+    /// 将所有 eBPF maps pin 到 bpffs 指定路径。
+    /// 每个 map 在 bpffs 路径下以其名称创建文件。
+    ///
+    /// 自动跳过内部 map（如 .rodata、.bss、.data 等）。
+    pub fn pin_maps(&mut self, bpffs_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // 确保 bpffs 已挂载
+        ensure_bpffs_mounted()?;
+
+        // 创建 dae 专属目录
+        let dir = std::path::Path::new(bpffs_path);
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+
+        // 获取 eBPF 对象（可变引用，因为 Map::pin() 需要 &mut self）
+        let obj = self.obj.as_mut().ok_or("eBPF object not loaded")?;
+
+        // 遍历所有 maps 并 pin
+        for mut map in obj.maps_mut() {
+            let map_name = map.name().to_string_lossy().to_string();
+            // 跳过内部 map（如 .rodata、.bss 等）
+            if map_name.starts_with('.') || map_name.is_empty() {
+                continue;
+            }
+            let pin_path = dir.join(&map_name);
+            // 如果已存在，先移除再重新 pin
+            if pin_path.exists() {
+                std::fs::remove_file(&pin_path)?;
+            }
+            map.pin(&pin_path)?;
+            debug!("Pinned map '{}' to {:?}", map_name, pin_path);
+        }
+
+        Ok(())
+    }
+
+    /// 从 bpffs 卸载所有 dae 的 pinned maps。
+    pub fn unpin_maps(&self, bpffs_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::path::Path::new(bpffs_path);
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        // 遍历目录删除所有 pinned map 文件
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+                debug!("Unpinned map at {:?}", path);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 检查 bpffs 中是否存在 dae 的 pinned maps。
+    pub fn pinned_maps_exist(bpffs_path: &str) -> bool {
+        let dir = std::path::Path::new(bpffs_path);
+        if !dir.exists() {
+            return false;
+        }
+        // 检查是否有至少一个 map 文件
+        dir.read_dir()
+            .map(|mut entries| entries.any(|e| e.is_ok()))
+            .unwrap_or(false)
     }
 
     // ========================================================================
     // 通用 TC attach — 将指定程序列表挂载到目标接口
     // ========================================================================
 
-    /// 通用 TC attach：将指定的程序列表挂载到目标接口
-    ///
-    /// # 参数
-    ///
-    /// * `ifname` — 目标接口名称
-    /// * `progs` — 程序列表，每项为 (程序名, attach_point)
-    ///   attach_point 使用 libbpf_rs::TC_INGRESS 或 libbpf_rs::TC_EGRESS
-    pub fn attach_tc(&mut self, ifname: &str, progs: &[(&str, u32)]) -> Result<()> {
-        let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
-        let ifindex = if_nametoindex(ifname).map_err(|e| EbpfError::TcAttachError {
-            iface: ifname.into(),
-            detail: format!("if_nametoindex: {}", e),
-        })?;
+    /// 从程序名推导 TC attach point（ingress/egress）
+    fn prog_attach_point(prog_name: &str) -> u32 {
+        if prog_name.contains("egress") {
+            TC_EGRESS
+        } else {
+            // 默认 ingress（包含 "ingress" 或不确定时）
+            TC_INGRESS
+        }
+    }
 
-        info!(iface = %ifname, ifindex = %ifindex, count = %progs.len(), "Attaching TC programs");
+/// 通用 TC attach：将指定的程序列表挂载到目标接口
+///
+/// # 参数
+///
+/// * `ifname` — 目标接口名称
+/// * `progs` — 程序列表，每项为 (程序名, 优先级)
+/// * `handle` — 可选 handle（调用方已将 flip 位合并到 handle 中）
+pub fn attach_tc(
+    &mut self,
+    ifname: &str,
+    progs: &[(&str, u32)],
+    handle: Option<u32>,
+) -> Result<()> {
+    let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
+    let ifindex = if_nametoindex(ifname).map_err(|e| EbpfError::TcAttachError {
+        iface: ifname.into(),
+        detail: format!("if_nametoindex: {}", e),
+    })?;
 
-        for (prog_name, attach_point) in progs {
-            let prog = match find_prog(obj, prog_name) {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!("TC program '{}' not found, skipping", prog_name);
-                    continue;
-                }
-            };
+    info!(iface = %ifname, ifindex = %ifindex, count = %progs.len(), "Attaching TC programs");
 
-            let mut hook = TcHook::new(prog.as_fd());
-            hook.ifindex(ifindex);
-            hook.attach_point(*attach_point);
+    for (prog_name, priority) in progs {
+        let prog = match find_prog(obj, prog_name) {
+            Ok(p) => p,
+            Err(_) => {
+                warn!("TC program '{}' not found, skipping", prog_name);
+                continue;
+            }
+        };
 
-            // Create clsact qdisc (no-op if already exists)
-            hook.create().map_err(|e| EbpfError::TcAttachError {
-                iface: ifname.into(),
-                detail: format!("create({}): {}", prog_name, e),
-            })?;
+        let attach_point = Self::prog_attach_point(prog_name);
+        let mut hook = TcHook::new(prog.as_fd());
+        hook.ifindex(ifindex);
+        hook.attach_point(attach_point);
+        hook.priority(*priority);
 
-            // Attach the program
-            let attached = hook.attach().map_err(|e| EbpfError::TcAttachError {
-                iface: ifname.into(),
-                detail: format!("attach({}): {}", prog_name, e),
-            })?;
-
-            self.tc_hooks.push(TcAttachInfo {
-                hook: attached,
-                iface: ifname.into(),
-                prog_name: prog_name.to_string(),
-            });
-            info!(
-                "TC program '{}' attached to {} (ifindex={})",
-                prog_name, ifname, ifindex
-            );
+        if let Some(h) = handle {
+            hook.handle(h);
         }
 
+        // 对于 dae0/dae0peer（netkit 设备），先删除已存在的 clsact qdisc，
+        // 再重新创建。原因是 netkit 设备上的 clsact 如果已存在，
+        // hook.create() 是 no-op，导致之前设置的 priority 不生效。
+        // 仅当设备不存在（非首次运行）时记录 warning；设备不存在属于
+        // 正常首次运行场景，不视为错误。
+        if ifname == "dae0" || ifname == "dae0peer" {
+            let output = Command::new("tc")
+                .args(["qdisc", "del", "dev", ifname, "clsact"])
+                .output()
+                .map_err(|e| {
+                    EbpfError::TcAttachError {
+                        iface: ifname.into(),
+                        detail: format!("delete clsact qdisc failed: {}", e),
+                    }
+                })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("No such file or directory") {
+                    warn!(
+                        iface = %ifname,
+                        stderr = %stderr.trim(),
+                        "Failed to delete existing clsact qdisc"
+                    );
+                }
+            }
+        }
+
+        // Create clsact qdisc (no-op if already exists)
+        hook.create().map_err(|e| EbpfError::TcAttachError {
+            iface: ifname.into(),
+            detail: format!("create({}): {}", prog_name, e),
+        })?;
+
+        // Attach the program
+        let attached = hook.attach().map_err(|e| EbpfError::TcAttachError {
+            iface: ifname.into(),
+            detail: format!("attach({}): {}", prog_name, e),
+        })?;
+
+        self.tc_hooks.push(TcAttachInfo {
+            hook: attached,
+            iface: ifname.into(),
+            prog_name: prog_name.to_string(),
+        });
         info!(
-            "TC programs attached to {} (total hooks: {})",
-            ifname,
-            self.tc_hooks.len()
+            "TC program '{}' attached to {} (ifindex={}, priority={}, handle={:?})",
+            prog_name, ifname, ifindex, priority, handle
         );
-        Ok(())
     }
+
+    info!(
+        "TC programs attached to {} (total hooks: {})",
+        ifname,
+        self.tc_hooks.len()
+    );
+    Ok(())
+}
 
     // ========================================================================
     // 按接口分组 TC attach
@@ -646,9 +1038,10 @@ impl EbpfManager {
 
     /// 根据接口链路头长度选择 attach L2 或 L3 版本的 eBPF 程序
     ///
-    /// 读取 `/sys/class/net/<ifname>/type` 判断接口类型：
-    /// - ARPHRD_ETHER (1) → 14 字节（有以太网头，使用 L2 版本）
-    /// - 其他类型（如 ARPHRD_NONE/ARPHRD_TUNNEL）→ 0 字节（无链路头，使用 L3 版本）
+    /// 读取 `/sys/class/net/<ifname>/type` 判断接口类型。
+    /// 与原始 dae Go 行为对齐：dae 使用 netlink EncapType 判断，
+    /// 如果是 "none"/"ipip"/"ppp"/"tun" 则为 L3，否则为 L2。
+    /// 这里通过 ARPHRD 类型做等价映射。
     fn get_link_header_len(ifname: &str) -> Result<u32> {
         let path = format!("/sys/class/net/{}/type", ifname);
         let content = std::fs::read_to_string(&path)
@@ -658,83 +1051,139 @@ impl EbpfManager {
             .parse()
             .with_context(|| format!("Invalid interface type value for {}", ifname))?;
 
-        // ARPHRD_ETHER = 1 — 有以太网头
-        if if_type == 1 {
-            Ok(14) // 以太网头长度
-        } else {
-            Ok(0) // 无链路头
+        // 与 dae Go 的 EncapType 判断对齐：
+        // dae Go: EncapType in ["none", "ipip", "ppp", "tun"] → L3 (0), else → L2 (14)
+        // ARPHRD 常量映射:
+        //   ARPHRD_PPP = 512 (0x200)       → "ppp"
+        //   ARPHRD_TUNNEL = 768 (0x300)    → "tun"/"ipip"
+        //   ARPHRD_TUNNEL6 = 769 (0x301)   → "tun"
+        //   ARPHRD_SIT = 776 (0x308)       → "ipip"
+        //   ARPHRD_IPIP = 778 (0x30A)      → "ipip"
+        //   ARPHRD_NONE = 65534            → "none" (tun 设备)
+        match if_type {
+            512 |    // ARPHRD_PPP
+            768 |    // ARPHRD_TUNNEL
+            769 |    // ARPHRD_TUNNEL6
+            776 |    // ARPHRD_SIT
+            778 |    // ARPHRD_IPIP
+            65534    // ARPHRD_NONE
+            => Ok(0),   // L3: 无链路头
+            _ => Ok(14), // L2: 默认以太网头 (与 dae 一致)
         }
     }
 
-    /// WAN 接口：根据链路头长度选择 L2 或 L3 版本
-    ///
-    /// - 有以太网头（link_h_len > 0）→ attach L2 版本
-    /// - 无链路头（link_h_len == 0）→ attach L3 版本
-    pub fn attach_wan(&mut self, ifname: &str) -> Result<()> {
-        let link_h_len = Self::get_link_header_len(ifname)?;
-        info!(
-            "Attaching WAN TC programs to {} (link_h_len={})",
-            ifname, link_h_len
-        );
+/// WAN 接口：根据链路头长度选择 L2 或 L3 版本
+///
+/// 与原始 dae Go 行为对齐：
+/// - Egress 方向优先级 2，handle sub = 4
+/// - Ingress 方向优先级 1，handle sub = 2
+pub fn attach_wan(&mut self, ifname: &str) -> Result<()> {
+    let link_h_len = Self::get_link_header_len(ifname)?;
+    let handle_major = 0x2023u32;
+    let flip = self.flip;
+    info!(
+        "Attaching WAN TC programs to {} (link_h_len={}, flip={})",
+        ifname, link_h_len, flip
+    );
 
-        let egress_progs = if link_h_len > 0 {
-            vec![("tproxy_wan_egress_l2", TC_EGRESS)]
+    // Egress (优先级 2, handle sub=4)
+    self.attach_tc(
+        ifname,
+        &[if link_h_len > 0 {
+            ("tproxy_wan_egress_l2", 2)
         } else {
-            vec![("tproxy_wan_egress_l3", TC_EGRESS)]
-        };
+            ("tproxy_wan_egress_l3", 2)
+        }],
+        Some((handle_major << 16) | ((4 & !1u32) | flip)),
+    )?;
 
-        let ingress_progs = if link_h_len > 0 {
-            vec![("tproxy_wan_ingress_l2", TC_INGRESS)]
+    // Ingress (优先级 1, handle sub=2)
+    self.attach_tc(
+        ifname,
+        &[if link_h_len > 0 {
+            ("tproxy_wan_ingress_l2", 1)
         } else {
-            vec![("tproxy_wan_ingress_l3", TC_INGRESS)]
-        };
+            ("tproxy_wan_ingress_l3", 1)
+        }],
+        Some((handle_major << 16) | ((2 & !1u32) | flip)),
+    )?;
 
-        let mut all_progs = egress_progs;
-        all_progs.extend(ingress_progs);
+    Ok(())
+}
 
-        self.attach_tc(ifname, &all_progs)
-    }
+/// LAN 接口：根据链路头长度选择 L2 或 L3 版本
+///
+/// 与原始 dae Go 行为对齐：
+/// - Ingress 方向优先级 2，handle sub = 4
+/// - Egress 方向优先级 1，handle sub = 2
+/// 注意：与 WAN 相反，LAN 的 Egress 优先级更高。
+pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
+    let link_h_len = Self::get_link_header_len(ifname)?;
+    let handle_major = 0x2023u32;
+    let flip = self.flip;
+    info!(
+        "Attaching LAN TC programs to {} (link_h_len={}, flip={})",
+        ifname, link_h_len, flip
+    );
 
-    /// LAN 接口：根据链路头长度选择 L2 或 L3 版本
-    ///
-    /// - 有以太网头（link_h_len > 0）→ attach L2 版本
-    /// - 无链路头（link_h_len == 0）→ attach L3 版本
-    pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
-        let link_h_len = Self::get_link_header_len(ifname)?;
-        info!(
-            "Attaching LAN TC programs to {} (link_h_len={})",
-            ifname, link_h_len
-        );
-
-        let ingress_progs = if link_h_len > 0 {
-            vec![("tproxy_lan_ingress_l2", TC_INGRESS)]
+    // Ingress (优先级 2, handle sub=4)
+    self.attach_tc(
+        ifname,
+        &[if link_h_len > 0 {
+            ("tproxy_lan_ingress_l2", 2)
         } else {
-            vec![("tproxy_lan_ingress_l3", TC_INGRESS)]
-        };
+            ("tproxy_lan_ingress_l3", 2)
+        }],
+        Some((handle_major << 16) | ((4 & !1u32) | flip)),
+    )?;
 
-        let egress_progs = if link_h_len > 0 {
-            vec![("tproxy_lan_egress_l2", TC_EGRESS)]
+    // Egress (优先级 1, handle sub=2)
+    self.attach_tc(
+        ifname,
+        &[if link_h_len > 0 {
+            ("tproxy_lan_egress_l2", 1)
         } else {
-            vec![("tproxy_lan_egress_l3", TC_EGRESS)]
-        };
+            ("tproxy_lan_egress_l3", 1)
+        }],
+        Some((handle_major << 16) | ((2 & !1u32) | flip)),
+    )?;
 
-        let mut all_progs = ingress_progs;
-        all_progs.extend(egress_progs);
+    Ok(())
+}
 
-        self.attach_tc(ifname, &all_progs)
-    }
+/// dae0（宿主 NS）：挂载 tproxy_dae0_ingress
+///
+/// 优先级 0，handle major=0x2022，handle sub=2
+pub fn attach_dae0(&mut self, ifname: &str) -> Result<()> {
+    let handle_major = 0x2022u32;
+    let flip = self.flip;
+    info!(
+        "Attaching dae0 TC program to {} (flip={})",
+        ifname, flip
+    );
+    self.attach_tc(
+        ifname,
+        &[("tproxy_dae0_ingress", 0)],
+        Some((handle_major << 16) | ((2 & !1u32) | flip)),
+    )
+}
 
-    /// dae0（宿主 NS）：挂载 tproxy_dae0_ingress
-    pub fn attach_dae0(&mut self, ifname: &str) -> Result<()> {
-        info!("Attaching dae0 TC program to {}", ifname);
-        self.attach_tc(ifname, &[("tproxy_dae0_ingress", TC_INGRESS)])
-    }
-
-    /// dae0peer（代理 NS）：挂载 tproxy_dae0peer_ingress
-    pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
-        info!("Attaching dae0peer TC program to {}", ifname);
-        self.attach_tc(ifname, &[("tproxy_dae0peer_ingress", TC_INGRESS)])
-    }
+/// dae0peer（代理 NS）：挂载 tproxy_dae0peer_ingress
+///
+/// 优先级 0，handle major=0x2022，handle sub=2
+pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
+    let handle_major = 0x2022u32;
+    let flip = self.flip;
+    info!(
+        "Attaching dae0peer TC program to {} (flip={})",
+        ifname, flip
+    );
+    self.attach_tc(
+        ifname,
+        &[("tproxy_dae0peer_ingress", 0)],
+        Some((handle_major << 16) | ((2 & !1u32) | flip)),
+    )
+}
 
     // ========================================================================
     // cgroup 程序 attach
@@ -753,6 +1202,10 @@ impl EbpfManager {
     /// # 参数
     ///
     /// * `cgroup_fd` — cgroup 文件描述符（通常为 /sys/fs/cgroup 的 fd）
+    ///
+    /// # 错误回滚
+    ///
+    /// 如果部分程序 attach 失败，已成功 attach 的程序会被自动 detach 清理。
     pub fn attach_cgroup(&mut self, cgroup_fd: std::os::unix::io::RawFd) -> Result<()> {
         let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
 
@@ -765,32 +1218,61 @@ impl EbpfManager {
             "tproxy_wan_cg_sendmsg6",
         ];
 
-        for name in &cgroup_progs {
-            let prog = match find_prog(obj, name) {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!("cgroup program '{}' not found, skipping", name);
-                    continue;
-                }
-            };
+        let mut attached: Vec<(String, libbpf_rs::Link)> = Vec::new();
 
-            // libbpf-rs ProgramMut::attach_cgroup takes a raw fd (i32)
-            match prog.attach_cgroup(cgroup_fd) {
-                Ok(link) => {
-                    self.cgroup_links.push(link);
-                    info!("cgroup program '{}' attached", name);
-                }
-                Err(e) => {
-                    warn!("Failed to attach cgroup program '{}': {}", name, e);
+        let result = (|| -> Result<()> {
+            for name in &cgroup_progs {
+                let prog = match find_prog(obj, name) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("cgroup program '{}' not found, skipping", name);
+                        continue;
+                    }
+                };
+
+                match prog.attach_cgroup(cgroup_fd) {
+                    Ok(link) => {
+                        attached.push((name.to_string(), link));
+                        info!("cgroup program '{}' attached", name);
+                    }
+                    Err(e) => {
+                        // 失败时回滚所有已 attach 的 link
+                        warn!(
+                            "Failed to attach cgroup program '{}': {}, rolling back {} attached link(s)",
+                            name,
+                            e,
+                            attached.len()
+                        );
+                        for (prog_name, link) in attached.drain(..) {
+                            if let Err(e2) = link.detach() {
+                                warn!(
+                                    "Failed to detach cgroup program '{}' during rollback: {}",
+                                    prog_name, e2
+                                );
+                            }
+                        }
+                        return Err(anyhow::anyhow!(
+                            "Failed to attach cgroup program '{}': {}",
+                            name,
+                            e
+                        ));
+                    }
                 }
             }
+            Ok(())
+        })();
+
+        // 如果成功，将 links 转移到 self.cgroup_links
+        if result.is_ok() {
+            self.cgroup_links
+                .extend(attached.into_iter().map(|(_, link)| link));
+            info!(
+                "cgroup programs attached ({} links)",
+                self.cgroup_links.len()
+            );
         }
 
-        info!(
-            "cgroup programs attached ({} links)",
-            self.cgroup_links.len()
-        );
-        Ok(())
+        result
     }
 
     // ========================================================================
@@ -819,6 +1301,34 @@ impl EbpfManager {
             self.cgroup_links.clear();
         }
 
+        Ok(())
+    }
+
+    /// Detach TC hooks for a specific interface only.
+    /// Used for namespace-aware shutdown: dae0peer hooks must be detached
+    /// in the proxy namespace before detaching host-NS hooks.
+    pub fn detach_by_iface(&mut self, iface: &str) -> Result<()> {
+        let before = self.tc_hooks.len();
+        let mut to_detach: Vec<usize> = Vec::new();
+        for (i, info) in self.tc_hooks.iter().enumerate() {
+            if info.iface == iface {
+                to_detach.push(i);
+            }
+        }
+        // Detach in reverse order to preserve indices
+        for &i in to_detach.iter().rev() {
+            let mut info = self.tc_hooks.swap_remove(i);
+            if let Err(e) = info.hook.detach() {
+                warn!(
+                    "Failed to detach TC hook '{}' on {}: {}",
+                    info.prog_name, info.iface, e
+                );
+            }
+        }
+        let detached = before - self.tc_hooks.len();
+        if detached > 0 {
+            info!(iface = %iface, count = detached, "Detached TC hooks for interface");
+        }
         Ok(())
     }
 
@@ -907,7 +1417,15 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// Write CIDR entries to lpm_array_map using batch update.
+    /// Write CIDR entries to inner LPM trie maps via the `lpm_array_map` (ARRAY_OF_MAPS).
+    ///
+    /// `lpm_array_map` is `BPF_MAP_TYPE_ARRAY_OF_MAPS` whose inner maps are
+    /// `BPF_MAP_TYPE_LPM_TRIE`. Each entry tuple `(index, CidrEntry)` specifies:
+    ///   - `index`: slot index in the outer ARRAY_OF_MAPS (corresponds to `match_set->index`)
+    ///   - `CidrEntry`: the CIDR entry containing IP (16 bytes) and prefix_len
+    ///
+    /// This function groups entries by index, looks up the inner LPM trie FD for each
+    /// index from the outer map, and writes `(LpmKey, u32)` entries to the inner trie.
     pub fn write_cidr_table(&mut self, entries: &[(u32, CidrEntry)]) -> Result<()> {
         use std::ffi::c_void;
         use std::os::unix::io::AsRawFd;
@@ -916,37 +1434,67 @@ impl EbpfManager {
             return Ok(());
         }
 
-        let mut map = self.get_map_mut("lpm_array_map")?;
-        let fd = map.as_fd().as_raw_fd();
-        let num = entries.len() as u32;
-
-        let mut count = num;
-        let keys: Vec<u32> = entries.iter().map(|(k, _)| *k).collect();
-        let values: Vec<CidrEntry> = entries.iter().map(|(_, v)| *v).collect();
-
-        let ret = unsafe {
-            libbpf_sys::bpf_map_update_batch(
-                fd,
-                keys.as_ptr() as *const c_void,
-                values.as_ptr() as *const c_void,
-                &mut count as *mut u32,
-                std::ptr::null(),
-            )
-        };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            warn!(
-                "CIDR batch update failed ({}), falling back to individual",
-                err
-            );
-            for (index, entry) in entries {
-                let key = bytemuck::bytes_of(index);
-                let val = bytemuck::bytes_of(entry);
-                map.update(key, val, MapFlags::empty())
-                    .with_context(|| format!("CIDR entry at index {}", index))?;
-            }
+        // Group entries by outer array index (each index → an inner LPM trie)
+        let mut by_index: std::collections::BTreeMap<u32, Vec<LpmKey>> =
+            std::collections::BTreeMap::new();
+        for (idx, entry) in entries {
+            let lpm_key = LpmKey {
+                prefixlen: entry.prefix_len as u32,
+                data: entry.ip,
+            };
+            by_index.entry(*idx).or_default().push(lpm_key);
         }
-        info!("Wrote {} CIDR entries", entries.len());
+
+        // Get outer map FD then release the mutable borrow so we can use raw syscalls
+        let outer_fd = {
+            let map = self.get_map_mut("lpm_array_map")?;
+            map.as_fd().as_raw_fd()
+        };
+
+        let mut total_written: usize = 0;
+
+        for (&array_idx, lpm_keys) in &by_index {
+            // Look up inner map FD from the outer ARRAY_OF_MAPS
+            let idx_bytes = array_idx.to_ne_bytes();
+            let mut inner_fd: i32 = 0;
+            let ret = unsafe {
+                libbpf_sys::bpf_map_lookup_elem(
+                    outer_fd,
+                    idx_bytes.as_ptr() as *const c_void,
+                    &mut inner_fd as *mut i32 as *mut c_void,
+                )
+            };
+            if ret != 0 {
+                warn!(
+                    "Inner LPM trie not found at array index {}, skipping {} entries",
+                    array_idx,
+                    lpm_keys.len()
+                );
+                continue;
+            }
+
+            // Write each LpmKey → u32 entry to the inner LPM_TRIE map
+            let one: u32 = 1;
+            for lpm_key in lpm_keys {
+                let key_bytes = bytemuck::bytes_of(lpm_key);
+                let val_bytes = bytemuck::bytes_of(&one);
+                unsafe {
+                    libbpf_sys::bpf_map_update_elem(
+                        inner_fd,
+                        key_bytes.as_ptr() as *const c_void,
+                        val_bytes.as_ptr() as *const c_void,
+                        0u64, // BPF_ANY
+                    );
+                }
+            }
+            total_written += lpm_keys.len();
+        }
+
+        info!(
+            "Wrote {} CIDR entries across {} inner LPM tries",
+            total_written,
+            by_index.len()
+        );
         Ok(())
     }
 
@@ -1011,6 +1559,19 @@ impl EbpfManager {
             map.update(&key, bytemuck::bytes_of(&val), MapFlags::empty())
                 .with_context(|| format!("insert PID {}", pid))?;
         }
+        Ok(())
+    }
+
+    /// Update listen_socket_map with a TProxy listener socket FD.
+    ///
+    /// The SOCKMAP keys are: 0 = tcp4, 1 = udp, 2 = tcp6.
+    /// The value is the socket file descriptor (as u64).
+    pub fn update_listen_socket_map(&mut self, key: u32, fd: i32) -> Result<()> {
+        let map = self.get_map_mut("listen_socket_map")?;
+        let fd_val = fd as u64;
+        map.update(&key.to_ne_bytes(), &fd_val.to_ne_bytes(), MapFlags::empty())
+            .with_context(|| format!("update listen_socket_map key={}", key))?;
+        info!(key = key, fd = fd, "Updated listen_socket_map");
         Ok(())
     }
 
@@ -1198,6 +1759,63 @@ impl EbpfManager {
         Ok(())
     }
 
+    /// 清空 domain_routing_map 的所有条目。
+    ///
+    /// 遍历所有 key（16 字节 IP 地址）并逐个删除。
+    /// 在热重载（reload_config）时调用，以清除旧的路由规则映射。
+    /// 返回删除的条目数。
+    pub fn clear_domain_routing_map(&mut self) -> Result<u32> {
+        use std::os::fd::AsRawFd;
+
+        let map = self.get_map_mut("domain_routing_map")?;
+        let map_fd = map.as_fd().as_raw_fd();
+
+        let mut count: u32 = 0;
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        loop {
+            let next_key = {
+                let mut buf = vec![0u8; 16]; // 16-byte IP key (IPv4-mapped IPv6)
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        3i64, // BPF_MAP_GET_NEXT_KEY
+                        &(map_fd as u32),
+                        if prev_key.is_empty() {
+                            std::ptr::null::<u8>()
+                        } else {
+                            prev_key.as_ptr()
+                        },
+                        buf.as_mut_ptr(),
+                    )
+                };
+                if ret < 0 {
+                    break;
+                }
+                buf
+            };
+
+            // Delete this entry
+            unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    5i64, // BPF_MAP_DELETE_ELEM
+                    &(map_fd as u32),
+                    next_key.as_ptr(),
+                    std::ptr::null::<u8>(),
+                );
+            }
+            count += 1;
+            prev_key = next_key;
+        }
+
+        if count > 0 {
+            info!("Cleared {} entries from domain_routing_map", count);
+        }
+
+        Ok(count)
+    }
+
     // ============================================================================
     // Outbound Connectivity Map Operations
     // ============================================================================
@@ -1232,16 +1850,82 @@ impl EbpfManager {
         Ok(())
     }
 
+    /// Initialize outbound_connectivity_map so all outbounds start as alive.
+    ///
+    /// BPF ARRAY maps are zero-initialized, but `wan_outbound_is_alive()` in
+    /// tproxy.c treats 0 as dead. Without this initialization, ALL proxied
+    /// traffic is SHOT (dropped) until the first connectivity check writes 1.
+    pub fn init_outbound_connectivity_map(&mut self) -> Result<()> {
+        let mut map = self.get_map_mut("outbound_connectivity_map")?;
+        let one: u32 = 1;
+        // Initialize all 1536 entries (256 outbounds * 3 domains * 2 ipversions)
+        for key in 0u32..1536 {
+            map.update(
+                &key.to_ne_bytes(),
+                &one.to_ne_bytes(),
+                MapFlags::empty(),
+            )?;
+        }
+        info!("Initialized outbound_connectivity_map (all outbounds alive)");
+        Ok(())
+    }
+
     // ============================================================================
-    // Janitor: Expired conn_state_map Cleanup
+    // Janitor: Expired conn_state_map Cleanup + Pressure Detection
     // ============================================================================
+
+    /// Count the number of entries in an eBPF map by iterating keys.
+    /// Uses `bpf_map_get_next_key` syscall.
+    fn count_map_entries(&self, map_name: &str) -> Result<u32> {
+        use std::os::fd::AsRawFd;
+
+        let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
+        let map = find_map(obj, map_name)?;
+        let fd = map.as_fd().as_raw_fd();
+
+        let mut count: u32 = 0;
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        loop {
+            let mut next_key = vec![0u8; 64]; // large enough for any key
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    3i64, // BPF_MAP_GET_NEXT_KEY
+                    &(fd as u32),
+                    if prev_key.is_empty() {
+                        std::ptr::null::<u8>()
+                    } else {
+                        prev_key.as_ptr()
+                    },
+                    next_key.as_mut_ptr(),
+                )
+            };
+            if ret < 0 {
+                break;
+            }
+            count += 1;
+            prev_key = next_key;
+        }
+
+        Ok(count)
+    }
+
+    /// Detect conn_state_map usage ratio.
+    ///
+    /// Iterates map keys to count entries, returns usage as f64 (0.0 – 1.0).
+    /// Uses the stored `conn_state_map_max_entries` as denominator.
+    pub fn conn_state_map_usage(&self) -> Result<f64> {
+        let count = self.count_map_entries("conn_state_map")?;
+        Ok(count as f64 / self.conn_state_map_max_entries as f64)
+    }
 
     /// Scan and delete expired entries from conn_state_map.
     ///
     /// Iterates all entries via raw BPF syscall, checks `last_seen_ns`
     /// against timeout thresholds, and deletes expired ones.
-    /// Returns the number of entries deleted.
-    pub fn janitor_scan_conn_state(&mut self, now_ns: u64) -> Result<usize> {
+    /// Returns (deleted_count, remaining_count).
+    pub fn janitor_scan_conn_state(&mut self, now_ns: u64) -> Result<(usize, u32)> {
         use std::os::fd::AsRawFd;
 
         // Timeout constants from tproxy.c (in nanoseconds)
@@ -1255,6 +1939,7 @@ impl EbpfManager {
         let map_fd = map.as_fd().as_raw_fd();
 
         let mut expired_keys: Vec<Vec<u8>> = Vec::new();
+        let mut total_count: u32 = 0;
         let mut prev_key: Vec<u8> = Vec::new();
 
         loop {
@@ -1278,6 +1963,8 @@ impl EbpfManager {
                 }
                 buf
             };
+
+            total_count += 1;
 
             // Lookup value
             let mut val = vec![0u8; 64];
@@ -1328,8 +2015,250 @@ impl EbpfManager {
             }
         }
 
+        let remaining = total_count.saturating_sub(count as u32);
         if count > 0 {
-            info!("Janitor scan: deleted {} expired conn_state entries", count);
+            info!(
+                "Janitor conn_state scan: deleted {} expired, {} remaining",
+                count, remaining
+            );
+        }
+
+        Ok((count, remaining))
+    }
+
+    // ============================================================================
+    // Janitor: redirect_track Cleanup
+    // ============================================================================
+
+    /// Scan and delete expired entries from redirect_track map.
+    ///
+    /// redirect_track entries have a 5-minute TTL. The kernel updates
+    /// `last_seen_ns` on each matching reply packet.
+    /// Returns the number of entries deleted.
+    pub fn janitor_scan_redirect_track(&mut self, now_ns: u64) -> Result<u32> {
+        use std::os::fd::AsRawFd;
+
+        let map = self.get_map_mut("redirect_track")?;
+        let map_fd = map.as_fd().as_raw_fd();
+
+        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        loop {
+            let next_key = {
+                let mut buf = vec![0u8; 40]; // redirect_tuple: 16+16 = 32, rounded up
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        3i64, // BPF_MAP_GET_NEXT_KEY
+                        &(map_fd as u32),
+                        if prev_key.is_empty() {
+                            std::ptr::null::<u8>()
+                        } else {
+                            prev_key.as_ptr()
+                        },
+                        buf.as_mut_ptr(),
+                    )
+                };
+                if ret < 0 {
+                    break;
+                }
+                buf
+            };
+
+            // Lookup value to check last_seen_ns
+            let mut val = vec![0u8; 40]; // redirect_entry: larger than 32
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    4i64, // BPF_MAP_LOOKUP_ELEM
+                    &(map_fd as u32),
+                    next_key.as_ptr(),
+                    val.as_mut_ptr(),
+                )
+            };
+            if ret < 0 {
+                prev_key = next_key;
+                continue;
+            }
+
+            // redirect_entry C layout (with implicit alignment padding for u64):
+            //   ifindex(4) + smac(6) + dmac(6) + from_wan(1) + _pad(7) + last_seen_ns(8)
+            // last_seen_ns is at offset 24 (20 + 4 bytes implicit C alignment padding)
+            if val.len() >= 32 {
+                let last_seen_ns = u64::from_ne_bytes(val[24..32].try_into().unwrap_or([0; 8]));
+                if now_ns.saturating_sub(last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS {
+                    expired_keys.push(next_key.clone());
+                }
+            }
+
+            prev_key = next_key;
+        }
+
+        let count = expired_keys.len() as u32;
+        for key in &expired_keys {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    5i64, // BPF_MAP_DELETE_ELEM
+                    &(map_fd as u32),
+                    key.as_ptr(),
+                    std::ptr::null::<u8>(),
+                );
+            }
+        }
+
+        if count > 0 {
+            info!("Janitor redirect_track: deleted {} expired entries", count);
+        }
+
+        Ok(count)
+    }
+
+    // ============================================================================
+    // Janitor: cookie_pid_map Cleanup
+    // ============================================================================
+
+    /// Scan and delete expired entries from cookie_pid_map.
+    ///
+    /// cookie_pid_map entries have a 5-minute TTL based on `last_seen_ns`
+    /// in the `ProcInfo` value. The kernel updates this on each matched packet.
+    /// Returns the number of entries deleted.
+    pub fn janitor_scan_cookie_pid_map(&mut self, now_ns: u64) -> Result<u32> {
+        use std::os::fd::AsRawFd;
+
+        let map = self.get_map_mut("cookie_pid_map")?;
+        let map_fd = map.as_fd().as_raw_fd();
+
+        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        loop {
+            let next_key = {
+                let mut buf = vec![0u8; 16]; // u64 key, rounded up
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        3i64, // BPF_MAP_GET_NEXT_KEY
+                        &(map_fd as u32),
+                        if prev_key.is_empty() {
+                            std::ptr::null::<u8>()
+                        } else {
+                            prev_key.as_ptr()
+                        },
+                        buf.as_mut_ptr(),
+                    )
+                };
+                if ret < 0 {
+                    break;
+                }
+                buf
+            };
+
+            // Lookup value to check last_seen_ns
+            let mut val = vec![0u8; 32]; // ProcInfo: last_seen_ns(8) + pid(4) + pname(16) + pad(4) = 32
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    4i64, // BPF_MAP_LOOKUP_ELEM
+                    &(map_fd as u32),
+                    next_key.as_ptr(),
+                    val.as_mut_ptr(),
+                )
+            };
+            if ret < 0 {
+                prev_key = next_key;
+                continue;
+            }
+
+            // ProcInfo layout: last_seen_ns is at offset 0
+            if val.len() >= 8 {
+                let last_seen_ns = u64::from_ne_bytes(val[0..8].try_into().unwrap_or([0; 8]));
+                if now_ns.saturating_sub(last_seen_ns) > COOKIE_PID_MAP_TIMEOUT_NS {
+                    expired_keys.push(next_key.clone());
+                }
+            }
+
+            prev_key = next_key;
+        }
+
+        let count = expired_keys.len() as u32;
+        for key in &expired_keys {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    5i64, // BPF_MAP_DELETE_ELEM
+                    &(map_fd as u32),
+                    key.as_ptr(),
+                    std::ptr::null::<u8>(),
+                );
+            }
+        }
+
+        if count > 0 {
+            info!("Janitor cookie_pid_map: deleted {} expired entries", count);
+        }
+
+        Ok(count)
+    }
+
+    // ============================================================================
+    // Janitor: routing_handoff_map Cleanup
+    // ============================================================================
+
+    /// 清理 routing_handoff_map 中的条目。
+    ///
+    /// routing_handoff_map 是一个短生命周期的交接 map，用于从 eBPF 到用户态的
+    /// 路由决策传递。条目应该在用户态读取后尽快清理。这个方法直接清空所有条目。
+    ///
+    /// 返回删除的条目数。
+    pub fn janitor_scan_routing_handoff(&mut self) -> Result<u32> {
+        use std::os::fd::AsRawFd;
+
+        let map = self.get_map_mut("routing_handoff_map")?;
+        let map_fd = map.as_fd().as_raw_fd();
+
+        let mut count: u32 = 0;
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        loop {
+            let next_key = {
+                let mut buf = vec![0u8; 48]; // tuples_key size is ~37, rounded up
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        3i64, // BPF_MAP_GET_NEXT_KEY
+                        &(map_fd as u32),
+                        if prev_key.is_empty() {
+                            std::ptr::null::<u8>()
+                        } else {
+                            prev_key.as_ptr()
+                        },
+                        buf.as_mut_ptr(),
+                    )
+                };
+                if ret < 0 {
+                    break;
+                }
+                buf
+            };
+
+            // Delete the entry
+            unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    5i64, // BPF_MAP_DELETE_ELEM
+                    &(map_fd as u32),
+                    next_key.as_ptr(),
+                    std::ptr::null::<u8>(),
+                );
+            }
+            count += 1;
+            prev_key = next_key;
+        }
+
+        if count > 0 {
+            info!("Janitor routing_handoff_map: deleted {} entries", count);
         }
 
         Ok(count)
@@ -1376,6 +2305,15 @@ mod tests {
     #[test]
     fn test_match_set_size() {
         assert_eq!(std::mem::size_of::<MatchSet>(), 24);
+    }
+
+    #[test]
+    fn test_redirect_tuple_size() {
+        assert_eq!(std::mem::size_of::<RedirectTuple>(), 32);
+    }
+    #[test]
+    fn test_redirect_entry_size() {
+        assert_eq!(std::mem::size_of::<RedirectEntry>(), 32);
     }
 
     #[test]

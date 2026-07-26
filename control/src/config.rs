@@ -158,6 +158,42 @@ pub enum ConfigError {
     #[error("[E1903] api.tls is true but cert or key not specified")]
     ApiTlsMissingCertKey,
 
+    // ── DNS Errors ──
+    /// E2001: DNS group references unknown proxy group
+    #[error("[E2001] DNS group '{dns_group}' references unknown proxy group: '{proxy_group}'")]
+    DnsUnknownProxyGroup {
+        dns_group: String,
+        proxy_group: String,
+    },
+    /// E2002: DNS routing references unknown DNS group
+    #[error("[E2002] DNS routing references unknown DNS group: '{group}'")]
+    DnsUnknownGroup {
+        group: String,
+    },
+    /// E2003: Duplicate DNS group name
+    #[error("[E2003] Duplicate DNS group name: '{name}'")]
+    DnsDuplicateGroup {
+        name: String,
+    },
+    /// E2004: DNS starting_dns ip_version_prefer must be 4 or 6
+    #[error("[E2004] starting_dns ip_version_prefer must be 4 or 6, got: {value}")]
+    DnsIpVersionPreferInvalid {
+        value: u8,
+    },
+    /// E2005: DNS group has no upstream
+    #[error("[E2005] DNS group '{group}' has no upstream servers")]
+    DnsGroupNoUpstream {
+        group: String,
+    },
+    /// E2006: Starting DNS has no upstream
+    #[error("[E2006] starting_dns has no upstream servers")]
+    DnsStartingDnsNoUpstream,
+    /// E2007: DNS routing fallback references unknown DNS group
+    #[error("[E2007] DNS routing fallback references unknown DNS group: '{group}'")]
+    DnsFallbackUnknownGroup {
+        group: String,
+    },
+
     // ── Other ──
     /// Unknown section name
     #[error("[E1001] Line {line}: unknown section: '{name}'")]
@@ -183,6 +219,16 @@ pub enum ConfigWarning {
     ApiTokenTooShort {
         length: usize,
     },
+    /// W2001: DNS group request_routing not configured, using fallback
+    #[allow(dead_code)]
+    DnsGroupNoRequestRouting {
+        group: String,
+    },
+    /// W2002: DNS group response_routing not configured, all responses accepted
+    #[allow(dead_code)]
+    DnsGroupNoResponseRouting {
+        group: String,
+    },
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -197,6 +243,12 @@ impl std::fmt::Display for ConfigWarning {
             ConfigWarning::ApiTokenTooShort { length } => {
                 write!(f, "[W1902] API token length {} < recommended 16", length)
             }
+            ConfigWarning::DnsGroupNoRequestRouting { group } => {
+                write!(f, "[W2001] DNS group '{}' has no request_routing configured, using first upstream as fallback", group)
+            }
+            ConfigWarning::DnsGroupNoResponseRouting { group } => {
+                write!(f, "[W2002] DNS group '{}' has no response_routing configured, all responses accepted", group)
+            }
         }
     }
 }
@@ -206,6 +258,200 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 
 // ============================================================================
 // Configuration Data Structures
+// ============================================================================
+
+// ============================================================================
+// DNS Configuration Types
+// ============================================================================
+
+/// An upstream DNS server entry (label + URL)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsUpstreamEntry {
+    /// Label (name) for this upstream, used in routing
+    pub label: String,
+    /// Upstream URL (e.g. udp://1.1.1.1:53, tcp+udp://dns.google:53, https://...)
+    pub address: String,
+}
+
+/// Starting DNS configuration (bootstrap resolver, used before proxy is available)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StartingDnsConfig {
+    /// IP version preference: 4 (IPv4 only) or 6 (IPv6 only)
+    pub ip_version_prefer: u8,
+    /// Bootstrap upstream server list (usually one)
+    pub upstream: Vec<DnsUpstreamEntry>,
+}
+
+/// DNS cache configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsCacheConfig {
+    /// Whether DNS caching is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum number of cached entries
+    #[serde(default = "default_dns_cache_max_size")]
+    pub max_size: u32,
+    /// Maximum TTL for cached entries (seconds)
+    #[serde(default = "default_dns_cache_max_ttl")]
+    pub max_ttl: u32,
+    /// Minimum TTL for cached entries (seconds)
+    #[serde(default = "default_dns_cache_min_ttl")]
+    pub min_ttl: u32,
+    /// Whether optimistic caching (RFC 8767) is enabled
+    #[serde(default)]
+    pub optimistic_cache: bool,
+    /// How long expired entries are served during refresh (seconds)
+    #[serde(default = "default_dns_optimistic_cache_ttl")]
+    pub optimistic_cache_ttl: u32,
+}
+
+fn default_dns_cache_max_size() -> u32 { 4096 }
+fn default_dns_cache_max_ttl() -> u32 { 86400 }
+fn default_dns_cache_min_ttl() -> u32 { 60 }
+fn default_dns_optimistic_cache_ttl() -> u32 { 3600 }
+
+impl Default for DnsCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size: 4096,
+            max_ttl: 86400,
+            min_ttl: 60,
+            optimistic_cache: false,
+            optimistic_cache_ttl: 3600,
+        }
+    }
+}
+
+/// A single DNS routing rule (request or group-level)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsRouteRule {
+    /// Match expression (e.g. `qname(geosite:cn)`, `qtype(a)`)
+    pub r#match: String,
+    /// Action: target group name or upstream label
+    pub action: String,
+}
+
+/// DNS request routing configuration (within a group)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsGroupRequestRouting {
+    /// Ordered list of routing rules
+    #[serde(default)]
+    pub rules: Vec<DnsRouteRule>,
+    /// Default upstream if no rule matches
+    pub fallback: String,
+}
+
+/// DNS response routing rule
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsResponseRule {
+    /// Match expression (e.g. `upstream(googledns)`, `ip(geoip:private)`)
+    pub r#match: String,
+    /// Action: `accept`, `reject`, or upstream label to requery
+    pub action: String,
+}
+
+/// DNS response routing configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsGroupResponseRouting {
+    /// Ordered list of response routing rules
+    #[serde(default)]
+    pub rules: Vec<DnsResponseRule>,
+    /// Default action if no rule matches
+    pub fallback: String,
+}
+
+/// DNS group configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsGroupConfig {
+    /// Group name (used in routing)
+    pub name: String,
+    /// Proxy binding: "direct" or "proxy(group_name)" reference
+    pub proxy: String,
+    /// Upstream DNS servers in this group
+    #[serde(default)]
+    pub upstream: Vec<DnsUpstreamEntry>,
+    /// Within-group request routing (which upstream to use)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_routing: Option<DnsGroupRequestRouting>,
+    /// Response routing (pollution detection and fallback)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_routing: Option<DnsGroupResponseRouting>,
+}
+
+/// Top-level DNS routing: which group handles which query
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsRoutingConfig {
+    /// Ordered list of DNS routing rules
+    #[serde(default)]
+    pub rules: Vec<DnsRouteRule>,
+    /// Default DNS group if no rule matches
+    pub fallback: String,
+}
+
+impl Default for DnsRoutingConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            fallback: String::new(),
+        }
+    }
+}
+
+/// DNS configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsConfig {
+    /// Starting DNS (bootstrap, IPv4/IPv6 only)
+    pub starting_dns: StartingDnsConfig,
+    /// Local DNS listener address (default: 127.0.0.1:5353)
+    #[serde(default = "default_dns_bind")]
+    pub bind: String,
+    /// DNS cache settings
+    #[serde(default)]
+    pub cache: DnsCacheConfig,
+    /// DNS groups
+    #[serde(default)]
+    pub groups: Vec<DnsGroupConfig>,
+    /// DNS routing: which group handles which query
+    #[serde(default)]
+    pub routing: DnsRoutingConfig,
+}
+
+fn default_dns_bind() -> String { "127.0.0.1:5353".into() }
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            starting_dns: StartingDnsConfig {
+                ip_version_prefer: 4,
+                upstream: vec![DnsUpstreamEntry {
+                    label: "bootstrap".into(),
+                    address: "udp://1.1.1.1:53".into(),
+                }],
+            },
+            bind: "127.0.0.1:5353".into(),
+            cache: DnsCacheConfig::default(),
+            groups: Vec::new(),
+            routing: DnsRoutingConfig {
+                rules: Vec::new(),
+                fallback: String::new(),
+            },
+        }
+    }
+}
+
+// ============================================================================
+// Top-Level Config
 // ============================================================================
 
 /// Complete daefile configuration (corresponds to JSON top-level structure)
@@ -235,6 +481,9 @@ pub struct DaefileConfig {
     /// API configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
+    /// DNS configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsConfig>,
 }
 
 impl Default for DaefileConfig {
@@ -249,6 +498,7 @@ impl Default for DaefileConfig {
             outbounds: OutboundsConfig::default(),
             routing: RoutingConfig::default(),
             api: None,
+            dns: None,
         }
     }
 }
@@ -605,6 +855,25 @@ enum ParseState {
     Routing,
     /// Inside api section
     Api,
+    // ── DNS states ──
+    /// Inside dns section
+    Dns,
+    /// Inside dns > starting_dns block
+    DnsStartingDns,
+    /// Inside dns > cache block
+    DnsCache,
+    /// Inside dns > groups section
+    DnsGroups,
+    /// Inside a specific dns group block
+    DnsGroup(String),
+    /// Inside dns group > upstream block
+    DnsGroupUpstream(String, String), // (group_name, last_parsed_upstream_label)
+    /// Inside dns > routing block (DNS routing)
+    DnsRouting,
+    /// Inside dns group > request_routing block
+    DnsGroupRequestRouting(String), // group_name
+    /// Inside dns group > response_routing block
+    DnsGroupResponseRouting(String), // group_name
 }
 
 /// Parse daefile text into [`DaefileConfig`]
@@ -651,6 +920,20 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
 
     let mut process_match = ProcessMatchConfig::default();
 
+    // DNS section parsing temporary variables
+    let mut current_dns_config: Option<DnsConfig> = None;
+    let mut current_dns_group = DnsGroupConfig {
+        name: String::new(),
+        proxy: String::new(),
+        upstream: Vec::new(),
+        request_routing: None,
+        response_routing: None,
+    };
+    let mut current_dns_route_rules: Vec<DnsRouteRule> = Vec::new();
+    let mut current_dns_route_fallback = String::new();
+    let mut current_dns_resp_rules: Vec<DnsResponseRule> = Vec::new();
+    let mut current_dns_resp_fallback = String::new();
+
     for (line_num, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
         let line_number = line_num + 1; // 1-based
@@ -673,6 +956,10 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         "outbounds" => state = ParseState::Outbounds,
                         "routing" => state = ParseState::Routing,
                         "api" => state = ParseState::Api,
+                        "dns" => {
+                            current_dns_config = Some(DnsConfig::default());
+                            state = ParseState::Dns;
+                        }
                         _ => {
                             return Err(ConfigError::UnknownSection {
                                 line: line_number,
@@ -1227,6 +1514,381 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     Ok(())
                 })?;
             }
+
+            // ── dns (top-level) ──
+            ParseState::Dns => {
+                if line == "}" {
+                    // Finalize DNS config
+                    if let Some(dns_cfg) = current_dns_config.take() {
+                        config.dns = Some(dns_cfg);
+                    }
+                    state = ParseState::Top;
+                    continue;
+                }
+                // Handle sub-sections inside dns
+                if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
+                    match section_name {
+                        "starting_dns" => {
+                            state = ParseState::DnsStartingDns;
+                        }
+                        "cache" => {
+                            state = ParseState::DnsCache;
+                        }
+                        "groups" => {
+                            state = ParseState::DnsGroups;
+                        }
+                        "routing" => {
+                            current_dns_route_rules.clear();
+                            current_dns_route_fallback.clear();
+                            state = ParseState::DnsRouting;
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown dns sub-section: '{}'", section_name),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                // Handle key-value pairs at dns level (e.g. bind)
+                parse_kv_pair(line, line_number, |key, value| {
+                    match key {
+                        "bind" => {
+                            if let Some(ref mut dns) = current_dns_config {
+                                dns.bind = unquote(value).to_string();
+                            }
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown dns field: '{}'", key),
+                            });
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+
+            // ── dns > starting_dns ──
+            ParseState::DnsStartingDns => {
+                if line == "}" {
+                    // Pop from stack first; if stack has DnsStartingDns,
+                    // we were in the upstream sub-block — return to parent level
+                    if let Some(parent) = state_stack.pop() {
+                        state = parent;
+                    } else {
+                        state = ParseState::Dns;
+                    }
+                    continue;
+                }
+                if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
+                    match section_name {
+                        "upstream" => {
+                            // Enter upstream sub-block: push current state and stay
+                            state_stack.push(ParseState::DnsStartingDns);
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown starting_dns sub-section: '{}'", section_name),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                // Inside upstream sub-block or at starting_dns level — parse label: 'url' pairs
+                parse_kv_pair(line, line_number, |key, value| {
+                    match key {
+                        "ip_version_prefer" => {
+                            let v: u8 = value.parse().map_err(|_| ConfigError::FieldType {
+                                line: line_number,
+                                field: key.into(),
+                                message: format!("cannot parse as integer: '{}'", value),
+                            })?;
+                            if let Some(ref mut dns) = current_dns_config {
+                                dns.starting_dns.ip_version_prefer = v;
+                            }
+                        }
+                        // Allow inline upstream entries: label: 'url'
+                        _ => {
+                            if let Some(ref mut dns) = current_dns_config {
+                                dns.starting_dns.upstream.push(DnsUpstreamEntry {
+                                    label: key.to_string(),
+                                    address: unquote(value).to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+
+            // ── dns > cache ──
+            ParseState::DnsCache => {
+                if line == "}" {
+                    state = ParseState::Dns;
+                    continue;
+                }
+                parse_kv_pair(line, line_number, |key, value| {
+                    if let Some(ref mut dns) = current_dns_config {
+                        match key {
+                            "enabled" => {
+                                dns.cache.enabled = parse_bool(value).map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as boolean: '{}'", value),
+                                })?;
+                            }
+                            "max_size" => {
+                                dns.cache.max_size = value.parse().map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as integer: '{}'", value),
+                                })?;
+                            }
+                            "max_ttl" => {
+                                dns.cache.max_ttl = value.parse().map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as integer: '{}'", value),
+                                })?;
+                            }
+                            "min_ttl" => {
+                                dns.cache.min_ttl = value.parse().map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as integer: '{}'", value),
+                                })?;
+                            }
+                            "optimistic_cache" => {
+                                dns.cache.optimistic_cache = parse_bool(value).map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as boolean: '{}'", value),
+                                })?;
+                            }
+                            "optimistic_cache_ttl" => {
+                                dns.cache.optimistic_cache_ttl = value.parse().map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as integer: '{}'", value),
+                                })?;
+                            }
+                            _ => {
+                                return Err(ConfigError::Syntax {
+                                    line: line_number,
+                                    message: format!("unknown dns cache field: '{}'", key),
+                                });
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+
+            // ── dns > groups ──
+            ParseState::DnsGroups => {
+                if line == "}" {
+                    state = ParseState::Dns;
+                    continue;
+                }
+                // Group declaration: group_name {
+                let name = line.strip_suffix('{').map(|s| s.trim()).map(String::from);
+                if let Some(ref name) = name {
+                    if !name.is_empty() && !name.contains(' ') {
+                        current_dns_group = DnsGroupConfig {
+                            name: name.clone(),
+                            proxy: String::new(),
+                            upstream: Vec::new(),
+                            request_routing: None,
+                            response_routing: None,
+                        };
+                        state = ParseState::DnsGroup(name.clone());
+                        continue;
+                    }
+                }
+                return Err(ConfigError::Syntax {
+                    line: line_number,
+                    message: format!("expected DNS group declaration (e.g. `trusted_dns {{`), got: '{}'", line),
+                });
+            }
+
+            // ── dns > groups > group_name ──
+            ParseState::DnsGroup(group_name) => {
+                if line == "}" {
+                    // Finalize group and add to config
+                    let group = std::mem::replace(&mut current_dns_group, DnsGroupConfig {
+                        name: String::new(),
+                        proxy: String::new(),
+                        upstream: Vec::new(),
+                        request_routing: None,
+                        response_routing: None,
+                    });
+                    if let Some(ref mut dns) = current_dns_config {
+                        dns.groups.push(group);
+                    }
+                    state = ParseState::DnsGroups;
+                    continue;
+                }
+                // Handle sub-sections inside group
+                if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
+                    match section_name {
+                        "upstream" => {
+                            state = ParseState::DnsGroupUpstream(group_name.clone(), String::new());
+                        }
+                        "request_routing" => {
+                            current_dns_route_rules.clear();
+                            current_dns_route_fallback.clear();
+                            state = ParseState::DnsGroupRequestRouting(group_name.clone());
+                        }
+                        "response_routing" => {
+                            current_dns_resp_rules.clear();
+                            current_dns_resp_fallback = "accept".into();
+                            state = ParseState::DnsGroupResponseRouting(group_name.clone());
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown DNS group sub-section: '{}'", section_name),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                // Handle proxy binding
+                parse_kv_pair(line, line_number, |key, value| {
+                    match key {
+                        "proxy" => {
+                            current_dns_group.proxy = unquote(value).to_string();
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown DNS group field: '{}'", key),
+                            });
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+
+            // ── dns group > upstream ──
+            ParseState::DnsGroupUpstream(group_name, _) => {
+                if line == "}" {
+                    state = ParseState::DnsGroup(group_name.clone());
+                    continue;
+                }
+                // Parse label: 'url' pairs
+                parse_kv_pair(line, line_number, |key, value| {
+                    current_dns_group.upstream.push(DnsUpstreamEntry {
+                        label: key.to_string(),
+                        address: unquote(value).to_string(),
+                    });
+                    Ok(())
+                })?;
+            }
+
+            // ── dns > routing (top-level DNS routing) ──
+            ParseState::DnsRouting => {
+                if line == "}" {
+                    if let Some(ref mut dns) = current_dns_config {
+                        dns.routing = DnsRoutingConfig {
+                            rules: std::mem::take(&mut current_dns_route_rules),
+                            fallback: std::mem::take(&mut current_dns_route_fallback),
+                        };
+                    }
+                    state = ParseState::Dns;
+                    continue;
+                }
+                // Handle fallback: action
+                if let Some(action) = line.strip_prefix("fallback:").map(|s| s.trim()) {
+                    current_dns_route_fallback = action.to_string();
+                    continue;
+                }
+                // Handle rule line: expr -> action
+                if let Some(arrow_pos) = line.find("->") {
+                    let expr = line[..arrow_pos].trim();
+                    let action = line[arrow_pos + 2..].trim();
+                    if !expr.is_empty() && !action.is_empty() {
+                        current_dns_route_rules.push(DnsRouteRule {
+                            r#match: expr.to_string(),
+                            action: action.to_string(),
+                        });
+                        continue;
+                    }
+                }
+                return Err(ConfigError::Syntax {
+                    line: line_number,
+                    message: format!("expected DNS routing rule or fallback, got: '{}'", line),
+                });
+            }
+
+            // ── dns group > request_routing ──
+            ParseState::DnsGroupRequestRouting(group_name) => {
+                if line == "}" {
+                    current_dns_group.request_routing = Some(DnsGroupRequestRouting {
+                        rules: std::mem::take(&mut current_dns_route_rules),
+                        fallback: std::mem::take(&mut current_dns_route_fallback),
+                    });
+                    state = ParseState::DnsGroup(group_name.clone());
+                    continue;
+                }
+                // Handle fallback: action
+                if let Some(action) = line.strip_prefix("fallback:").map(|s| s.trim()) {
+                    current_dns_route_fallback = action.to_string();
+                    continue;
+                }
+                // Handle rule line: expr -> action
+                if let Some(arrow_pos) = line.find("->") {
+                    let expr = line[..arrow_pos].trim();
+                    let action = line[arrow_pos + 2..].trim();
+                    if !expr.is_empty() && !action.is_empty() {
+                        current_dns_route_rules.push(DnsRouteRule {
+                            r#match: expr.to_string(),
+                            action: action.to_string(),
+                        });
+                        continue;
+                    }
+                }
+                return Err(ConfigError::Syntax {
+                    line: line_number,
+                    message: format!("expected request routing rule or fallback, got: '{}'", line),
+                });
+            }
+
+            // ── dns group > response_routing ──
+            ParseState::DnsGroupResponseRouting(group_name) => {
+                if line == "}" {
+                    current_dns_group.response_routing = Some(DnsGroupResponseRouting {
+                        rules: std::mem::take(&mut current_dns_resp_rules),
+                        fallback: std::mem::take(&mut current_dns_resp_fallback),
+                    });
+                    state = ParseState::DnsGroup(group_name.clone());
+                    continue;
+                }
+                // Handle fallback: action
+                if let Some(action) = line.strip_prefix("fallback:").map(|s| s.trim()) {
+                    current_dns_resp_fallback = action.to_string();
+                    continue;
+                }
+                // Handle rule line: expr -> action
+                if let Some(arrow_pos) = line.find("->") {
+                    let expr = line[..arrow_pos].trim();
+                    let action = line[arrow_pos + 2..].trim();
+                    if !expr.is_empty() && !action.is_empty() {
+                        current_dns_resp_rules.push(DnsResponseRule {
+                            r#match: expr.to_string(),
+                            action: action.to_string(),
+                        });
+                        continue;
+                    }
+                }
+                return Err(ConfigError::Syntax {
+                    line: line_number,
+                    message: format!("expected response routing rule or fallback, got: '{}'", line),
+                });
+            }
         }
     }
 
@@ -1430,6 +2092,9 @@ pub fn validate_config(config: &DaefileConfig) -> std::result::Result<(), Config
 
     // 8. API validation
     validate_api(config)?;
+
+    // 9. DNS validation
+    validate_dns(config)?;
 
     Ok(())
 }
@@ -1761,6 +2426,115 @@ fn validate_api(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
             }
         }
     }
+    Ok(())
+}
+
+/// DNS validation
+fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> {
+    let dns = match config.dns.as_ref() {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+
+    // Validate starting_dns
+    if dns.starting_dns.ip_version_prefer != 4 && dns.starting_dns.ip_version_prefer != 6 {
+        return Err(ConfigError::DnsIpVersionPreferInvalid {
+            value: dns.starting_dns.ip_version_prefer,
+        });
+    }
+    if dns.starting_dns.upstream.is_empty() {
+        return Err(ConfigError::DnsStartingDnsNoUpstream);
+    }
+
+    // Collect DNS group names
+    let dns_group_names: std::collections::HashSet<&str> =
+        dns.groups.iter().map(|g| g.name.as_str()).collect();
+
+    // Validate DNS group names uniqueness
+    let mut seen = std::collections::HashSet::new();
+    for group in &dns.groups {
+        if !seen.insert(&group.name) {
+            return Err(ConfigError::DnsDuplicateGroup {
+                name: group.name.clone(),
+            });
+        }
+    }
+
+    // Validate each DNS group
+    for group in &dns.groups {
+        // proxy must be "direct" or reference a valid proxy group
+        if group.proxy != "direct" {
+            let proxy_group_names: std::collections::HashSet<&str> =
+                config.outbounds.groups.iter().map(|g| g.name.as_str()).collect();
+            if !proxy_group_names.contains(group.proxy.as_str()) {
+                return Err(ConfigError::DnsUnknownProxyGroup {
+                    dns_group: group.name.clone(),
+                    proxy_group: group.proxy.clone(),
+                });
+            }
+        }
+
+        // At least one upstream
+        if group.upstream.is_empty() {
+            return Err(ConfigError::DnsGroupNoUpstream {
+                group: group.name.clone(),
+            });
+        }
+
+        // Validate request_routing actions reference valid upstream labels
+        if let Some(ref rr) = group.request_routing {
+            let upstream_labels: std::collections::HashSet<&str> =
+                group.upstream.iter().map(|u| u.label.as_str()).collect();
+            // Also check against DNS group names for cross-group routing
+            for rule in &rr.rules {
+                if !upstream_labels.contains(rule.action.as_str())
+                    && !dns_group_names.contains(rule.action.as_str())
+                {
+                    return Err(ConfigError::DnsUnknownGroup {
+                        group: rule.action.clone(),
+                    });
+                }
+            }
+            if !upstream_labels.contains(rr.fallback.as_str())
+                && !dns_group_names.contains(rr.fallback.as_str())
+            {
+                return Err(ConfigError::DnsFallbackUnknownGroup {
+                    group: rr.fallback.clone(),
+                });
+            }
+        }
+
+        // Validate response_routing
+        if let Some(ref resp) = group.response_routing {
+            if resp.fallback != "accept" && resp.fallback != "reject" {
+                // Could also be an upstream label for requery
+                let upstream_labels: std::collections::HashSet<&str> =
+                    group.upstream.iter().map(|u| u.label.as_str()).collect();
+                if !upstream_labels.contains(resp.fallback.as_str()) {
+                    return Err(ConfigError::DnsUnknownGroup {
+                        group: resp.fallback.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Validate top-level DNS routing references
+    if !dns.routing.fallback.is_empty() {
+        if !dns_group_names.contains(dns.routing.fallback.as_str()) {
+            return Err(ConfigError::DnsFallbackUnknownGroup {
+                group: dns.routing.fallback.clone(),
+            });
+        }
+    }
+    for rule in &dns.routing.rules {
+        if !dns_group_names.contains(rule.action.as_str()) {
+            return Err(ConfigError::DnsUnknownGroup {
+                group: rule.action.clone(),
+            });
+        }
+    }
+
     Ok(())
 }
 

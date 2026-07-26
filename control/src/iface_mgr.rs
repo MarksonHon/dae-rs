@@ -63,19 +63,25 @@ impl InterfaceManager {
     ) -> Result<()> {
         // Scan existing interfaces first (before moving on_bind into the binding)
         let links = list_sys_links();
+        let mut to_bind = Vec::new();
         {
             let mut tracked = self.tracked.lock().await;
             for name in &links {
                 if glob_match(pattern, name) {
                     tracked.insert(name.clone());
-                    info!(
-                        "InterfaceManager: initial bind {} (pattern={})",
-                        name, pattern
-                    );
-                    if let Err(e) = on_bind(name) {
-                        warn!("InterfaceManager: bind failed {}: {}", name, e);
-                    }
+                    to_bind.push(name.clone());
                 }
+            }
+        }
+
+        // Call callbacks outside the lock
+        for name in &to_bind {
+            info!(
+                "InterfaceManager: initial bind {} (pattern={})",
+                name, pattern
+            );
+            if let Err(e) = on_bind(name) {
+                warn!("InterfaceManager: bind failed {}: {}", name, e);
             }
         }
 
@@ -111,35 +117,50 @@ impl InterfaceManager {
                 }
 
                 let current_links = list_sys_links();
-                let mut tracked_set = tracked.lock().await;
+                let mut to_bind = Vec::new();
+                let mut to_unbind = Vec::new();
+                {
+                    let mut tracked_set = tracked.lock().await;
 
-                // Detect new interfaces
-                for name in &current_links {
-                    if !tracked_set.contains(name) {
-                        let b = bindings.lock().await;
-                        for binding in b.iter() {
-                            if glob_match(&binding.pattern, name) {
-                                info!(
-                                    "InterfaceManager: new interface {} (pattern={})",
-                                    name, binding.pattern
-                                );
-                                tracked_set.insert(name.clone());
-                                if let Err(e) = (binding.on_bind)(name) {
-                                    warn!("InterfaceManager: bind failed {}: {}", name, e);
+                    // Detect new interfaces
+                    for name in &current_links {
+                        if !tracked_set.contains(name) {
+                            let b = bindings.lock().await;
+                            for binding in b.iter() {
+                                if glob_match(&binding.pattern, name) {
+                                    info!(
+                                        "InterfaceManager: new interface {} (pattern={})",
+                                        name, binding.pattern
+                                    );
+                                    tracked_set.insert(name.clone());
+                                    to_bind.push(name.clone());
                                 }
                             }
                         }
                     }
+
+                    // Detect removed interfaces
+                    let tracked_snapshot: Vec<String> = tracked_set.iter().cloned().collect();
+                    for name in &tracked_snapshot {
+                        if !current_links.contains(name) {
+                            to_unbind.push(name.clone());
+                            tracked_set.remove(name);
+                        }
+                    }
                 }
 
-                // Detect removed interfaces
-                let tracked_snapshot: Vec<String> = tracked_set.iter().cloned().collect();
-                let removed: Vec<String> = tracked_snapshot
-                    .into_iter()
-                    .filter(|name| !current_links.contains(name))
-                    .collect();
-
-                for name in &removed {
+                // Call callbacks outside the lock
+                for name in &to_bind {
+                    let b = bindings.lock().await;
+                    for binding in b.iter() {
+                        if glob_match(&binding.pattern, name) {
+                            if let Err(e) = (binding.on_bind)(name) {
+                                warn!("InterfaceManager: bind failed {}: {}", name, e);
+                            }
+                        }
+                    }
+                }
+                for name in &to_unbind {
                     let b = bindings.lock().await;
                     for binding in b.iter() {
                         if glob_match(&binding.pattern, name) {
@@ -154,7 +175,6 @@ impl InterfaceManager {
                             }
                         }
                     }
-                    tracked_set.remove(name);
                 }
 
                 debug!(

@@ -88,6 +88,14 @@ struct {
 	__uint(max_entries, 1536); // 256 outbounds * 3 domains * 2 ipversions
 } outbound_connectivity_map SEC(".maps");
 
+// Sockmap:
+struct {
+	__uint(type, BPF_MAP_TYPE_SOCKMAP);
+	__type(key, __u32); // 0 is tcp4, 1 is udp, 2 is tcp6.
+	__type(value, __u64); // fd of socket.
+	__uint(max_entries, 3);
+} listen_socket_map SEC(".maps");
+
 union ip6 {
 	__u8 u6_addr8[16];
 	__be16 u6_addr16[8];
@@ -1470,14 +1478,33 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 		return ctx->result;
 #ifdef __DEBUG_ROUTING
 	bpf_printk(
-		"No match_set hits. Did coder forget to sync common/consts/ebpf_sync_spec.json with enum MatchType?");
+		"No match_set hits, forwarding to control plane for decision");
 #endif
-	return -EPERM;
+	return OUTBOUND_CONTROL_PLANE_ROUTING;
 #undef _l4proto_type
 #undef _ipversion_type
 #undef _pname
 #undef _is_wan
 #undef _dscp
+}
+
+static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
+{
+	struct bpf_sock *sk;
+	const __u32 *key = &one_key;
+
+	if (l4proto == IPPROTO_TCP)
+		key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &two_key : &zero_key;
+
+	sk = bpf_map_lookup_elem(&listen_socket_map, key);
+
+	if (!sk)
+		return -1;
+
+	int ret = bpf_sk_assign(skb, sk, 0);
+
+	bpf_sk_release(sk);
+	return ret;
 }
 
 static __always_inline int redirect_to_control_plane_ingress(void)
@@ -2804,9 +2831,12 @@ SEC("tc/dae0peer_ingress")
 int tproxy_dae0peer_ingress(struct __sk_buff *skb)
 {
 	/* Only packets redirected from wan_egress or lan_ingress have this cb mark.
-   */
+	 * Packets without TPROXY_MARK (e.g. SOCKS5 proxy responses to the TProxy's
+	 * upstream sockets) must be allowed to pass through to the proxy NS stack
+	 * so they can reach the TProxy's sockets. Do NOT drop them with TC_ACT_SHOT.
+	 */
 	if (skb->cb[0] != TPROXY_MARK)
-		return TC_ACT_SHOT;
+		return TC_ACT_OK;
 
 	/* ip rule add fwmark 0x8000000/0x8000000 table 2023
    * ip route add local default dev lo table 2023
@@ -2819,148 +2849,38 @@ int tproxy_dae0peer_ingress(struct __sk_buff *skb)
 	 * first fragments that still expose those headers). Established TCP can
 	 * return to the stack without bpf_sk_assign.
 	 */
-	/* TProxy runs in host namespace; bpf_sk_assign fails across namespaces.
-	 * Skip assign_listener — the policy routing in host NS will deliver
-	 * marked packets directly to the TProxy socket via local default dev lo.
-	 * Established TCP (l4proto == 0) and new connections (SYN) both go through
-	 * the same path.
-	 */
+	__u8 l4proto = skb->cb[1];
+
+	if (l4proto != 0)
+		assign_listener(skb, l4proto);
 	return TC_ACT_OK;
 }
 
-// load_redirect_tuple_fast returns this code when it cannot safely parse via
-// direct packet access and should fall back to bpf_skb_load_bytes.
-#define LOAD_REDIRECT_TUPLE_FALLBACK 2
-
-static __always_inline int
-load_redirect_tuple_fast(struct __sk_buff *skb,
-			 struct redirect_tuple *redirect_tuple)
-{
-	void *data, *data_end;
-
-	// Pull header data to linear region for direct access.
-	// 128 bytes is enough for: ethhdr(14) + iphdr(40) + addresses.
-#define REDIRECT_PULL_SIZE 128
-	if (bpf_skb_pull_data(skb, REDIRECT_PULL_SIZE))
-		return LOAD_REDIRECT_TUPLE_FALLBACK;
-
-	data = (void *)(long)skb->data;
-	data_end = (void *)(long)skb->data_end;
-	struct ethhdr *eth = data;
-
-	if ((void *)(eth + 1) > data_end)
-		return LOAD_REDIRECT_TUPLE_FALLBACK;
-	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-		struct iphdr *iph = data + ETH_HLEN;
-
-		if ((void *)(iph + 1) > data_end)
-			return LOAD_REDIRECT_TUPLE_FALLBACK;
-		// Use IPv4-mapped IPv6 format with ffff marker to match insert side
-		redirect_tuple->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		redirect_tuple->sip.u6_addr32[3] = iph->daddr;
-		redirect_tuple->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		redirect_tuple->dip.u6_addr32[3] = iph->saddr;
-		return 0;
-	}
-	if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
-		struct ipv6hdr *ipv6h = data + ETH_HLEN;
-
-		if ((void *)(ipv6h + 1) > data_end)
-			return LOAD_REDIRECT_TUPLE_FALLBACK;
-		__builtin_memcpy(&redirect_tuple->sip, &ipv6h->daddr,
-				 sizeof(redirect_tuple->sip));
-		__builtin_memcpy(&redirect_tuple->dip, &ipv6h->saddr,
-				 sizeof(redirect_tuple->dip));
-		return 0;
-	}
-	return 1;
-}
-
-static __always_inline int
-load_redirect_tuple_slow(struct __sk_buff *skb,
-			 struct redirect_tuple *redirect_tuple)
-{
-	int ret;
-
-	if (skb->protocol == bpf_htons(ETH_P_IP)) {
-		// Set ffff marker first for IPv4-mapped IPv6 format
-		__u32 ffff_marker = bpf_htonl(0x0000ffff);
-
-		redirect_tuple->sip.u6_addr32[2] = ffff_marker;
-		redirect_tuple->dip.u6_addr32[2] = ffff_marker;
-
-		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct iphdr, daddr),
-					 &redirect_tuple->sip.u6_addr32[3],
-					 sizeof(redirect_tuple->sip.u6_addr32[3]));
-		if (ret)
-			return ret;
-		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct iphdr, saddr),
-					 &redirect_tuple->dip.u6_addr32[3],
-					 sizeof(redirect_tuple->dip.u6_addr32[3]));
-		if (ret)
-			return ret;
-		return 0;
-	}
-	if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
-		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct ipv6hdr, daddr),
-					 &redirect_tuple->sip,
-					 sizeof(redirect_tuple->sip));
-		if (ret)
-			return ret;
-		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct ipv6hdr, saddr),
-					 &redirect_tuple->dip,
-					 sizeof(redirect_tuple->dip));
-		if (ret)
-			return ret;
-		return 0;
-	}
-	return 1;
-}
-
-static __always_inline int
-load_redirect_tuple(struct __sk_buff *skb,
-		    struct redirect_tuple *redirect_tuple)
-{
-	int ret = load_redirect_tuple_fast(skb, redirect_tuple);
-
-	if (ret == LOAD_REDIRECT_TUPLE_FALLBACK)
-		return load_redirect_tuple_slow(skb, redirect_tuple);
-	return ret;
-}
+// load_redirect_tuple* functions were removed in commit <fix> because
+// tproxy_dae0_ingress no longer needs to inspect redirect_track entries.
+// The redirect_track map and publish_redirect_track_for_packet are still
+// used by the WAN egress and LAN egress handlers (prep_redirect_to_control_plane).
 
 SEC("tc/dae0_ingress")
 int tproxy_dae0_ingress(struct __sk_buff *skb)
 {
-	struct redirect_tuple redirect_tuple = {};
-	int ret;
-
-	ret = load_redirect_tuple(skb, &redirect_tuple);
-	if (ret)
-		return TC_ACT_OK;
-	struct redirect_entry *redirect_entry =
-		bpf_map_lookup_elem(&redirect_track, &redirect_tuple);
-
-	if (!redirect_entry)
-		return TC_ACT_OK;
-
-	redirect_entry->last_seen_ns = bpf_ktime_get_ns();
-
-	bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_source),
-			    redirect_entry->dmac, sizeof(redirect_entry->dmac),
-			    0);
-	bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_dest),
-			    redirect_entry->smac, sizeof(redirect_entry->smac),
-			    0);
-	__u32 type = redirect_entry->from_wan ? PACKET_HOST : PACKET_OTHERHOST;
-
-	bpf_skb_change_type(skb, type);
-	__u64 flags = redirect_entry->from_wan ? BPF_F_INGRESS : 0;
-
-	return bpf_redirect(redirect_entry->ifindex, flags);
+	/* Packets arriving here come from the proxy NS (via dae0peer veth).
+	 * The kernel's skb_scrub_packet() clears skb->mark when crossing
+	 * network namespaces, so we must restore the dae_socket_mark so that
+	 * the WAN egress handler can identify TProxy upstream sockets via
+	 * pid_is_control_plane().
+	 *
+	 * TProxy's response packets to original clients (from IP_TRANSPARENT
+	 * sockets) may match a redirect_track entry, but must NOT be redirected
+	 * back to the proxy NS — they should pass through to the host stack.
+	 * The only packets that should be redirected here are those with
+	 * skb->cb[0] == TPROXY_MARK, but those go through dae0 EGRESS (set by
+	 * redirect_to_control_plane_egress()), not INGRESS. So we simply restore
+	 * the mark and pass everything through.
+	 */
+	if (PARAM.dae_socket_mark)
+		skb->mark = PARAM.dae_socket_mark;
+	return TC_ACT_OK;
 }
 
 struct get_real_comm_ctx {

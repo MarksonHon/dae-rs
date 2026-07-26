@@ -1118,15 +1118,21 @@ pub fn build_domain_routing_bitmap(
 /// This function produces a linear sequence of MatchSet entries that tproxy.c's
 /// `route()` function can evaluate using `bpf_loop()`.
 ///
+/// Automatically adds `dip(<proxy_server_ip>) -> direct` rules for all proxy
+/// server IPs, matching the original dae behavior. This prevents traffic to
+/// proxy servers from being re-proxied (loop prevention).
+///
 /// # Pipeline
 ///
 /// 1. [`NormalizedProgram::from_config`] — parse raw rules into structured IR
 /// 2. [`RulesBuilder::apply`] — lower IR to MatchSet entries
 /// 3. LPM trie creation & domain set collection
-/// 4. Fallback rule appending
+/// 4. Proxy server auto-direct rule insertion
+/// 5. Fallback rule appending
 pub fn compile_rules(
     routing: &config::RoutingConfig,
     outbounds: &config::OutboundsConfig,
+    proxy_server_ips: &[std::net::IpAddr],
 ) -> Result<CompiledRouting> {
     // ── Step 1: Build NormalizedProgram from config ──
     let program =
@@ -1134,6 +1140,20 @@ pub fn compile_rules(
 
     // ── Step 2: Build outbound ID map ──
     let outbound_id_map = build_outbound_id_map(outbounds);
+
+    // ── Step 2.5: Prepare proxy server IP CIDRs for LPM trie ──
+    // Convert each proxy server IP to a /32 (IPv4) or /128 (IPv6) CIDR entry.
+    // These will be placed into an LPM trie for efficient matching.
+    let proxy_cidrs: Vec<ipnet::IpNet> = proxy_server_ips
+        .iter()
+        .filter_map(|ip| {
+            let prefix_len = match ip {
+                std::net::IpAddr::V4(_) => 32u8,
+                std::net::IpAddr::V6(_) => 128u8,
+            };
+            ipnet::IpNet::new(*ip, prefix_len).ok()
+        })
+        .collect();
 
     // ── Step 3: Register function parsers and apply ──
     let mut builder = RulesBuilder::new();
@@ -1166,6 +1186,16 @@ pub fn compile_rules(
     let mut domain_sets: Vec<Vec<String>> = Vec::new();
     let mut final_match_sets: Vec<MatchSet> = Vec::new();
     let mut rule_domain_idx = 0usize;
+
+    // ── Step 4.5: Create LPM trie for proxy server IPs ──
+    // Add proxy server IPs as a dedicated LPM trie BEFORE user rules,
+    // so the auto-direct MatchSet can reference it.
+    // The trie index is stored for later MatchSet creation.
+    let proxy_lpm_index = if !proxy_cidrs.is_empty() {
+        Some(find_or_create_lpm_trie(&proxy_cidrs, &mut lpm_tries, &mut lpm_dedup))
+    } else {
+        None
+    };
 
     // First pass over rules: collect LPM trie and domain set data.
     for rule in &program.rules {
@@ -1324,6 +1354,27 @@ pub fn compile_rules(
                 final_match_sets.extend(match_sets);
             }
         }
+    }
+
+    // ── Step 4.75: Prepend proxy server auto-direct rules ──
+    // Insert `dip(<proxy_server_ip>) -> direct` at the FRONT of the match set list,
+    // so they are evaluated BEFORE any user-defined rules.
+    // This prevents traffic destined for proxy servers from being re-proxied,
+    // which would create a loop: eBPF intercepts → TProxy → proxy server → eBPF intercepts again.
+    if let Some(proxy_idx) = proxy_lpm_index {
+        let mut ms = MatchSet::zeroed();
+        ms.r#type = match_type::IP_SET;
+        ms.value.index = proxy_idx as u32;
+        ms.not = 0;
+        ms.outbound = outbound::DIRECT;
+        ms.must = 0;
+        ms.mark = 0;
+        final_match_sets.insert(0, ms);
+        info!(
+            proxy_ips = proxy_cidrs.len(),
+            lpm_index = proxy_idx,
+            "Auto-added direct rule for proxy server IPs",
+        );
     }
 
     // ── Step 5: Add fallback rule (MUST be the last entry) ──
@@ -1867,6 +1918,30 @@ fn build_match_set_for_function(
     Ok(result)
 }
 
+/// 用户空间路由回退选择。
+///
+/// 当 eBPF 路由无法决策时（outbound == [`outbound::CONTROL_PLANE_ROUTING`]），
+/// 由用户空间根据 [`RoutingParams`] 做出路由选择。
+///
+/// 这对应原始 dae Go 中 `control_plane.go` 的 `ChooseDialTarget()` 函数。
+/// eBPF 程序 `tproxy.c` 中定义了 `OUTBOUND_CONTROL_PLANE_ROUTING` 常量（0xFD），
+/// 当 eBPF 中的路由规则无法匹配时（例如域名尚未解析），流量回退到用户空间进行决策。
+///
+/// # 参数
+///
+/// * `routing` — 编译好的 [`RoutingMatcher`]，包含 MatchSet 规则和 LPM/domain 数据
+/// * `ctx` — 连接的 [`RoutingParams`]，包含源/目标 IP、端口、协议、域名等信息
+///
+/// # 返回值
+///
+/// 返回 [`RoutingResult`]，包含最终的 outbound 选择、mark 值和 must 标志。
+pub fn choose_dial_target(
+    routing: &RoutingMatcher,
+    ctx: &RoutingParams,
+) -> RoutingResult {
+    routing.match_routing(ctx)
+}
+
 /// Build outbound name → ID mapping.
 ///
 /// Mapping rules:
@@ -2067,7 +2142,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
 
         // Should have 1 match set + 1 fallback
         assert_eq!(compiled.match_sets.len(), 2);
@@ -2092,7 +2167,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
 
         // Should have: PORT(LOGICAL_AND) + L4PROTO(proxy_id) + FALLBACK
         // The LOGICAL_AND separates the dport and l4proto subrules
@@ -2124,7 +2199,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
 
         assert_eq!(compiled.match_sets.len(), 2);
         assert_eq!(compiled.match_sets[0].r#type, match_type::DOMAIN_SET);
@@ -2145,7 +2220,7 @@ mod tests {
         });
 
         let outbounds = config::OutboundsConfig::default();
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
 
         // dport(22) -> direct, dport(25) -> block, + fallback
         assert_eq!(compiled.match_sets[0].r#type, match_type::PORT);
@@ -2197,7 +2272,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
         assert_eq!(compiled.match_sets[0].not, 1);
     }
 
@@ -2234,7 +2309,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
 
         // Should have: DIP + SIP + IPVERSION + DSCP + MAC + FALLBACK
         assert_eq!(compiled.match_sets.len(), 6);
@@ -2268,7 +2343,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
         assert_eq!(compiled.match_sets.len(), 1); // just fallback
         assert_eq!(compiled.match_sets[0].r#type, match_type::FALLBACK);
         assert_eq!(
@@ -2287,7 +2362,7 @@ mod tests {
         });
 
         let outbounds = config::OutboundsConfig::default();
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
 
         // The "empty" rule creates a FALLBACK match set, plus the program fallback
         // So we should have 2 fallbacks
@@ -2312,7 +2387,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // Should match dport 80
@@ -2339,7 +2414,7 @@ mod tests {
         });
 
         let outbounds = config::OutboundsConfig::default();
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // Should match www.baidu.com
@@ -2374,7 +2449,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // TCP port 443 should match
@@ -2423,7 +2498,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // 10.x.x.x should match direct

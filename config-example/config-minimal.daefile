@@ -41,3 +41,27 @@ routing {
   l4proto(tcp) -> proxy(proxy_primary)
   fallback: proxy(proxy_primary)
 }
+
+dns {
+  starting_dns {
+    ip_version_prefer: 4
+    upstream {
+      bootstrap: 'udp://1.1.1.1:53'
+    }
+  }
+  bind: '127.0.0.1:5353'
+  groups {
+    default_dns {
+      proxy: proxy_primary
+      upstream {
+        cloudflare: 'udp://1.1.1.1:53'
+      }
+      request_routing {
+        fallback: cloudflare
+      }
+    }
+  }
+  routing {
+    fallback: default_dns
+  }
+}

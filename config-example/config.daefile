@@ -11,8 +11,8 @@ interface {
 
 namespace {
   mode: isolated
-  veth_host: dae0
-  veth_peer: dae0peer
+  veth_host: dae-rs-host
+  veth_peer: dae-rs-peer
   host_addr: 169.254.0.1/16
   peer_addr: 169.254.0.11/16
   mtu: 1500

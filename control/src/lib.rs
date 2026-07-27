@@ -59,12 +59,12 @@ pub mod ebpf;
 pub mod iface_mgr;
 pub mod netns;
 pub mod routing;
+pub mod routing_handoff;
 pub mod tproxy;
 pub mod udp_tracker;
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -73,15 +73,17 @@ use std::sync::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use libbpf_rs::MapCore;
 use protocols::Socks5Dialer;
 use tproxy::{TproxyListener, UdpTproxyListener};
 
 use crate::ebpf::CidrEntry;
 
 // Ringbuf event constants (must match tproxy.c)
+#[allow(dead_code)]
 const DAE_EVENT_BLOCKED: u32 = 0;
+#[allow(dead_code)]
 const DAE_EVENT_UDP_CONN_OVERFLOW: u32 = 1;
+#[allow(dead_code)]
 const DAE_EVENT_TCP_CONN_OVERFLOW: u32 = 2;
 
 // ============================================================================
@@ -152,7 +154,7 @@ impl Default for Config {
             route_table: 2023,
             fwmark_proxy: 0x8000000,
             fwmark_bypass: 0x04000000,
-            fwmark_mask: 0x8000000,
+            fwmark_mask: 0x08000000,
             mtu: 1500,
             log_level: "info".into(),
             ebpf_path: ebpf::DEFAULT_EBPF_PATH.to_string(),
@@ -236,7 +238,7 @@ impl Config {
             route_table: ns.map(|n| n.route_table).unwrap_or(2023),
             fwmark_proxy: marks.map(|m| m.proxy).unwrap_or(0x8000000),
             fwmark_bypass: marks.map(|m| m.bypass).unwrap_or(0x04000000),
-            fwmark_mask: marks.map(|m| m.mask).unwrap_or(0x8000000),
+            fwmark_mask: marks.map(|m| m.mask).unwrap_or(0x08000000),
             mtu: ns.map(|n| n.mtu).unwrap_or(1500),
             log_level: runtime.log_level.clone(),
             ebpf_path: ebpf::DEFAULT_EBPF_PATH.to_string(),
@@ -315,6 +317,8 @@ pub struct ControlPlane {
     cookie_pid_handle: Option<tokio::task::JoinHandle<()>>,
     /// Tokio task handle for the connectivity checker
     connectivity_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Tokio task handle for the routing handoff consumer
+    routing_handoff_handle: Option<tokio::task::JoinHandle<()>>,
     /// Ringbuf consumer background thread
     ringbuf_thread: Option<std::thread::JoinHandle<()>>,
     /// Signal to stop the ringbuf thread
@@ -330,6 +334,8 @@ pub struct ControlPlane {
     pub dns_manager: Option<crate::dns::DnsManager>,
     /// UDP connection state tracker (for UDP flow cleanup in janitor)
     udp_tracker: Option<Arc<Mutex<crate::udp_tracker::UdpConnStateTracker>>>,
+    /// Userspace routing matcher (used by routing handoff consumer)
+    routing_matcher: Option<Arc<crate::routing::RoutingMatcher>>,
 }
 
 impl ControlPlane {
@@ -349,7 +355,7 @@ impl ControlPlane {
     /// * `config` — Control plane configuration
     pub fn new(config: Config) -> Self {
         let ebpf_mgr = Arc::new(Mutex::new(ebpf::EbpfManager::new_with_path(
-            "dae0",
+            "dae-rs-host",
             &config.ebpf_path,
         )));
         let netns_mgr = netns::NetnsManager::new(&config);
@@ -370,14 +376,18 @@ impl ControlPlane {
             redirect_track_handle: None,
             cookie_pid_handle: None,
             connectivity_handle: None,
+            routing_handoff_handle: None,
             domain_routing: None,
             dns_manager: None,
-            udp_tracker: None,
+            udp_tracker: Some(Arc::new(
+                Mutex::new(udp_tracker::UdpConnStateTracker::new()),
+            )),
             iface_mgr: None,
             ringbuf_thread: None,
             ringbuf_running: None,
             embedded_ebpf: None,
             ebpf_param: None,
+            routing_matcher: None,
         }
     }
 
@@ -405,14 +415,26 @@ impl ControlPlane {
     /// If any step fails, the error is returned and subsequent steps are not executed.
     /// The caller should decide whether to call [`stop()`](ControlPlane::stop) for cleanup based on the error.
     pub async fn start(&mut self) -> Result<()> {
+        let start_time = std::time::Instant::now();
         info!("Control plane starting...");
+
+        debug!(
+            tproxy_port = self.config.tproxy_port,
+            route_table = self.config.route_table,
+            fwmark_proxy = format!("{:#x}", self.config.fwmark_proxy),
+            mtu = self.config.mtu,
+            proxy_addr = %self.config.proxy_addr,
+            "Control plane start() invoked with config"
+        );
 
         // ---- Step 1: Create network namespace ----
         info!("Step 1/5: Creating network namespace and veth pair");
+        let step_start = std::time::Instant::now();
         self.netns_mgr.create().await.map_err(|e| {
             error!("Failed to create network namespace: {}", e);
             e
         })?;
+        debug!("Step 1 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 1.25: 诊断：记录 link pair 类型 ----
         info!(
@@ -424,6 +446,7 @@ impl ControlPlane {
 
         // ---- Step 1.5: Set eBPF PARAM with netns information ----
         // Now that netns is created, we can set dae0_ifindex, dae_netns_id, dae0peer_mac
+        let step_start = std::time::Instant::now();
         if let Some(ref mut param) = self.ebpf_param {
             // Get dae0 ifindex in host NS
             param.dae0_ifindex = self
@@ -465,7 +488,20 @@ impl ControlPlane {
             // Set use_redirect_peer based on kernel support
             param.use_redirect_peer = crate::ebpf::probe_redirect_peer();
             info!("Set PARAM.use_redirect_peer = {}", param.use_redirect_peer);
+
+            debug!(
+                dae0_ifindex = param.dae0_ifindex,
+                dae_netns_id = param.dae_netns_id,
+                dae0peer_mac = format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    param.dae0peer_mac[0], param.dae0peer_mac[1], param.dae0peer_mac[2],
+                    param.dae0peer_mac[3], param.dae0peer_mac[4], param.dae0peer_mac[5]),
+                tproxy_port = param.tproxy_port,
+                control_plane_pid = param.control_plane_pid,
+                use_redirect_peer = param.use_redirect_peer,
+                "Full PARAM fields set"
+            );
         }
+        debug!("Step 1.5 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 1.75: Initialize flip bit for TC handle ----
         // 检查是否有 pinned maps 来判断是否是热重载/重启恢复
@@ -478,6 +514,7 @@ impl ControlPlane {
             0u32
         };
         self.ebpf().set_flip(flip);
+        debug!("Flip bit set to {}", flip);
 
         // ---- Step 2: Load eBPF program ----
         info!("Step 2/5: Loading eBPF program");
@@ -485,7 +522,7 @@ impl ControlPlane {
         // Set PARAM global variable before loading (if configured)
         if let Some(param) = self.ebpf_param {
             self.ebpf().set_param(&param);
-            info!("eBPF PARAM configured: tproxy_port={}", param.tproxy_port);
+            debug!("eBPF PARAM configured: full struct {:?}", param);
         }
 
         // 设置 eBPF map pinning 路径，使 maps 在 load 后自动 pin 到 bpffs
@@ -494,6 +531,7 @@ impl ControlPlane {
             .set_pin_path(crate::ebpf::BPFFS_PATH.to_string());
         info!("eBPF map pinning enabled: {}", crate::ebpf::BPFFS_PATH);
 
+        let load_start = std::time::Instant::now();
         if let Some(ebpf_bytes) = self.embedded_ebpf {
             info!("Using embedded eBPF bytecode ({} bytes)", ebpf_bytes.len());
             self.ebpf().load_from_bytes(ebpf_bytes).map_err(|e| {
@@ -506,6 +544,7 @@ impl ControlPlane {
                 e
             })?;
         }
+        debug!("eBPF load completed: {}ms", load_start.elapsed().as_millis());
 
         // ---- Step 2.5: Initialize outbound_connectivity_map ----
         // BPF ARRAY maps are zero-initialized, but wan_outbound_is_alive()
@@ -513,6 +552,9 @@ impl ControlPlane {
         // the first connectivity check runs (~30s after startup).
         if let Err(e) = self.ebpf().init_outbound_connectivity_map() {
             warn!("Failed to init outbound_connectivity_map: {}", e);
+            debug!("outbound_connectivity_map init error: {:?}", e);
+        } else {
+            debug!("outbound_connectivity_map initialized (all outbounds marked alive)");
         }
 
         // ---- Step 2.6: Initialize InterfaceManager for dynamic WAN/LAN management ----
@@ -523,10 +565,16 @@ impl ControlPlane {
             !self.config.wan_interface.is_empty() || !self.config.lan_interface.is_empty();
         if use_iface_mgr {
             info!("Step 2.6/5: Initializing InterfaceManager for WAN/LAN interfaces");
+            debug!(
+                wan_patterns = ?self.config.wan_interface,
+                lan_patterns = ?self.config.lan_interface,
+                "InterfaceManager configuration"
+            );
             let mut iface_mgr = crate::iface_mgr::InterfaceManager::new();
 
             // Register WAN interface patterns with bind/unbind callbacks
             for pattern in &self.config.wan_interface {
+                debug!(pattern = %pattern, "Registering WAN interface pattern");
                 let ebpf_bind = self.ebpf_mgr.clone();
                 let ebpf_unbind = self.ebpf_mgr.clone();
                 iface_mgr
@@ -551,6 +599,7 @@ impl ControlPlane {
 
             // Register LAN interface patterns with bind/unbind callbacks
             for pattern in &self.config.lan_interface {
+                debug!(pattern = %pattern, "Registering LAN interface pattern");
                 let ebpf_bind = self.ebpf_mgr.clone();
                 let ebpf_unbind = self.ebpf_mgr.clone();
                 iface_mgr
@@ -574,7 +623,9 @@ impl ControlPlane {
             }
 
             // Start the background polling task
+            let iface_start = std::time::Instant::now();
             iface_mgr.start().await?;
+            debug!("InterfaceManager started: {}ms", iface_start.elapsed().as_millis());
             self.iface_mgr = Some(iface_mgr);
             info!(
                 "InterfaceManager started with {} WAN + {} LAN patterns",
@@ -594,21 +645,26 @@ impl ControlPlane {
         //     handled dynamically by InterfaceManager if configured)
         //   - cgroup programs → proxy NS (sock_create/release etc.)
         info!("Step 3/5: Attaching TC programs and configuring kernel");
-        // Attach dae0_ingress in host NS
-        self.ebpf().attach_dae0("dae0").map_err(|e| {
-            error!("Failed to attach dae0_ingress TC: {}", e);
+        let step_start = std::time::Instant::now();
+        // Attach dae-rs-host_ingress in host NS
+        let host_if = self.netns_mgr.host_if().to_string();
+        let peer_if = self.netns_mgr.peer_if().to_string();
+        self.ebpf().attach_dae0(&host_if).map_err(|e| {
+            error!("Failed to attach {}_ingress TC: {}", host_if, e);
             e
         })?;
-        configure_kernel_if("dae0");
-        // Attach dae0peer_ingress in proxy NS
+        configure_kernel_if(&host_if);
+        debug!("dae0 ingress TC attached to {}", host_if);
+        // Attach dae-rs-peer_ingress in proxy NS
         {
             self.netns_mgr.join_proxy_ns()?;
-            self.ebpf().attach_dae0peer("dae0peer").map_err(|e| {
+            self.ebpf().attach_dae0peer(&peer_if).map_err(|e| {
                 error!("Failed to attach dae0peer_ingress TC: {}", e);
                 e
             })?;
-            configure_kernel_if("dae0peer");
+            configure_kernel_if(&peer_if);
             self.netns_mgr.join_host_ns()?;
+            debug!("dae0peer ingress TC attached to {} (in proxy NS)", peer_if);
         }
         // If InterfaceManager is active, WAN/LAN TC attachment is handled dynamically
         // by the background polling task (see Step 2.6 above).
@@ -621,6 +677,7 @@ impl ControlPlane {
             }
             for wan_if in &self.config.wan_interface {
                 info!("Attaching WAN eBPF TC programs to {}", wan_if);
+                debug!(iface = %wan_if, "WAN TC attach: calling attach_wan + configure_kernel_if");
                 self.ebpf().attach_wan(wan_if)?;
                 configure_kernel_if(wan_if);
                 info!("WAN TC attached to {}", wan_if);
@@ -630,6 +687,7 @@ impl ControlPlane {
             }
             for lan_if in &self.config.lan_interface {
                 info!("Attaching LAN eBPF TC programs to {}", lan_if);
+                debug!(iface = %lan_if, "LAN TC attach: calling attach_lan + configure_kernel_if");
                 self.ebpf().attach_lan(lan_if)?;
                 configure_kernel_if(lan_if);
                 info!("LAN TC attached to {}", lan_if);
@@ -637,14 +695,17 @@ impl ControlPlane {
         } else {
             info!("WAN/LAN TC attachment delegated to InterfaceManager (dynamic)");
         }
+        debug!("Step 3 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 3.5: Write eBPF maps (exclusion list + rules) ----
         info!("Step 3.5/5: Writing eBPF maps (exclusion list + rules)");
+        let step_start = std::time::Instant::now();
 
-        // 3.5a. Write excluded process names (from daefile config)
+        // 3.5a. Write excluded process names and PIDs (from daefile config)
         if let Some(ref dc) = self.daefile_config {
             if let Some(ref pe) = dc.process_exclusion {
                 if pe.enabled {
+                    debug!("Process exclusion is enabled");
                     // Write comm exclusion list
                     if !pe.r#match.comm.is_empty() {
                         let comm_hashes: Vec<u32> = pe
@@ -653,6 +714,11 @@ impl ControlPlane {
                             .iter()
                             .map(|c| crate::ebpf::hash_comm(c))
                             .collect();
+                        debug!(
+                            comms = ?pe.r#match.comm,
+                            hashes = ?comm_hashes,
+                            "Writing excluded comm hashes"
+                        );
                         self.ebpf().write_excluded_comm(&comm_hashes)?;
                         info!(
                             "Wrote {} excluded comm hashes to eBPF map",
@@ -661,20 +727,38 @@ impl ControlPlane {
                     }
                     // Write pid exclusion list
                     if !pe.r#match.pid.is_empty() {
+                        debug!(pids = ?pe.r#match.pid, "Writing excluded PIDs");
                         self.ebpf().write_excluded_pids(&pe.r#match.pid)?;
                         info!("Wrote {} excluded PIDs to eBPF map", pe.r#match.pid.len());
                     }
                     // Write tgid exclusion list (shares the same map as pid)
                     if !pe.r#match.tgid.is_empty() {
+                        debug!(tgids = ?pe.r#match.tgid, "Writing excluded TGIDs");
                         self.ebpf().write_excluded_pids(&pe.r#match.tgid)?;
                         info!("Wrote {} excluded TGIDs to eBPF map", pe.r#match.tgid.len());
                     }
+                } else {
+                    debug!("Process exclusion is disabled in config");
                 }
             }
         }
 
+        // Note: write_excluded_pids and write_excluded_comm are NOT called here
+        // because they write to cookie_pid_map with PID/comm hash keys, but the
+        // eBPF program's pid_is_control_plane() looks up by socket cookie (u64),
+        // not by PID. Writing PID keys would pollute the map without providing
+        // any actual exclusion. dae-rs's own sockets are identified via:
+        //   1. cgroup hooks (now attached in both host and proxy NS) register
+        //      real socket cookies → pid_is_control_plane cookie match
+        //   2. SO_MARK=0x100 fallback on dae-rs's outgoing sockets
+
         // 3.5b. Compile routing rules into MatchSet and write to eBPF maps
         if let Some(ref dc) = self.daefile_config {
+            debug!(
+                n_rules = dc.routing.rules.len(),
+                n_outbounds = dc.outbounds.nodes.len(),
+                "Processing routing rules"
+            );
             if !dc.routing.rules.is_empty() {
                 // Collect proxy server IPs from all outbound nodes for auto-direct rules.
                 // This prevents traffic destined for proxy servers from being re-proxied (loop prevention).
@@ -685,17 +769,29 @@ impl ControlPlane {
                         proxy_server_ips.len(),
                         proxy_server_ips
                     );
+                } else {
+                    debug!("No proxy server IPs collected (no auto-direct rules needed)");
                 }
+                let compile_start = std::time::Instant::now();
                 let compiled =
                     routing::compile_rules(&dc.routing, &dc.outbounds, &proxy_server_ips)
                         .context("Failed to compile routing rules")?;
+                debug!(
+                    compile_ms = compile_start.elapsed().as_millis(),
+                    match_sets = compiled.match_sets.len(),
+                    lpm_tries = compiled.lpm_tries.len(),
+                    domain_sets = compiled.domain_sets.len(),
+                    "Routing rules compiled"
+                );
 
                 // Write MatchSet entries to routing_map
                 if !compiled.match_sets.is_empty() {
+                    let write_start = std::time::Instant::now();
                     self.ebpf().write_routing_rules(&compiled.match_sets)?;
                     info!(
-                        "Wrote {} MatchSet entries to routing_map",
-                        compiled.match_sets.len()
+                        "Wrote {} MatchSet entries to routing_map ({}ms)",
+                        compiled.match_sets.len(),
+                        write_start.elapsed().as_millis()
                     );
                 }
 
@@ -711,17 +807,28 @@ impl ControlPlane {
                         }
                     }
                     if !all_cidr_entries.is_empty() {
+                        let write_start = std::time::Instant::now();
                         self.ebpf().write_cidr_table(&all_cidr_entries)?;
                         info!(
-                            "Wrote {} CIDR entries across {} LPM tries",
+                            "Wrote {} CIDR entries across {} LPM tries ({}ms)",
                             all_cidr_entries.len(),
-                            compiled.lpm_tries.len()
+                            compiled.lpm_tries.len(),
+                            write_start.elapsed().as_millis(),
                         );
+                    } else {
+                        debug!("No CIDR entries to write (no LPM rules)");
                     }
                 }
 
+                // Set up userspace routing matcher (used by RoutingHandoffConsumer)
+                self.routing_matcher = Some(Arc::new(
+                    crate::routing::RoutingMatcher::from_compiled(&compiled),
+                ));
+                debug!("RoutingMatcher built from compiled rules");
+
                 // Set up domain routing tracker
                 if !compiled.domain_sets.is_empty() {
+                    let n_sets = compiled.domain_sets.len();
                     self.domain_routing = Some(crate::domain_routing::DomainRoutingTracker::new(
                         std::sync::Arc::new(compiled.domain_sets),
                     ));
@@ -729,65 +836,140 @@ impl ControlPlane {
                         "Domain routing tracker initialized with {} domain sets",
                         self.domain_routing.as_ref().unwrap().len(),
                     );
+                    debug!(n_sets, "Domain routing tracker created");
                 }
+            } else {
+                debug!("No routing rules defined in config (empty rules list)");
             }
         }
+        debug!("Step 3.5 completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 3.7: Attach cgroup programs in proxy NS ----
-        info!("Step 3.7/5: Attaching cgroup programs in proxy namespace");
+        // ---- Step 3.7: Attach cgroup programs in BOTH namespaces ----
+        // The eBPF programs need to track all dae-rs sockets regardless of
+        // which network namespace they're created in. Since dae-rs runs
+        // components in both:
+        //   - Host NS: DNS listener, API server, connectivity checker
+        //   - Proxy NS (daens): TProxy listener, SOCKS5 dialer
+        //
+        // We attach the cgroup programs to both namespaces' cgroups.
+        // The cookie_pid_map is shared, so socket cookies from both
+        // namespaces are tracked and recognized by pid_is_control_plane().
+        info!("Step 3.7/5: Attaching cgroup programs (host NS + proxy NS)");
+        let step_start = std::time::Instant::now();
+
+        // Attach in host NS first
         {
-            // Switch to proxy NS to attach cgroup programs
-            self.netns_mgr.join_proxy_ns()?;
-
-            // Open cgroup fd for the proxy namespace
-            // Use /sys/fs/cgroup as the cgroup root
             let cgroup_fd = unsafe {
                 libc::open(
                     b"/sys/fs/cgroup\0".as_ptr() as *const libc::c_char,
                     libc::O_RDONLY | libc::O_DIRECTORY,
                 )
             };
-
+            debug!("cgroup_fd for host NS: {}", cgroup_fd);
             if cgroup_fd >= 0 {
                 match self.ebpf().attach_cgroup(cgroup_fd) {
                     Ok(()) => {
-                        info!("cgroup programs attached successfully");
+                        info!("cgroup programs attached in HOST namespace");
                     }
                     Err(e) => {
-                        warn!("Failed to attach cgroup programs: {}", e);
+                        warn!(
+                            "Failed to attach cgroup programs in HOST namespace: {}",
+                            e
+                        );
+                        debug!("cgroup attach host NS error details: {:?}", e);
                     }
                 }
-                unsafe {
-                    libc::close(cgroup_fd);
-                }
+                unsafe { libc::close(cgroup_fd) };
             } else {
-                warn!(
-                    "Failed to open /sys/fs/cgroup: {}",
-                    std::io::Error::last_os_error()
-                );
+                warn!("Failed to open /sys/fs/cgroup in host NS (errno={})", unsafe { *libc::__errno_location() });
             }
+        }
 
-            // Switch back to host NS
+        // Attach in proxy NS
+        {
+            self.netns_mgr.join_proxy_ns()?;
+            let cgroup_fd = unsafe {
+                libc::open(
+                    b"/sys/fs/cgroup\0".as_ptr() as *const libc::c_char,
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                )
+            };
+            debug!("cgroup_fd for proxy NS: {}", cgroup_fd);
+            if cgroup_fd >= 0 {
+                match self.ebpf().attach_cgroup(cgroup_fd) {
+                    Ok(()) => {
+                        info!("cgroup programs attached in PROXY namespace (daens)");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to attach cgroup programs in PROXY namespace: {}",
+                            e
+                        );
+                        debug!("cgroup attach proxy NS error details: {:?}", e);
+                    }
+                }
+                unsafe { libc::close(cgroup_fd) };
+            } else {
+                warn!("Failed to open /sys/fs/cgroup in proxy NS (errno={})", unsafe { *libc::__errno_location() });
+            }
             self.netns_mgr.join_host_ns()?;
         }
+        debug!("Step 3.7 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 4: Start TProxy listener ----
         info!("Step 4/5: Starting TProxy listener in proxy namespace");
+        let step_start = std::time::Instant::now();
         self.start_tproxy().await?;
+        debug!("Step 4 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 4.5: Start DNS manager ----
         if let Some(ref dns_cfg) = self.config.dns_config {
             info!("Step 4.5/5: Starting DNS manager");
+            debug!(dns_bind = %dns_cfg.bind, dns_cache_max_size = dns_cfg.cache.max_size, "DNS config details");
             let mut dns_mgr = crate::dns::DnsManager::new(dns_cfg.clone());
+            let upstream_start = std::time::Instant::now();
             if let Err(e) = dns_mgr.init_upstreams() {
                 warn!("DNS upstream initialization failed (non-fatal): {}", e);
-            }
-            if let Err(e) = dns_mgr.start().await {
-                warn!("DNS manager start failed (non-fatal): {}", e);
             } else {
-                info!("DNS manager started successfully");
+                debug!(
+                    "DNS upstreams initialized: {}ms",
+                    upstream_start.elapsed().as_millis()
+                );
+            }
+            let dns_start = std::time::Instant::now();
+            if let Err(e) = dns_mgr.start().await {
+                return Err(anyhow::anyhow!(
+                    "DNS manager failed to start (bind {}): {}. \
+                     This is a critical component — DNS resolution will not work without it. \
+                     Please ensure the DNS bind port is available or change it in the config",
+                    dns_cfg.bind,
+                    e,
+                ));
+            } else {
+                info!("DNS manager started successfully ({}ms)", dns_start.elapsed().as_millis());
                 self.dns_manager = Some(dns_mgr);
             }
+        } else {
+            debug!("No DNS config — DNS manager not started");
+        }
+
+        // ---- Step 4.6: Start routing handoff consumer ----
+        // Consumes entries from routing_handoff_map that the eBPF program
+        // produces when it cannot determine the outbound (CONTROL_PLANE_ROUTING).
+        // The consumer uses the userspace RoutingMatcher to make the final
+        // routing decision and writes it to conn_state_map.
+        if let Some(ref matcher) = self.routing_matcher {
+            info!("Step 4.6/5: Starting routing handoff consumer");
+            let consumer = crate::routing_handoff::RoutingHandoffConsumer::new(
+                self.ebpf_mgr.clone(),
+                matcher.clone(),
+            );
+            self.routing_handoff_handle = Some(tokio::spawn(async move {
+                consumer.run().await;
+            }));
+            info!("Routing handoff consumer started");
+        } else {
+            warn!("No RoutingMatcher available — routing handoff consumer NOT started");
         }
 
         // ---- Step 5: Start background tasks ----
@@ -795,36 +977,59 @@ impl ControlPlane {
         // Ringbuf event consumer (get fd first to release the lock before assigning fields)
         let ringbuf_fd = self.ebpf().event_ringbuf_fd().ok();
         if let Some(fd) = ringbuf_fd {
+            debug!("Ringbuf fd obtained: {}", fd);
             let (handle, running) = ebpf::EbpfManager::spawn_ringbuf_consumer(fd);
             self.ringbuf_thread = Some(handle);
             self.ringbuf_running = Some(running);
+            debug!("Ringbuf consumer spawned");
         } else {
             warn!("Failed to get ringbuf fd, ringbuf consumer not started");
         }
         // Conn_state janitor (with pressure detection)
+        debug!("Spawning conn_state janitor");
         self.janitor_handle = Some(Self::spawn_conn_state_janitor(
             self.ebpf_mgr.clone(),
-            None, // UDP tracker — will be wired up when available
+            self.udp_tracker.clone(),
         ));
+        debug!("Conn_state janitor spawned");
 
         // Redirect track janitor (30s interval, 5min TTL)
+        debug!("Spawning redirect track janitor");
         self.redirect_track_handle =
             Some(Self::spawn_redirect_track_janitor(self.ebpf_mgr.clone()));
+        debug!("Redirect track janitor spawned");
 
         // Cookie PID map janitor (60s interval, 5min TTL)
+        debug!("Spawning cookie PID map janitor");
         self.cookie_pid_handle = Some(Self::spawn_cookie_pid_map_janitor(self.ebpf_mgr.clone()));
+        debug!("Cookie PID map janitor spawned");
 
         // Connectivity checker (proxies health)
         let proxy_addr: std::net::SocketAddr =
             self.config.proxy_addr.parse().expect("valid proxy address");
+        debug!(
+            proxy_addr = %proxy_addr,
+            "Starting connectivity checker"
+        );
         self.connectivity_handle = Some(Self::start_connectivity_checker(
             self.ebpf_mgr.clone(),
             proxy_addr,
             0,
         ));
+        debug!("Connectivity checker spawned");
 
         self.running = true;
+        let total_ms = start_time.elapsed().as_millis();
+        debug!("Control plane total startup time: {}ms", total_ms);
         info!("Control plane started successfully");
+
+        // Dump eBPF debug counters for data path diagnosis.
+        // This helps identify where in the eBPF pipeline packets are being
+        // dropped (e.g., bpf_sk_assign failures, redirect failures, etc.).
+        {
+            let mut mgr = self.ebpf_mgr.lock().unwrap();
+            mgr.log_debug_counters("startup");
+        }
 
         // Log network diagnostics after startup
         match std::process::Command::new("ip")
@@ -835,7 +1040,7 @@ impl ControlPlane {
                 "Default route: {}",
                 String::from_utf8_lossy(&o.stdout).trim()
             ),
-            Err(_) => warn!("Could not query default route"),
+            Err(e) => warn!("Could not query default route: {}", e),
         }
         match std::process::Command::new("ip").args(["link"]).output() {
             Ok(o) => info!("Links:\n{}", String::from_utf8_lossy(&o.stdout)),
@@ -864,10 +1069,19 @@ impl ControlPlane {
     /// * Returns an error if the proxy namespace has not been created
     /// * Returns a bind error if the port is already in use
     async fn start_tproxy(&mut self) -> Result<()> {
+        let start_time = std::time::Instant::now();
+        debug!("start_tproxy: beginning TProxy setup");
+
         // ---- Create SOCKS5 dialer ----
         let proxy_addr: SocketAddr = self.config.proxy_addr.parse().map_err(|e| {
             anyhow::anyhow!("Invalid proxy address '{}': {}", self.config.proxy_addr, e)
         })?;
+        debug!(
+            proxy_addr = %proxy_addr,
+            proxy_has_username = !self.config.proxy_username.is_empty(),
+            proxy_dial_timeout_ms = self.config.proxy_dial_timeout_ms,
+            "SOCKS5 dialer configuration"
+        );
 
         // ---- Create TProxy listener in DAENS (proxy namespace) ----
         // eBPF 数据流：
@@ -886,8 +1100,10 @@ impl ControlPlane {
                     e
                 )
             })?;
+        debug!(listen_addr = %listen_addr, "TProxy listen address");
 
         let socket_mark = 0x100u32;
+        debug!(socket_mark = format!("{:#x}", socket_mark), "Socket mark for eBPF self-exclusion");
         let dialer_tcp = Socks5Dialer::new_with_mark(
             proxy_addr,
             &self.config.proxy_username,
@@ -902,17 +1118,50 @@ impl ControlPlane {
             self.config.proxy_dial_timeout_ms,
             socket_mark,
         );
+        debug!("TCP and UDP SOCKS5 dialers created");
 
         let tproxy_tcp = Arc::new(TproxyListener::new(listen_addr, dialer_tcp));
-        let tproxy_udp = Arc::new(UdpTproxyListener::new(listen_addr, dialer_udp));
+        let tproxy_udp = {
+            let mut udp = UdpTproxyListener::new(listen_addr, dialer_udp);
+            // Configure DNS hijacking: set the DNS forward address so that
+            // UDP DNS queries intercepted by eBPF are forwarded to the
+            // internal DNS handler instead of going through SOCKS5.
+            // The DNS handler listens on 169.254.0.1:port in the host NS,
+            // reachable from daens via the dae0peer→dae0 veth path.
+            if let Some(ref dns_cfg) = self.config.dns_config {
+                if let Ok(dns_bind) = dns_cfg.bind.parse::<std::net::SocketAddr>() {
+                    let dns_port = dns_bind.port();
+                    let dns_forward: std::net::SocketAddr = format!("169.254.0.1:{}", dns_port)
+                        .parse()
+                        .expect("invalid DNS forward address");
+                    udp.set_dns_forward_addr(dns_forward);
+                    info!(
+                        "DNS hijacking enabled: UDP TProxy will forward DNS queries to {}",
+                        dns_forward
+                    );
+                    debug!(
+                        dns_bind = %dns_bind,
+                        dns_forward = %dns_forward,
+                        "DNS hijack: TProxy forwards DNS queries to host NS DNS handler"
+                    );
+                }
+            }
+            Arc::new(udp)
+        };
 
         // ---- Add host namespace policy routing ----
         // 宿主 NS 策略路由：标记包 → local default dev lo → TProxy socket
         // （用于从 daens 通过 dae0peer → dae0 进入宿主 NS 的标记包）
+        debug!("Adding host namespace policy routing");
+        let route_start = std::time::Instant::now();
         self.netns_mgr
             .add_host_policy_routing()
             .await
             .context("Failed to add host namespace policy routing")?;
+        debug!(
+            "Host policy routing added: {}ms",
+            route_start.elapsed().as_millis()
+        );
 
         info!(
             listen_addr = %listen_addr,
@@ -928,12 +1177,14 @@ impl ControlPlane {
             .netns_mgr
             .get_proxy_ns_fd()
             .ok_or_else(|| anyhow::anyhow!("Proxy namespace not created"))?;
+        debug!(proxy_ns_fd, "Proxy namespace fd obtained for TProxy thread");
 
         let tproxy_tcp_clone = tproxy_tcp.clone();
         let tproxy_udp_clone = tproxy_udp.clone();
         let ebpf_mgr_clone = self.ebpf_mgr.clone();
         use std::os::unix::io::BorrowedFd;
         let thread_handle = std::thread::spawn(move || {
+            debug!("TProxy thread spawned, entering daens...");
             // ---- 进入 daens ----
             // TProxy 必须运行在 daens 中，因为 eBPF 路由后的标记包
             // 通过 daens 的策略路由投递到本地 lo。
@@ -944,6 +1195,7 @@ impl ControlPlane {
             }
             info!("Entered daens for TProxy listener");
 
+            let rt_start = std::time::Instant::now();
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -954,47 +1206,66 @@ impl ControlPlane {
                     return;
                 }
             };
+            debug!(
+                "TProxy tokio runtime created: {}ms",
+                rt_start.elapsed().as_millis()
+            );
 
             let result = rt.block_on(async {
-                // Bind the dual-stack TCP listener (in daens)
+                // Bind separate AF_INET + AF_INET6 TCP listeners (in daens).
+                // AF_INET  socket → SOCKMAP key 0 (tcp4) — handles IPv4 traffic
+                // AF_INET6 socket → SOCKMAP key 2 (tcp6) — handles IPv6 traffic
+                // This matches the original dae implementation and avoids the bug
+                // where bpf_sk_assign() assigns an AF_INET6 socket to IPv4 packets.
                 info!(
-                    "Binding TProxy TCP listener on {} in daens",
-                    tproxy_tcp_clone.listen_addr()
+                    "Binding TProxy TCP listeners on port {} in daens",
+                    tproxy_tcp_clone.listen_addr().port()
                 );
-                let listener_tcp = match tproxy_tcp_clone.bind().await {
-                    Ok(l) => l,
+                let bind_start = std::time::Instant::now();
+                let (listener_tcp_v4, listener_tcp_v6) = match tproxy_tcp_clone.bind().await {
+                    Ok(pair) => pair,
                     Err(e) => {
-                        error!("Failed to bind TProxy TCP socket: {}", e);
+                        error!("Failed to bind TProxy TCP sockets: {}", e);
                         return Err(e);
                     }
                 };
+                debug!(
+                    "TProxy TCP bind completed: {}ms",
+                    bind_start.elapsed().as_millis()
+                );
 
                 // ---- Populate listen_socket_map for bpf_sk_assign ----
-                // Insert the TCP listener socket FD into the SOCKMAP so that
-                // dae0peer_ingress can use assign_listener() via bpf_sk_assign.
-                // Key 0 = tcp4, key 2 = tcp6. The dual-stack socket handles both.
+                // Insert separate socket FDs into the SOCKMAP:
+                //   key 0 → AF_INET  socket (tcp4) — for IPv4 traffic
+                //   key 2 → AF_INET6 socket (tcp6) — for IPv6 traffic
                 {
                     use std::os::unix::io::AsRawFd;
-                    let raw_fd = listener_tcp.as_raw_fd();
+                    let raw_fd_v4 = listener_tcp_v4.as_raw_fd();
+                    let raw_fd_v6 = listener_tcp_v6.as_raw_fd();
                     let mut mgr = ebpf_mgr_clone.lock().unwrap();
-                    // Key 0 = tcp4 (dual-stack covers both v4 and v6)
-                    if let Err(e) = mgr.update_listen_socket_map(0, raw_fd) {
+                    // Key 0 = tcp4 (AF_INET socket)
+                    if let Err(e) = mgr.update_listen_socket_map(0, raw_fd_v4) {
                         error!("Failed to update listen_socket_map for tcp4: {}", e);
+                    } else {
+                        debug!("listen_socket_map[0] = {} (AF_INET)", raw_fd_v4);
                     }
-                    // Key 2 = tcp6 (same socket, also for tcp6 traffic)
-                    if let Err(e) = mgr.update_listen_socket_map(2, raw_fd) {
+                    // Key 2 = tcp6 (AF_INET6 socket)
+                    if let Err(e) = mgr.update_listen_socket_map(2, raw_fd_v6) {
                         error!("Failed to update listen_socket_map for tcp6: {}", e);
+                    } else {
+                        debug!("listen_socket_map[2] = {} (AF_INET6)", raw_fd_v6);
                     }
                 }
 
                 info!(
-                    "TProxy TCP listener starting on {} in daens",
-                    tproxy_tcp_clone.listen_addr()
+                    "TProxy TCP listeners starting on port {} in daens",
+                    tproxy_tcp_clone.listen_addr().port()
                 );
 
                 // Run TCP and UDP listeners concurrently
+                let serve_start = std::time::Instant::now();
                 let (tcp_result, udp_result) = tokio::join!(
-                    tproxy_tcp_clone.serve(listener_tcp),
+                    tproxy_tcp_clone.serve(listener_tcp_v4, listener_tcp_v6),
                     tproxy_udp_clone.start(Some(ebpf_mgr_clone.clone()))
                 );
 
@@ -1004,6 +1275,11 @@ impl ControlPlane {
                 if let Err(e) = udp_result {
                     error!("TProxy UDP listener error: {}", e);
                 }
+
+                debug!(
+                    "TProxy serve duration: {}ms",
+                    serve_start.elapsed().as_millis()
+                );
 
                 Ok(())
             });
@@ -1022,6 +1298,8 @@ impl ControlPlane {
         self.tproxy_udp = Some(tproxy_udp);
         self.tproxy_thread = Some(thread_handle);
 
+        let elapsed_ms = start_time.elapsed().as_millis();
+        debug!("start_tproxy completed: {}ms", elapsed_ms);
         info!("TProxy listener launching in background thread (in daens)");
         Ok(())
     }
@@ -1065,34 +1343,42 @@ impl ControlPlane {
                     .unwrap_or_default()
                     .as_nanos() as u64;
 
-                // ---- Step 1: Clean up UDP tracker expired entries ----
-                if let Some(ref tracker) = udp_tracker {
-                    if let Ok(mut tracker_guard) = tracker.lock() {
-                        let expired = tracker_guard.cleanup_expired();
-                        if !expired.is_empty() {
-                            // Delete expired UDP tracker entries from conn_state_map
-                            if let Ok(mut mgr) = ebpf_mgr.lock() {
-                                for key in &expired {
-                                    let _ = mgr.delete_conntrack(key);
-                                }
-                                debug!(
-                                    "Janitor: deleted {} expired entries from UDP tracker",
-                                    expired.len()
-                                );
-                            }
+                // ---- Step 1: Collect expired UDP tracker entries (without holding ebpf lock) ----
+                // Acquire ebpf_mgr lock FIRST, then udp_tracker lock SECOND.
+                // This guarantees a single lock acquisition order (ebpf → udp_tracker) across
+                // all code paths, preventing AB-BA deadlock.
+                let (expired_udp_keys, mut mgr) = {
+                    let mgr = match ebpf_mgr.lock() {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!("Janitor lock error: {}", e);
+                            continue;
                         }
+                    };
+                    let expired_udp_keys = if let Some(ref tracker) = udp_tracker {
+                        if let Ok(mut tracker_guard) = tracker.lock() {
+                            tracker_guard.cleanup_expired()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    (expired_udp_keys, mgr)
+                };
+
+                // ---- Step 1b: Delete expired UDP entries from conn_state_map ----
+                if !expired_udp_keys.is_empty() {
+                    for key in &expired_udp_keys {
+                        let _ = mgr.delete_conntrack(key);
                     }
+                    debug!(
+                        "Janitor: deleted {} expired entries from UDP tracker",
+                        expired_udp_keys.len()
+                    );
                 }
 
                 // ---- Step 2: Scan conn_state_map for expired entries ----
-                let mut mgr = match ebpf_mgr.lock() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!("Janitor lock error: {}", e);
-                        continue;
-                    }
-                };
-
                 match mgr.janitor_scan_conn_state(now_ns) {
                     Ok((deleted, remaining)) => {
                         if deleted > 0 {
@@ -1220,6 +1506,13 @@ impl ControlPlane {
             );
 
             loop {
+                // Dump eBPF debug counters periodically (helps diagnose data path issues)
+                {
+                    if let Ok(mut mgr) = ebpf_mgr.lock() {
+                        mgr.log_debug_counters("connectivity");
+                    }
+                }
+
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
 
                 // TCP health check: try marked (SO_MARK=0x100) first, then plain
@@ -1417,50 +1710,110 @@ impl ControlPlane {
 
     pub fn detach_bpf_hooks(&mut self) {
         info!("Emergency BPF hook detachment");
-        // Detach dae0peer hooks in proxy NS first (before host NS hooks)
-        // because dae0peer interface only exists in proxy NS
+        let start = std::time::Instant::now();
+        // Detach dae-rs-peer hooks in proxy NS first (before host NS hooks)
+        // because dae-rs-peer interface only exists in proxy NS
         if let Ok(()) = self.netns_mgr.join_proxy_ns() {
-            let _ = self.ebpf().detach_by_iface("dae0peer");
+            debug!("Detaching proxy NS hooks...");
+            let _ = self.ebpf().detach_by_iface(&self.netns_mgr.peer_if());
             let _ = self.netns_mgr.join_host_ns();
+        } else {
+            debug!("Could not join proxy NS for detach (may not exist)");
         }
         // Detach all remaining hooks in host NS
         let _ = self.ebpf().detach_all();
+        debug!("Emergency BPF hook detachment completed: {}ms", start.elapsed().as_millis());
     }
 
     pub async fn stop(&mut self) -> Result<()> {
+        let start_time = std::time::Instant::now();
         info!("Control plane stopping...");
 
         let mut errors: Vec<anyhow::Error> = Vec::new();
 
-        // ---- Step 0: Stop API server ----
+        // ---- Step 0: Stop all background tasks first ----
+        // These must be stopped before service listeners to prevent:
+        // 1. Connectivity checker printing logs during shutdown
+        // 2. Janitors holding eBPF map locks while we try to detach
+        // 3. Race conditions with InterfaceManager unbinding programs
+        // All use abort() for immediate cancellation.
+        info!("Step 0/5: Stopping all background tasks");
+        let step_start = std::time::Instant::now();
+        // 0a. Connectivity checker
+        if let Some(handle) = self.connectivity_handle.take() {
+            handle.abort();
+            debug!("Connectivity checker task aborted");
+        }
+        // 0b. conn_state janitor
+        if let Some(handle) = self.janitor_handle.take() {
+            handle.abort();
+            debug!("ConnState janitor task aborted");
+        }
+        // 0c. redirect_track janitor
+        if let Some(handle) = self.redirect_track_handle.take() {
+            handle.abort();
+            debug!("Redirect track janitor task aborted");
+        }
+        // 0d. cookie_pid_map janitor
+        if let Some(handle) = self.cookie_pid_handle.take() {
+            handle.abort();
+            debug!("Cookie PID map janitor task aborted");
+        }
+        // 0e. InterfaceManager
+        if let Some(mut iface_mgr) = self.iface_mgr.take() {
+            iface_mgr.stop().await;
+            debug!("InterfaceManager stopped");
+        }
+        // 0f. Ringbuf consumer
+        if let Some(running) = self.ringbuf_running.take() {
+            running.store(false, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.ringbuf_thread.take() {
+            let join_start = std::time::Instant::now();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::task::spawn_blocking(move || {
+                    let _ = handle.join();
+                }),
+            )
+            .await;
+            debug!("Ringbuf consumer joined: {}ms", join_start.elapsed().as_millis());
+        }
+        // 0g. Routing handoff consumer
+        if let Some(handle) = self.routing_handoff_handle.take() {
+            handle.abort();
+            debug!("Routing handoff consumer task aborted");
+        }
+        debug!("Step 0 completed: {}ms", step_start.elapsed().as_millis());
+
+        // ---- Step 1: Stop API server ----
         if let Some(handle) = self.api_handle.take() {
-            info!("Step 0/5: Stopping REST API server");
+            info!("Step 1/5: Stopping REST API server");
             handle.abort();
             let _ = handle.await;
-            info!("REST API server stopped");
+            debug!("API server stopped");
         }
 
-        // ---- Step 0.5: Stop DNS manager ----
+        // ---- Step 2: Stop DNS manager ----
+        // Uses task abort internally to avoid hanging on infinite recv loops.
         if let Some(mut dns_mgr) = self.dns_manager.take() {
-            info!("Step 0.5/5: Stopping DNS manager");
+            info!("Step 2/5: Stopping DNS manager");
+            let dns_stop = std::time::Instant::now();
             if let Err(e) = dns_mgr.stop().await {
                 warn!("DNS manager stop error: {}", e);
             }
+            debug!("DNS manager stopped: {}ms", dns_stop.elapsed().as_millis());
         }
 
-        // ---- Step 1: Stop TProxy listener ----
-        info!("Step 1/5: Stopping TProxy listener");
-        // Send stop signals to both TCP and UDP before waiting for thread exit
-        // (the thread runs both via tokio::join!, so both must stop for it to exit)
+        // ---- Step 3: Stop TProxy listener ----
+        info!("Step 3/5: Stopping TProxy listener");
+        let step_start = std::time::Instant::now();
         if let Some(tproxy) = &self.tproxy {
             tproxy.stop();
-            info!("TProxy TCP stop signal sent");
         }
         if let Some(udp) = &self.tproxy_udp {
             udp.stop();
-            info!("TProxy UDP stop signal sent");
         }
-        // Wait for TProxy thread to exit (with timeout, non-blocking for async runtime)
         if let Some(handle) = self.tproxy_thread.take() {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -1477,97 +1830,59 @@ impl ControlPlane {
         }
         self.tproxy.take();
         self.tproxy_udp.take();
+        debug!("Step 3 completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 1.5a: Stop ringbuf consumer ----
-        if let Some(running) = self.ringbuf_running.take() {
-            info!("Step 1.5a/5: Stopping ringbuf consumer");
-            running.store(false, Ordering::Relaxed);
-        }
-        if let Some(handle) = self.ringbuf_thread.take() {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                tokio::task::spawn_blocking(move || {
-                    let _ = handle.join();
-                }),
-            )
-            .await;
-            info!("Ringbuf consumer stopped");
-        }
-
-        // ---- Step 1.5b: Stop connectivity checker ----
-        if let Some(handle) = self.connectivity_handle.take() {
-            info!("Step 1.5b/5: Stopping connectivity checker");
-            handle.abort();
-        }
-
-        // ---- Step 1.5c: Stop conn_state janitor ----
-        if let Some(handle) = self.janitor_handle.take() {
-            info!("Step 1.5c/5: Stopping conn_state janitor");
-            handle.abort();
-        }
-
-        // ---- Step 1.5c1: Stop redirect_track janitor ----
-        if let Some(handle) = self.redirect_track_handle.take() {
-            info!("Step 1.5c1/5: Stopping redirect_track janitor");
-            handle.abort();
-        }
-
-        // ---- Step 1.5c2: Stop cookie_pid_map janitor ----
-        if let Some(handle) = self.cookie_pid_handle.take() {
-            info!("Step 1.5c2/5: Stopping cookie_pid_map janitor");
-            handle.abort();
-        }
-
-        // ---- Step 1.5d: Stop InterfaceManager ----
-        // Stop the background polling task before detaching TC programs,
-        // so it doesn't try to attach/detach during shutdown.
-        if let Some(mut iface_mgr) = self.iface_mgr.take() {
-            info!("Step 1.5d/5: Stopping InterfaceManager");
-            iface_mgr.stop().await;
-        }
-
-        // ---- Step 2: Detach all TC and cgroup programs ----
-        // The TC hooks are on interfaces in both namespaces:
-        //   - Host NS: dae0_ingress, wan_*, lan_*
-        //   - Proxy NS: dae0peer_ingress, cgroup programs
-        // detach_all() handles both sides.
-        info!("Step 2/5: Detaching all TC and cgroup programs");
+        // ---- Step 5: Detach all TC and cgroup programs ----
+        info!("Step 5/5: Detaching all TC and cgroup programs");
+        let step_start = std::time::Instant::now();
         if let Err(e) = self.ebpf().detach_all() {
             error!("Failed to detach programs: {}", e);
             errors.push(e);
         }
+        debug!("Detach completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 3: Unload eBPF program ----
-        info!("Step 3/5: Unloading eBPF program");
+        // ---- Step 6: Unload eBPF program ----
+        info!("Step 6/5: Unloading eBPF program");
+        let step_start = std::time::Instant::now();
         if let Err(e) = self.ebpf().unload() {
             error!("Failed to unload eBPF program: {}", e);
             errors.push(e);
         }
+        debug!("Unload completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 3.5: Unpin eBPF maps from bpffs ----
-        // 在完全停止时清理 pinned maps，确保下次启动时使用新的 maps
-        // 如果希望在重启后保留连接状态，可以注释掉此步骤
-        info!("Step 3.5/5: Unpinning eBPF maps");
+        // ---- Step 7: Unpin eBPF maps from bpffs ----
+        info!("Step 7/5: Unpinning eBPF maps");
+        let step_start = std::time::Instant::now();
         if let Err(e) = self.ebpf().unpin_maps(crate::ebpf::BPFFS_PATH) {
             warn!("Failed to unpin eBPF maps: {}", e);
         }
+        debug!("Unpin completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 4: Destroy network namespace ----
-        info!("Step 4/5: Destroying network namespace and veth pair");
+        // ---- Step 8: Destroy network namespace ----
+        info!("Step 8/5: Destroying network namespace and veth pair");
+        let step_start = std::time::Instant::now();
         if let Err(e) = self.netns_mgr.destroy() {
             error!("Failed to destroy network namespace: {}", e);
             errors.push(e);
         }
+        debug!("Destroy completed: {}ms", step_start.elapsed().as_millis());
 
         self.running = false;
 
+        let total_ms = start_time.elapsed().as_millis();
         if errors.is_empty() {
+            debug!("Control plane stop total time: {}ms", total_ms);
             info!("Control plane stopped successfully");
             Ok(())
         } else {
             for e in &errors {
                 warn!("Control plane stop error: {}", e);
             }
+            debug!(
+                "Control plane stop completed with {} errors (total: {}ms)",
+                errors.len(),
+                total_ms
+            );
             Err(anyhow::anyhow!(
                 "Control plane stopped with {} error(s)",
                 errors.len()
@@ -1581,15 +1896,34 @@ impl ControlPlane {
     /// Also toggles the flip bit for TC handle rotation to support
     /// filter switching on hot-reload.
     /// Safe to call even when eBPF is not loaded (maps are skipped).
+    ///
+    /// # Reload Coverage
+    ///
+    /// **Supported (live):**
+    /// - Routing rules (MatchSet, LPM tries, domain routing)
+    /// - Process exclusion lists (comm/PID/TGID)
+    ///
+    /// **NOT supported — require full restart:**
+    /// - Proxy address / credentials (TProxy dialer is immutable at runtime)
+    /// - `tproxy_port` (TProxy listener socket is immutable)
+    /// - DNS configuration (`dns_manager` is immutable)
+    /// - WAN/LAN interface patterns (`InterfaceManager` bindings are immutable)
+    /// - MTU, fwmark values (kernel network stack parameters)
+    ///
+    /// Changing proxy credentials or address here will update `self.config.*`
+    /// fields but the active `Socks5Dialer` and `TproxyListener` instances
+    /// continue using the old values until the next restart.
     pub fn reload_config(&mut self, daefile_content: &str) -> Result<()> {
+        let start = std::time::Instant::now();
         info!("Hot-reloading configuration");
+        debug!("reload_config: input size {} bytes", daefile_content.len());
 
         // ---- Step 0: Toggle flip bit for TC handle rotation ----
         // 翻转 flip 位，使后续 attach 使用新的 handle，
         // 旧 filter 在 detach 时使用旧 handle 被删除。
         let new_flip = self.ebpf().flip() ^ 1;
         self.ebpf().set_flip(new_flip);
-        info!("Hot-reload: toggled flip bit to {}", new_flip);
+        debug!("Hot-reload: toggled flip bit to {}", new_flip);
 
         // 1. Re-parse daefile
         let daefile_config = config::parse_daefile(daefile_content)
@@ -1597,13 +1931,26 @@ impl ControlPlane {
         config::validate_config(&daefile_config)?;
         self.daefile_config = Some(daefile_config.clone());
         self.daefile_content = Some(daefile_content.to_string());
+        debug!("Hot-reload: daefile re-parsed and validated");
 
-        // Update hot-reloadable config fields from the new daefile
+        // Update hot-reloadable config fields from the new daefile.
+        // Note: these updates are recorded but the active Socks5Dialer and
+        // TproxyListener instances are NOT recreated — new proxy credentials
+        // and address only take effect on the next restart.
         if let Some(first_node) = daefile_config.outbounds.nodes.first() {
+            if self.config.proxy_addr != first_node.address {
+                warn!(
+                    "Hot-reload: proxy_addr changed '{}' -> '{}'. \
+                     Active dialer still uses old address; restart required for new proxy.",
+                    self.config.proxy_addr, first_node.address,
+                );
+            }
             self.config.proxy_addr = first_node.address.clone();
             self.config.proxy_username = first_node.username.clone().unwrap_or_default();
             self.config.proxy_password = first_node.password.clone().unwrap_or_default();
             self.config.proxy_dial_timeout_ms = first_node.dial_timeout_ms;
+        } else {
+            warn!("Hot-reload: no outbound nodes defined; proxy config unchanged");
         }
         self.config.log_level = daefile_config.runtime.log_level.clone();
 
@@ -1694,6 +2041,8 @@ impl ControlPlane {
             );
         }
 
+        let elapsed_ms = start.elapsed().as_millis();
+        debug!("Hot-reload completed: {}ms", elapsed_ms);
         info!("Hot-reload completed successfully");
         Ok(())
     }
@@ -1705,11 +2054,16 @@ impl Drop for ControlPlane {
     /// If the control plane is still running and the user forgot to call [`stop()`](ControlPlane::stop),
     /// the Drop implementation will automatically perform cleanup. However, since async is not available
     /// in Drop, this performs cleanup synchronously (a non-async version of stop).
+    ///
+    /// Temp JSON files are cleaned up here as a best-effort, since the caller may not
+    /// have reached the normal shutdown path (e.g. process killed with SIGKILL).
     fn drop(&mut self) {
         if self.running {
             warn!("ControlPlane dropped without explicit stop()");
-            // Each sub-module's Drop implementation handles its own cleanup
         }
+        // Each sub-module's Drop implementation handles its own cleanup.
+        // Also clean up any leftover temp JSON config files (best-effort).
+        cleanup_temp_json(3600);
     }
 }
 
@@ -1982,7 +2336,7 @@ mod tests {
         let cp = ControlPlane::new(config);
 
         assert!(!cp.running);
-        assert_eq!(cp.ebpf().iface(), "dae0");
+        assert_eq!(cp.ebpf().iface(), "dae-rs-host");
         assert!(!cp.ebpf().is_loaded());
         assert!(!cp.netns_mgr.is_created());
     }
@@ -1997,7 +2351,7 @@ mod tests {
         assert_eq!(config.route_table, 2023);
         assert_eq!(config.fwmark_proxy, 0x8000000);
         assert_eq!(config.fwmark_bypass, 0x04000000);
-        assert_eq!(config.fwmark_mask, 0x0f000000);
+        assert_eq!(config.fwmark_mask, 0x08000000);
         assert_eq!(config.proxy_addr, "127.0.0.1:1080");
         assert_eq!(config.proxy_dial_timeout_ms, 5000);
     }

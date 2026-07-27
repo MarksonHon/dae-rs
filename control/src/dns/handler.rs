@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -5,10 +6,24 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// Helper: extract the UdpSocket's local addr so we can create new sockets per query
-fn udp_local_addr(socket: &UdpSocket) -> SocketAddr {
-    socket.local_addr().unwrap_or(([0, 0, 0, 0], 0).into())
-}
+// ============================================================================
+// Linux socket option constants for IP_TRANSPARENT
+// ============================================================================
+
+/// `IP_TRANSPARENT` socket option value (Linux).
+/// Allows a socket to bind to a non-local address and send responses with a
+/// source address that does not belong to the local machine.
+/// Requires `CAP_NET_ADMIN` capability.
+const IP_TRANSPARENT: libc::c_int = 19;
+
+/// `IPV6_TRANSPARENT` socket option value (Linux).
+/// IPv6 variant of IP_TRANSPARENT.
+const IPV6_TRANSPARENT: libc::c_int = 75;
+
+/// `SO_MARK` socket option value (Linux).
+/// Used to mark dae-rs's own traffic so the eBPF program recognizes it as
+/// control plane traffic and lets it pass without proxy interception.
+const SO_MARK: libc::c_int = 36;
 
 use crate::config::DnsConfig;
 use crate::dns::cache::DnsCache;
@@ -55,9 +70,14 @@ impl DnsListener {
         }
     }
 
-    /// Start UDP and TCP DNS listeners
+    /// Start UDP and TCP DNS listeners.
+    ///
+    /// Binds with SO_REUSEADDR to handle rapid restart without TIME_WAIT conflicts.
+    /// Also creates an additional listener on 169.254.0.1:port for cross-namespace
+    /// DNS forwarding from the TProxy (which runs in the proxy namespace daens).
     pub async fn start(&mut self) -> anyhow::Result<()> {
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let start = std::time::Instant::now();
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         self.shutdown_tx = Some(shutdown_tx);
 
         let bind = self.bind_addr;
@@ -66,10 +86,13 @@ impl DnsListener {
         let cache = self.cache.clone();
         let router = Arc::new(self.router.clone());
 
-        // UDP listener
-        let udp_socket = UdpSocket::bind(bind)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to bind DNS UDP listener on {}: {}", bind, e))?;
+        debug!(bind = %bind, "DNS listener starting");
+
+        // UDP listener: bind with SO_REUSEADDR so rapid restart works
+        let udp_socket = bind_udp_with_reuseaddr(bind).await.map_err(|e| {
+            anyhow::anyhow!("failed to bind DNS UDP listener on {}: {}", bind, e)
+        })?;
+        debug!("DNS UDP listener bound to {}", bind);
         let u_config = config.clone();
         let u_pools = upstream_pools.clone();
         let u_cache = cache.clone();
@@ -79,28 +102,68 @@ impl DnsListener {
         });
         self.udp_handle = Some(udp_handle);
 
-        // TCP listener
-        let tcp_listener = TcpListener::bind(bind)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to bind DNS TCP listener on {}: {}", bind, e))?;
+        // TCP listener: bind with SO_REUSEADDR
+        let tcp_listener = bind_tcp_with_reuseaddr(bind).await.map_err(|e| {
+            anyhow::anyhow!("failed to bind DNS TCP listener on {}: {}", bind, e)
+        })?;
         let tcp_handle = tokio::spawn(async move {
             run_tcp_listener(tcp_listener, config, upstream_pools, cache, router).await;
         });
         self.tcp_handle = Some(tcp_handle);
 
+        debug!(
+            "DNS listener started on {} ({}ms)",
+            bind,
+            start.elapsed().as_millis()
+        );
         info!("DNS listener started on {} (UDP + TCP)", bind);
+
+        // Create an additional UDP listener on 169.254.0.1:port for cross-namespace
+        // DNS forwarding. The TProxy runs in the proxy NS (daens) and forwards DNS
+        // queries intercepted by eBPF to this address instead of going through SOCKS5.
+        // 169.254.0.1 is assigned to the host's dae0 interface, reachable from daens
+        // via the veth pair.
+        let internal_addr: SocketAddr = format!("169.254.0.1:{}", bind.port())
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid internal DNS address: {}", e))?;
+        debug!("DNS internal listener address: {}", internal_addr);
+        match bind_udp_with_reuseaddr(internal_addr).await {
+            Ok(internal_socket) => {
+                let i_config = Arc::new(self.config.clone());
+                let i_pools = self.upstream_pools.clone();
+                let i_cache = self.cache.clone();
+                let i_router = Arc::new(self.router.clone());
+                tokio::spawn(async move {
+                    run_udp_listener(internal_socket, i_config, i_pools, i_cache, i_router).await;
+                });
+                info!(
+                    "DNS internal listener started on {} for cross-namespace forwarding",
+                    internal_addr
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to bind DNS internal listener on {}: {} (cross-namespace DNS may not work)",
+                    internal_addr, e
+                );
+            }
+        }
+
         Ok(())
     }
 
-    /// Stop the DNS listener
+    /// Stop the DNS listener.
+    ///
+    /// Uses abort() instead of cooperative cancellation because the listener
+    /// tasks run infinite recv/accept loops and never check for shutdown signals.
+    /// Abort is safe: tokio tasks are cancel-safe at await points.
     pub async fn stop(&mut self) -> anyhow::Result<()> {
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
         if let Some(handle) = self.udp_handle.take() {
+            handle.abort();
             let _ = handle.await;
         }
         if let Some(handle) = self.tcp_handle.take() {
+            handle.abort();
             let _ = handle.await;
         }
         info!("DNS listener stopped");
@@ -109,6 +172,11 @@ impl DnsListener {
 }
 
 /// Run the UDP DNS listener
+///
+/// Receives incoming DNS queries and spawns a task per query.
+/// The response socket with IP_TRANSPARENT is created inside [`handle_dns_query`]
+/// after determining the upstream DNS server address, so the response appears
+/// to originate from the upstream DNS server rather than the local listener.
 async fn run_udp_listener(
     socket: UdpSocket,
     config: Arc<DnsConfig>,
@@ -116,7 +184,6 @@ async fn run_udp_listener(
     cache: Arc<RwLock<DnsCache>>,
     router: Arc<DnsRouter>,
 ) {
-    let local_addr = udp_local_addr(&socket);
     let mut buf = vec![0u8; 4096];
     loop {
         let result = socket.recv_from(&mut buf).await;
@@ -134,21 +201,17 @@ async fn run_udp_listener(
         let router = router.clone();
 
         tokio::spawn(async move {
-            // Create a new socket for each query response
-            if let Ok(resp_socket) = UdpSocket::bind(local_addr).await {
-                if let Err(e) = handle_dns_query(
-                    &resp_socket,
-                    src,
-                    &request,
-                    &config,
-                    &upstream_pools,
-                    &cache,
-                    &router,
-                )
-                .await
-                {
-                    debug!("DNS query handling failed: {}", e);
-                }
+            if let Err(e) = handle_dns_query(
+                src,
+                &request,
+                &config,
+                &upstream_pools,
+                &cache,
+                &router,
+            )
+            .await
+            {
+                debug!("DNS query handling failed: {}", e);
             }
         });
     }
@@ -177,7 +240,7 @@ async fn run_tcp_listener(
         let router = router.clone();
 
         tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::AsyncReadExt;
 
             let mut stream = stream;
 
@@ -199,7 +262,7 @@ async fn run_tcp_listener(
                 return;
             }
 
-            if let Ok(response) =
+            if let Ok((response, _upstream_addr)) =
                 handle_dns_internal(&request, &config, &upstream_pools, &cache, &router).await
             {
                 // Write response with length prefix
@@ -216,8 +279,16 @@ async fn run_tcp_listener(
 }
 
 /// Handle a single DNS query (from UDP)
+///
+/// Processes the query via [`handle_dns_internal`], then creates an
+/// `IP_TRANSPARENT` UDP socket bound to the upstream DNS server's address
+/// to send the response. This ensures the response's source address matches
+/// the upstream DNS server that the client originally queried, rather than
+/// the local DNS listener address (e.g. 169.254.0.1:5353).
+///
+/// For cached responses (where no upstream address is available), a regular
+/// marked socket bound to an ephemeral port is used as fallback.
 async fn handle_dns_query(
-    socket: &UdpSocket,
     src: SocketAddr,
     request: &[u8],
     config: &Arc<DnsConfig>,
@@ -225,19 +296,46 @@ async fn handle_dns_query(
     cache: &Arc<RwLock<DnsCache>>,
     router: &Arc<DnsRouter>,
 ) -> anyhow::Result<()> {
-    let response = handle_dns_internal(request, config, upstream_pools, cache, router).await?;
-    socket.send_to(&response, src).await?;
+    let (response, upstream_addr) =
+        handle_dns_internal(request, config, upstream_pools, cache, router).await?;
+
+    // Determine the bind address for the response socket:
+    // - Upstream query result: bind to the upstream DNS server address with IP_TRANSPARENT
+    //   so the response appears to come from the DNS server the client queried.
+    // - Cache hit (None): bind to ephemeral port as fallback.
+    let bind_addr = upstream_addr.unwrap_or_else(|| {
+        // Fallback: ephemeral address (0.0.0.0:0). The kernel assigns a local
+        // source address. This is the same behavior as before IP_TRANSPARENT support.
+        ([0u8; 4], 0u16).into()
+    });
+
+    let resp_socket = create_marked_udp_socket_for_dns(bind_addr, 0x100).await
+        .ok_or_else(|| anyhow::anyhow!(
+            "failed to create IP_TRANSPARENT socket for DNS response (bind={})",
+            bind_addr
+        ))?;
+
+    resp_socket.send_to(&response, src).await?;
     Ok(())
 }
 
 /// Internal DNS query processing
+///
+/// Returns the DNS response bytes along with the upstream server address used
+/// (if any). The upstream address is needed by [`handle_dns_query`] to create
+/// an `IP_TRANSPARENT` socket so the response appears to come from the correct
+/// upstream DNS server.
+///
+/// Returns `None` for the upstream address when the response came from cache
+/// (no upstream was contacted), in which case the caller should use a fallback
+/// source address.
 async fn handle_dns_internal(
     request: &[u8],
-    config: &Arc<DnsConfig>,
+    #[allow(unused)] config: &Arc<DnsConfig>,
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
     cache: &Arc<RwLock<DnsCache>>,
-    router: &Arc<DnsRouter>,
-) -> anyhow::Result<Vec<u8>> {
+    #[allow(unused)] router: &Arc<DnsRouter>,
+) -> anyhow::Result<(Vec<u8>, Option<SocketAddr>)> {
     // Parse query name and type
     let (qname, qtype) = parse_dns_question(request);
 
@@ -247,7 +345,7 @@ async fn handle_dns_internal(
         let cache_guard = cache.read().await;
         if let Some(cached) = cache_guard.lookup(cache_key) {
             debug!("DNS cache hit: {} type={}", qname, qtype);
-            return Ok(cached.to_vec());
+            return Ok((cached.to_vec(), None));
         }
     }
 
@@ -255,7 +353,7 @@ async fn handle_dns_internal(
     let route = router.match_query(&qname, qtype);
     if route.upstream_label.is_empty() {
         // No upstream found — return empty response
-        return Ok(build_empty_response(request));
+        return Ok((build_empty_response(request), None));
     }
 
     // Look up upstream pool
@@ -269,11 +367,13 @@ async fn handle_dns_internal(
                 Some(p) => p,
                 None => {
                     warn!("DNS upstream not found: {}", pool_key);
-                    return Ok(build_empty_response(request));
+                    return Ok((build_empty_response(request), None));
                 }
             }
         }
     };
+
+    let upstream_addr = pool.address();
 
     // Forward query to upstream
     let response = pool.query(request).await?;
@@ -287,23 +387,24 @@ async fn handle_dns_internal(
             let ttl = extract_min_ttl(&response);
             let mut cache_guard = cache.write().await;
             cache_guard.insert(cache_key, response.clone(), ttl);
-            Ok(response)
+            Ok((response, Some(upstream_addr)))
         }
-        DnsResponseAction::Reject => Ok(build_empty_response(request)),
+        DnsResponseAction::Reject => Ok((build_empty_response(request), Some(upstream_addr))),
         DnsResponseAction::Requery(new_upstream) => {
             let new_pool_key = format!("{}__{}", route.group.name, new_upstream);
             if let Some(new_pool) = upstream_pools.get(&new_pool_key) {
+                let new_upstream_addr = new_pool.address();
                 let response = new_pool.query(request).await?;
                 let ttl = extract_min_ttl(&response);
                 let mut cache_guard = cache.write().await;
                 cache_guard.insert(cache_key, response.clone(), ttl);
-                Ok(response)
+                Ok((response, Some(new_upstream_addr)))
             } else {
                 // Fallback: accept original response
                 let ttl = extract_min_ttl(&response);
                 let mut cache_guard = cache.write().await;
                 cache_guard.insert(cache_key, response.clone(), ttl);
-                Ok(response)
+                Ok((response, Some(upstream_addr)))
             }
         }
     }
@@ -313,7 +414,7 @@ async fn handle_dns_internal(
 fn check_dns_response(
     response: &[u8],
     group: &crate::config::DnsGroupConfig,
-    router: &Arc<DnsRouter>,
+    #[allow(unused)] router: &Arc<DnsRouter>,
 ) -> DnsResponseAction {
     let routing = match &group.response_routing {
         Some(r) => r,
@@ -537,4 +638,192 @@ fn build_empty_response(query: &[u8]) -> Vec<u8> {
         resp.extend_from_slice(&query[12..]);
     }
     resp
+}
+
+/// Bind a UDP socket to `addr` with SO_REUSEADDR set before bind.
+/// This avoids EADDRINUSE errors during rapid restart or when the port
+/// is in TIME_WAIT state.
+async fn bind_udp_with_reuseaddr(addr: SocketAddr) -> anyhow::Result<tokio::net::UdpSocket> {
+    use std::os::unix::io::FromRawFd;
+
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(anyhow::anyhow!("socket() failed: {}", std::io::Error::last_os_error()));
+    }
+
+    let one: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+
+    let sockaddr = sockaddr_from_addr(addr);
+    let ret = unsafe { libc::bind(fd, sockaddr.0, sockaddr.1) };
+    if ret != 0 {
+        unsafe { libc::close(fd) };
+        return Err(anyhow::anyhow!("bind({}) failed: {}", addr, std::io::Error::last_os_error()));
+    }
+
+    let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+    tokio::net::UdpSocket::from_std(std_socket)
+        .map_err(|e| anyhow::anyhow!("from_std failed: {}", e))
+}
+
+/// Bind a TCP listener to `addr` with SO_REUSEADDR set before bind.
+async fn bind_tcp_with_reuseaddr(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .context("Failed to create TCP socket")?;
+    socket.set_reuse_address(true)?;
+    let sock_addr = socket2::SockAddr::from(addr);
+    socket.bind(&sock_addr)?;
+    socket.listen(128)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    std_listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| anyhow::anyhow!("from_std failed: {}", e))
+}
+
+/// Convert a SocketAddr to a raw libc sockaddr pointer + len tuple.
+fn sockaddr_from_addr(addr: SocketAddr) -> (*const libc::sockaddr, libc::socklen_t) {
+    if addr.is_ipv6() {
+        let (ip, port) = match addr {
+            SocketAddr::V6(v6) => (*v6.ip(), v6.port()),
+            _ => unreachable!(),
+        };
+        let mut a: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        a.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+        a.sin6_port = port.to_be();
+        a.sin6_addr = unsafe { std::mem::transmute(ip.octets()) };
+        let len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+        (unsafe { std::mem::transmute::<_, *const libc::sockaddr>(&a) }, len)
+    } else {
+        let (ip, port) = match addr {
+            SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
+            _ => unreachable!(),
+        };
+        let mut a: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        a.sin_family = libc::AF_INET as libc::sa_family_t;
+        a.sin_port = port.to_be();
+        a.sin_addr = libc::in_addr { s_addr: u32::from(ip).to_be() };
+        let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        (unsafe { std::mem::transmute::<_, *const libc::sockaddr>(&a) }, len)
+    }
+}
+
+/// Create a UDP socket with IP_TRANSPARENT, SO_REUSEADDR, and SO_MARK, bound to
+/// `orig_dst` — the address the client expects the response to come from.
+///
+/// # Why IP_TRANSPARENT
+///
+/// DNS clients expect the response source address to match the DNS server they
+/// queried (e.g. 8.8.8.8:53). However, the dae-rs DNS handler listens on a local
+/// address (e.g. 169.254.0.1:5353). Without IP_TRANSPARENT, responses would appear
+/// to come from the listener address, which clients may reject or misroute.
+///
+/// IP_TRANSPARENT allows the socket to bind to a non-local address (the upstream
+/// DNS server's IP), so the response appears to originate from the correct DNS
+/// server. This requires `CAP_NET_ADMIN` capability.
+///
+/// # Why SO_MARK
+///
+/// SO_MARK=0x100 marks the response traffic so the eBPF program identifies it
+/// as dae-rs control plane traffic and lets it pass through without proxy
+/// interception, preventing routing loops.
+///
+/// # Parameters
+///
+/// * `orig_dst` — The address to bind to. For upstream query results, this is the
+///   upstream DNS server address (e.g. 8.8.8.8:53). For cache hits, this can be
+///   an ephemeral address (0.0.0.0:0).
+/// * `mark` — The SO_MARK value to set (typically 0x100).
+///
+/// Returns `None` if socket creation or binding fails.
+async fn create_marked_udp_socket_for_dns(orig_dst: SocketAddr, mark: u32) -> Option<tokio::net::UdpSocket> {
+    use std::os::unix::io::FromRawFd;
+
+    let domain = if orig_dst.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        warn!("create_marked_udp_socket_for_dns: socket() failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+
+    let one: libc::c_int = 1;
+    let mark_val: libc::c_int = mark as libc::c_int;
+
+    unsafe {
+        // Set SO_REUSEADDR to avoid EADDRINUSE when re-binding to the same address
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        // Set SO_MARK for eBPF self-exclusion
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_MARK,
+            &mark_val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        // Set IP_TRANSPARENT / IPV6_TRANSPARENT to allow binding to non-local addresses.
+        // This MUST be set before bind().
+        if orig_dst.is_ipv6() {
+            libc::setsockopt(
+                fd,
+                libc::SOL_IPV6,
+                IPV6_TRANSPARENT,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        } else {
+            libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                IP_TRANSPARENT,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    // Bind to orig_dst. With IP_TRANSPARENT, this will succeed even if orig_dst
+    // is not a local address (e.g. an upstream DNS server IP).
+    let sockaddr = sockaddr_from_addr(orig_dst);
+    let ret = unsafe { libc::bind(fd, sockaddr.0, sockaddr.1) };
+    if ret != 0 {
+        warn!("create_marked_udp_socket_for_dns: bind({}) failed: {}", orig_dst, std::io::Error::last_os_error());
+        unsafe { libc::close(fd) };
+        return None;
+    }
+
+    let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+    match tokio::net::UdpSocket::from_std(std_socket) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!("create_marked_udp_socket_for_dns: from_std failed: {}", e);
+            None
+        }
+    }
 }

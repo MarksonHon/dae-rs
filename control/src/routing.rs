@@ -430,64 +430,29 @@ impl RulesBuilder {
         let mut all_sets = Vec::new();
 
         for rule in &program.rules {
-            let outbound_id = self.lookup_outbound_id(&rule.outbound, outbound_id_map)?;
+            let outbound_id = resolve_outbound_id(&rule.outbound, outbound_id_map)?;
 
             if rule.and_functions.is_empty() {
-                // Empty match rule → treat as fallback with the rule's outbound
-                let mut ms = MatchSet::zeroed();
-                ms.r#type = match_type::FALLBACK;
-                ms.outbound = outbound_id;
-                ms.not = 0;
-                ms.must = if rule.outbound.must { 1 } else { 0 };
-                ms.mark = rule.outbound.mark;
-                all_sets.push(ms);
+                all_sets.push(build_fallback_matchset(outbound_id, &rule.outbound));
                 continue;
             }
 
             // Process each AND-separated function in order.
-            // The outbound must be set correctly for LOGICAL_OR chaining within a function,
-            // and LOGICAL_AND between functions.
             for (i_func, func) in rule.and_functions.iter().enumerate() {
                 let parser = self
                     .parsers
                     .get(&func.name)
                     .ok_or_else(|| anyhow!("unknown function: '{}' in rule", func.name))?;
 
-                // Group params by key (for functions that support different key types)
                 let (key_to_values, key_order) = group_params_by_key(&func.raw_params);
-
                 let is_last_function = i_func == rule.and_functions.len() - 1;
 
                 for (j_match_set, key) in key_order.iter().enumerate() {
                     let values = &key_to_values[key.as_str()];
-
-                    // Determine the correct outbound for this position in the rule.
-                    // Within a function: all except the last get LOGICAL_OR.
-                    // Between functions: all except the last AND-group get LOGICAL_AND.
                     let is_last_in_function = j_match_set == key_order.len() - 1;
 
-                    let override_outbound = if !is_last_in_function {
-                        // More sub-parts in this function → use LOGICAL_OR
-                        Outbound {
-                            name: "LOGICAL_OR".to_string(),
-                            mark: rule.outbound.mark,
-                            must: rule.outbound.must,
-                        }
-                    } else if !is_last_function {
-                        // Last in function but more functions → use LOGICAL_AND
-                        Outbound {
-                            name: "LOGICAL_AND".to_string(),
-                            mark: rule.outbound.mark,
-                            must: rule.outbound.must,
-                        }
-                    } else {
-                        // Last in both → use the real outbound
-                        Outbound {
-                            name: rule.outbound.name.clone(),
-                            mark: rule.outbound.mark,
-                            must: rule.outbound.must,
-                        }
-                    };
+                    let override_outbound =
+                        compute_override_outbound(is_last_in_function, is_last_function, &rule.outbound);
 
                     debug!(
                         "apply: {}({}) key={} -> outbound={} (func={}/{}, part={}/{})",
@@ -508,26 +473,6 @@ impl RulesBuilder {
         }
 
         Ok(all_sets)
-    }
-
-    /// Convert an Outbound to an eBPF outbound ID using the outbound_id_map.
-    fn lookup_outbound_id(
-        &self,
-        outbound: &Outbound,
-        outbound_id_map: &HashMap<String, u8>,
-    ) -> Result<u8> {
-        match outbound.name.as_str() {
-            "direct" => Ok(outbound::DIRECT),
-            "block" => Ok(outbound::BLOCK),
-            "LOGICAL_OR" => Ok(outbound::LOGICAL_OR),
-            "LOGICAL_AND" => Ok(outbound::LOGICAL_AND),
-            "must" | "must_direct" => Ok(outbound::MUST_RULES),
-            "control_plane_routing" => Ok(outbound::CONTROL_PLANE_ROUTING),
-            name => outbound_id_map
-                .get(name)
-                .copied()
-                .ok_or_else(|| anyhow!("outbound '{}' not found in outbound_id_map", name)),
-        }
     }
 }
 
@@ -577,6 +522,74 @@ fn group_params_by_key(raw_params: &[String]) -> (HashMap<String, Vec<String>>, 
 }
 
 // ============================================================================
+// Shared Lowering Helpers
+// ============================================================================
+
+/// Determine the override outbound for a given position within a rule.
+///
+/// Within a function's key groups, all except the last get `LOGICAL_OR`.
+/// Between AND-separated functions, all except the last get `LOGICAL_AND`.
+/// The final entry uses the real outbound.
+fn compute_override_outbound(
+    is_last_in_function: bool,
+    is_last_function: bool,
+    rule_outbound: &Outbound,
+) -> Outbound {
+    if !is_last_in_function {
+        Outbound {
+            name: "LOGICAL_OR".to_string(),
+            mark: rule_outbound.mark,
+            must: rule_outbound.must,
+        }
+    } else if !is_last_function {
+        Outbound {
+            name: "LOGICAL_AND".to_string(),
+            mark: rule_outbound.mark,
+            must: rule_outbound.must,
+        }
+    } else {
+        Outbound {
+            name: rule_outbound.name.clone(),
+            mark: rule_outbound.mark,
+            must: rule_outbound.must,
+        }
+    }
+}
+
+/// Resolve an outbound name to its eBPF outbound ID.
+///
+/// Handles special built-in names ("direct", "block", "LOGICAL_OR", etc.)
+/// and looks up user-defined outbounds via `outbound_id_map`.
+fn resolve_outbound_id(
+    outbound: &Outbound,
+    outbound_id_map: &HashMap<String, u8>,
+) -> Result<u8> {
+    match outbound.name.as_str() {
+        "direct" => Ok(outbound::DIRECT),
+        "block" => Ok(outbound::BLOCK),
+        "LOGICAL_OR" => Ok(outbound::LOGICAL_OR),
+        "LOGICAL_AND" => Ok(outbound::LOGICAL_AND),
+        "must" | "must_direct" => Ok(outbound::MUST_RULES),
+        "control_plane_routing" => Ok(outbound::CONTROL_PLANE_ROUTING),
+        name => outbound_id_map
+            .get(name)
+            .copied()
+            .ok_or_else(|| anyhow!("outbound '{}' not found in outbound_id_map", name)),
+    }
+}
+
+/// Build a FALLBACK MatchSet entry for a rule with no match conditions.
+fn build_fallback_matchset(outbound_id: u8, rule_outbound: &Outbound) -> MatchSet {
+    let mut ms = MatchSet::zeroed();
+    ms.r#type = match_type::FALLBACK;
+    ms.outbound = outbound_id;
+    ms.not = 0;
+    ms.must = if rule_outbound.must { 1 } else { 0 };
+    ms.mark = rule_outbound.mark;
+    ms
+}
+
+// ============================================================================
 // Function Parsers
 // ============================================================================
 
@@ -597,7 +610,7 @@ pub fn parse_dip_fn(
     values: &[String],
     override_outbound: &Outbound,
 ) -> Result<Vec<MatchSet>> {
-    let cidrs = parse_cidr_values(values)?;
+    let _cidrs = parse_cidr_values(values)?;
     // cidrs are accumulated into the LPM trie during compile_rules
     // The MatchSet is written with index = 0 (the caller fixes it later)
     let mut ms = MatchSet::zeroed();
@@ -617,7 +630,7 @@ pub fn parse_sip_fn(
     values: &[String],
     override_outbound: &Outbound,
 ) -> Result<Vec<MatchSet>> {
-    let cidrs = parse_cidr_values(values)?;
+    let _cidrs = parse_cidr_values(values)?;
     let mut ms = MatchSet::zeroed();
     ms.r#type = match_type::SOURCE_IP_SET;
     ms.value.index = 0; // placeholder
@@ -777,8 +790,8 @@ pub fn parse_ipversion_fn(
 /// Parser for `domain(...)` — domain matching.
 pub fn parse_domain_fn(
     f: &Function,
-    key: &str,
-    values: &[String],
+    #[allow(unused)] key: &str,
+    #[allow(unused)] values: &[String],
     override_outbound: &Outbound,
 ) -> Result<Vec<MatchSet>> {
     // Validate domain key
@@ -881,7 +894,7 @@ pub fn parse_mac_fn(
 pub fn parse_qtype_fn(
     f: &Function,
     _key: &str,
-    values: &[String],
+    _values: &[String],
     override_outbound: &Outbound,
 ) -> Result<Vec<MatchSet>> {
     let mut ms = MatchSet::zeroed();
@@ -1075,12 +1088,14 @@ pub struct CompiledRouting {
 /// - Patterns from `domain(full:...)` → exact match
 /// - No prefix → treated as suffix (backward compat)
 ///
-/// Returns a bitmap where bit N is set if `domain` matches `domain_sets[N]`.
+/// Returns a dynamically-sized bitmap where bit N is set if `domain` matches
+/// `domain_sets[N]`. The bitmap length is `(domain_sets.len() + 31) / 32` words.
 pub fn build_domain_routing_bitmap(
     domain: &str,
     domain_sets: &[Vec<String>],
-) -> [u32; MAX_MATCH_SET_LEN / 32] {
-    let mut bitmap = [0u32; MAX_MATCH_SET_LEN / 32];
+) -> Vec<u32> {
+    let num_words = (domain_sets.len() + 31) / 32;
+    let mut bitmap = vec![0u32; num_words];
     let domain_lower = domain.to_lowercase();
 
     for (rule_idx, patterns) in domain_sets.iter().enumerate() {
@@ -1097,13 +1112,35 @@ pub fn build_domain_routing_bitmap(
                     }
                 };
                 if matched {
-                    bitmap[rule_idx / 32] |= 1 << (rule_idx % 32);
+                    let word_idx = rule_idx / 32;
+                    let bit_idx = rule_idx % 32;
+                    if word_idx >= bitmap.len() {
+                        // Safety boundary — should not happen as bitmap is sized
+                        // from domain_sets.len(), but guard against races.
+                        debug!(
+                            rule_idx,
+                            bitmap_len = bitmap.len(),
+                            "build_domain_routing_bitmap: rule_idx exceeds bitmap length, expanding"
+                        );
+                        bitmap.resize(word_idx + 1, 0);
+                    }
+                    bitmap[word_idx] |= 1 << bit_idx;
                     break;
                 }
             } else {
                 // No key prefix — treat as suffix
                 if domain_lower.ends_with(pattern) || domain_lower == *pattern {
-                    bitmap[rule_idx / 32] |= 1 << (rule_idx % 32);
+                    let word_idx = rule_idx / 32;
+                    let bit_idx = rule_idx % 32;
+                    if word_idx >= bitmap.len() {
+                        debug!(
+                            rule_idx,
+                            bitmap_len = bitmap.len(),
+                            "build_domain_routing_bitmap: rule_idx exceeds bitmap length, expanding"
+                        );
+                        bitmap.resize(word_idx + 1, 0);
+                    }
+                    bitmap[word_idx] |= 1 << bit_idx;
                     break;
                 }
             }
@@ -1125,8 +1162,8 @@ pub fn build_domain_routing_bitmap(
 /// # Pipeline
 ///
 /// 1. [`NormalizedProgram::from_config`] — parse raw rules into structured IR
-/// 2. [`RulesBuilder::apply`] — lower IR to MatchSet entries
-/// 3. LPM trie creation & domain set collection
+/// 2. LPM trie creation & domain set collection (first pass)
+/// 3. Lower IR to MatchSet entries with correct indices (second pass)
 /// 4. Proxy server auto-direct rule insertion
 /// 5. Fallback rule appending
 pub fn compile_rules(
@@ -1134,12 +1171,23 @@ pub fn compile_rules(
     outbounds: &config::OutboundsConfig,
     proxy_server_ips: &[std::net::IpAddr],
 ) -> Result<CompiledRouting> {
+    let start = std::time::Instant::now();
+    debug!(
+        n_rules = routing.rules.len(),
+        n_outbounds = outbounds.nodes.len(),
+        n_proxy_ips = proxy_server_ips.len(),
+        fallback = %routing.fallback,
+        "compile_rules: starting"
+    );
+
     // ── Step 1: Build NormalizedProgram from config ──
     let program =
         NormalizedProgram::from_config(routing).context("Failed to normalize routing rules")?;
+    debug!("Step 1: NormalizedProgram built ({} rules)", program.rules.len());
 
     // ── Step 2: Build outbound ID map ──
     let outbound_id_map = build_outbound_id_map(outbounds);
+    debug!("Step 2: outbound_id_map built ({} entries)", outbound_id_map.len());
 
     // ── Step 2.5: Prepare proxy server IP CIDRs for LPM trie ──
     // Convert each proxy server IP to a /32 (IPv4) or /128 (IPv6) CIDR entry.
@@ -1154,45 +1202,25 @@ pub fn compile_rules(
             ipnet::IpNet::new(*ip, prefix_len).ok()
         })
         .collect();
+    debug!("Step 2.5: {} proxy CIDRs prepared", proxy_cidrs.len());
 
-    // ── Step 3: Register function parsers and apply ──
-    let mut builder = RulesBuilder::new();
-
-    // Register all 14 match types (mapping to dae's consts.Function_*)
-    builder.register("dip", parse_dip_fn);
-    builder.register("ip", parse_dip_fn);
-    builder.register("sip", parse_sip_fn);
-    builder.register("source_ip", parse_sip_fn);
-    builder.register("dport", parse_dport_fn);
-    builder.register("port", parse_dport_fn);
-    builder.register("sport", parse_sport_fn);
-    builder.register("source_port", parse_sport_fn);
-    builder.register("l4proto", parse_l4proto_fn);
-    builder.register("ipversion", parse_ipversion_fn);
-    builder.register("domain", parse_domain_fn);
-    builder.register("process_name", parse_process_name_fn);
-    builder.register("pname", parse_process_name_fn);
-    builder.register("dscp", parse_dscp_fn);
-    builder.register("mac", parse_mac_fn);
-    builder.register("qtype", parse_qtype_fn);
-    builder.register("upstream", parse_upstream_fn);
-
-    // ── Step 4: Build MatchSet entries ──
-    // Walk the program one function at a time, producing MatchSet entries
-    // with correct LPM trie indices and domain set indices.
+    // ── Step 3: First pass — collect LPM trie and domain set data ──
     let mut lpm_tries: Vec<Vec<ipnet::IpNet>> = Vec::new();
     let mut lpm_dedup: HashMap<u64, usize> = HashMap::new();
     let mut dedup_count = 0usize;
     let mut domain_sets: Vec<Vec<String>> = Vec::new();
     let mut final_match_sets: Vec<MatchSet> = Vec::new();
-    let mut rule_domain_idx = 0usize;
 
-    // ── Step 4.5: Create LPM trie for proxy server IPs ──
+    // ── Step 3.5: Create LPM trie for proxy server IPs ──
     // Add proxy server IPs as a dedicated LPM trie BEFORE user rules,
     // so the auto-direct MatchSet can reference it.
     // The trie index is stored for later MatchSet creation.
     let proxy_lpm_index = if !proxy_cidrs.is_empty() {
-        Some(find_or_create_lpm_trie(&proxy_cidrs, &mut lpm_tries, &mut lpm_dedup))
+        Some(find_or_create_lpm_trie(
+            &proxy_cidrs,
+            &mut lpm_tries,
+            &mut lpm_dedup,
+        ))
     } else {
         None
     };
@@ -1202,9 +1230,9 @@ pub fn compile_rules(
         for func in &rule.and_functions {
             match func.name.as_str() {
                 "dip" | "ip" => {
-                    if let Ok(cidrs) = parse_cidr_values(&func.raw_params) {
+                    if let Ok(_cidrs) = parse_cidr_values(&func.raw_params) {
                         let old_len = lpm_tries.len();
-                        let idx = find_or_create_lpm_trie(&cidrs, &mut lpm_tries, &mut lpm_dedup);
+                        let idx = find_or_create_lpm_trie(&_cidrs, &mut lpm_tries, &mut lpm_dedup);
                         if idx < old_len {
                             dedup_count += 1;
                         }
@@ -1278,31 +1306,16 @@ pub fn compile_rules(
     }
 
     // Second pass: build final match sets with correct LPM/domain indices.
-    // We need to walk the program again to assign correct indices.
-    // Since the function parsers in RulesBuilder already generated match sets
-    // with correct NOT/MUST/MARK fields, we build new match sets here with
-    // the correct indices.
-    //
-    // Actually, a cleaner approach: rewrite the match_sets using the
-    // collected LPM/domain data.
-    let mut ms_index = 0usize;
+    // We walk the program again, using shared helpers for outbound chaining
+    // and fallback creation, then call build_match_set_for_function which
+    // handles LPM trie and domain set index assignment.
     let mut rule_domain_idx = 0usize;
 
     for rule in &program.rules {
-        let outbound_id = *outbound_id_map
-            .get(&rule.outbound.name)
-            .unwrap_or(&outbound::CONTROL_PLANE_ROUTING);
+        let outbound_id = resolve_outbound_id(&rule.outbound, &outbound_id_map)?;
 
         if rule.and_functions.is_empty() {
-            // Empty rule → fallback-like entry
-            let mut ms = MatchSet::zeroed();
-            ms.r#type = match_type::FALLBACK;
-            ms.outbound = outbound_id;
-            ms.not = 0;
-            ms.must = if rule.outbound.must { 1 } else { 0 };
-            ms.mark = rule.outbound.mark;
-            final_match_sets.push(ms);
-            ms_index += 1;
+            final_match_sets.push(build_fallback_matchset(outbound_id, &rule.outbound));
             continue;
         }
 
@@ -1317,29 +1330,10 @@ pub fn compile_rules(
                     .unwrap_or(&[]);
                 let is_last_in_function = j_match_set == key_order.len() - 1;
 
-                // Determine outbound for this position
-                let override_name = if !is_last_in_function {
-                    "LOGICAL_OR"
-                } else if !is_last_function {
-                    "LOGICAL_AND"
-                } else {
-                    &rule.outbound.name
-                };
+                let ov_outbound =
+                    compute_override_outbound(is_last_in_function, is_last_function, &rule.outbound);
+                let ov_outbound_id = resolve_outbound_id(&ov_outbound, &outbound_id_map)?;
 
-                let ov_outbound = Outbound {
-                    name: override_name.to_string(),
-                    mark: rule.outbound.mark,
-                    must: rule.outbound.must,
-                };
-                let ov_outbound_id = match override_name {
-                    "LOGICAL_OR" => outbound::LOGICAL_OR,
-                    "LOGICAL_AND" => outbound::LOGICAL_AND,
-                    _ => *outbound_id_map
-                        .get(override_name)
-                        .unwrap_or(&outbound::CONTROL_PLANE_ROUTING),
-                };
-
-                // Build match set based on function type
                 let match_sets = build_match_set_for_function(
                     func,
                     key,
@@ -1356,7 +1350,7 @@ pub fn compile_rules(
         }
     }
 
-    // ── Step 4.75: Prepend proxy server auto-direct rules ──
+    // ── Step 4: Prepend proxy server auto-direct rules ──
     // Insert `dip(<proxy_server_ip>) -> direct` at the FRONT of the match set list,
     // so they are evaluated BEFORE any user-defined rules.
     // This prevents traffic destined for proxy servers from being re-proxied,
@@ -1377,7 +1371,7 @@ pub fn compile_rules(
         );
     }
 
-    // ── Step 5: Add fallback rule (MUST be the last entry) ──
+    // ── Step 5: Append fallback rule (MUST be the last entry) ──
     let fallback_outbound = program.fallback.name.clone();
     let fallback_id = *outbound_id_map
         .get(&fallback_outbound)
@@ -1415,6 +1409,15 @@ pub fn compile_rules(
             "Compiled routing rules",
         );
     }
+
+    debug!(
+        "compile_rules completed: {}ms ({} match_sets, {} lpm_tries, {} domain_sets, fallback={})",
+        start.elapsed().as_millis(),
+        final_match_sets.len(),
+        lpm_tries.len(),
+        domain_sets.len(),
+        fallback_outbound,
+    );
 
     Ok(CompiledRouting {
         match_sets: final_match_sets,
@@ -1664,13 +1667,13 @@ impl RoutingMatcher {
 /// Build MatchSet entries for a single function invocation, assigning correct LPM/domain indices.
 fn build_match_set_for_function(
     func: &Function,
-    key: &str,
-    values: &[String],
+    #[allow(unused)] key: &str,
+    #[allow(unused)] values: &[String],
     outbound_id: u8,
     ov_outbound: &Outbound,
     lpm_tries: &mut Vec<Vec<ipnet::IpNet>>,
     lpm_dedup: &mut HashMap<u64, usize>,
-    domain_sets: &[Vec<String>],
+    #[allow(unused)] domain_sets: &[Vec<String>],
     rule_domain_idx: &mut usize,
 ) -> Result<Vec<MatchSet>> {
     let mut result = Vec::new();
@@ -1935,10 +1938,7 @@ fn build_match_set_for_function(
 /// # 返回值
 ///
 /// 返回 [`RoutingResult`]，包含最终的 outbound 选择、mark 值和 must 标志。
-pub fn choose_dial_target(
-    routing: &RoutingMatcher,
-    ctx: &RoutingParams,
-) -> RoutingResult {
+pub fn choose_dial_target(routing: &RoutingMatcher, ctx: &RoutingParams) -> RoutingResult {
     routing.match_routing(ctx)
 }
 

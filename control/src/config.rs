@@ -554,8 +554,8 @@ impl Default for NamespaceConfig {
     fn default() -> Self {
         Self {
             mode: "isolated".into(),
-            host_if: "dae0".into(),
-            peer_if: "dae0peer".into(),
+            host_if: "dae-rs-host".into(),
+            peer_if: "dae-rs-peer".into(),
             host_addr: "169.254.0.1/16".into(),
             peer_addr: "169.254.0.11/16".into(),
             mtu: 1500,
@@ -867,7 +867,7 @@ enum ParseState {
     /// Inside a specific dns group block
     DnsGroup(String),
     /// Inside dns group > upstream block
-    DnsGroupUpstream(String, String), // (group_name, last_parsed_upstream_label)
+    DnsGroupUpstream(String), // group_name
     /// Inside dns > routing block (DNS routing)
     DnsRouting,
     /// Inside dns group > request_routing block
@@ -934,11 +934,15 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
     let mut current_dns_resp_rules: Vec<DnsResponseRule> = Vec::new();
     let mut current_dns_resp_fallback = String::new();
 
-    for (line_num, raw_line) in input.lines().enumerate() {
-        let line = raw_line.trim();
+    // Preprocess: merge continuation lines (lines ending with `\`)
+    let preprocessed = preprocess_multiline(input);
+
+    for (line_num, raw_line) in preprocessed.lines().enumerate() {
+        // Strip inline comments (respecting quoted strings)
+        let line = strip_inline_comment(raw_line).trim();
         let line_number = line_num + 1; // 1-based
 
-        // Skip blank lines and comment lines
+        // Skip blank lines and full-line comment lines
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -1735,7 +1739,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
                     match section_name {
                         "upstream" => {
-                            state = ParseState::DnsGroupUpstream(group_name.clone(), String::new());
+                            state = ParseState::DnsGroupUpstream(group_name.clone());
                         }
                         "request_routing" => {
                             current_dns_route_rules.clear();
@@ -1774,7 +1778,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
             }
 
             // ── dns group > upstream ──
-            ParseState::DnsGroupUpstream(group_name, _) => {
+            ParseState::DnsGroupUpstream(group_name) => {
                 if line == "}" {
                     state = ParseState::DnsGroup(group_name.clone());
                     continue;
@@ -2029,6 +2033,72 @@ fn unquote(s: &str) -> &str {
     } else {
         s
     }
+}
+
+/// Strip inline comment from a line, respecting quoted strings.
+///
+/// Finds the first unquoted `#` character and removes it and everything after,
+/// then trims trailing whitespace from the result.
+///
+/// This is a private helper; see unit tests in the `tests` module for examples.
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_quote: Option<char> = None;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '"' | '\'' if in_quote == Some(ch) => {
+                // Closing quote
+                in_quote = None;
+            }
+            '"' | '\'' if in_quote.is_none() => {
+                // Opening quote
+                in_quote = Some(ch);
+            }
+            '#' if in_quote.is_none() => {
+                return line[..i].trim_end();
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Preprocess input to merge continuation lines (lines ending with `\`).
+///
+/// Lines ending with `\` are joined with the next line, with the trailing `\`
+/// removed. This allows long configuration values to span multiple lines.
+/// Leading whitespace on continuation lines is preserved (user controls spacing).
+/// Chained continuations are supported.
+///
+/// # Examples
+///
+/// ```text
+/// address: 127.0.0.1:\
+///   1080
+/// ```
+/// is equivalent to: `address: 127.0.0.1:  1080`
+fn preprocess_multiline(input: &str) -> String {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut result = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_end();
+
+        if trimmed.ends_with('\\') {
+            // Remove the trailing backslash and merge with the next line(s)
+            result.push_str(&trimmed[..trimmed.len() - 1]);
+            i += 1;
+        } else {
+            result.push_str(line);
+            i += 1;
+            if i < lines.len() {
+                result.push('\n');
+            }
+        }
+    }
+
+    result
 }
 
 /// Parse a hex string (e.g., `0x02000000`) to u32
@@ -2599,8 +2669,8 @@ mod tests {
 
 namespace {
   mode: isolated
-  veth_host: dae0
-  veth_peer: dae0peer
+  veth_host: dae-rs-host
+  veth_peer: dae-rs-peer
   host_addr: 169.254.0.1/16
   peer_addr: 169.254.0.11/16
   mtu: 1500
@@ -2685,8 +2755,8 @@ api {
         // namespace
         let ns = config.namespace.as_ref().expect("namespace should exist");
         assert_eq!(ns.mode, "isolated");
-        assert_eq!(ns.host_if, "dae0");
-        assert_eq!(ns.peer_if, "dae0peer");
+        assert_eq!(ns.host_if, "dae-rs-host");
+        assert_eq!(ns.peer_if, "dae-rs-peer");
         assert_eq!(ns.host_addr, "169.254.0.1/16");
         assert_eq!(ns.peer_addr, "169.254.0.11/16");
         assert_eq!(ns.mtu, 1500);
@@ -3433,5 +3503,242 @@ api {
         let config = parse_daefile(input).expect("parse failed");
         // API disabled, so empty token should be fine
         validate_config(&config).expect("validation should pass (API disabled)");
+    }
+
+    // ── Inline Comment Tests ──
+
+    #[test]
+    fn test_strip_inline_comment_basic() {
+        assert_eq!(strip_inline_comment("key: value # comment"), "key: value");
+        assert_eq!(strip_inline_comment("key: value  # comment"), "key: value");
+        assert_eq!(strip_inline_comment("# full comment"), "");
+        assert_eq!(strip_inline_comment("key: value"), "key: value");
+    }
+
+    #[test]
+    fn test_strip_inline_comment_in_quotes() {
+        // # inside double quotes should NOT be treated as a comment
+        assert_eq!(
+            strip_inline_comment("key: \"hello # world\" # comment"),
+            "key: \"hello # world\""
+        );
+        // # inside single quotes should NOT be treated as a comment
+        assert_eq!(
+            strip_inline_comment("key: 'hello # world' # comment"),
+            "key: 'hello # world'"
+        );
+        // No comment at all
+        assert_eq!(
+            strip_inline_comment("key: \"hello # world\""),
+            "key: \"hello # world\""
+        );
+    }
+
+    #[test]
+    fn test_strip_inline_comment_unclosed_quote() {
+        // Unclosed quote — # is still treated as inside the quote
+        assert_eq!(
+            strip_inline_comment("key: \"hello # world"),
+            "key: \"hello # world"
+        );
+    }
+
+    #[test]
+    fn test_inline_comment_in_config() {
+        let input = r#"global {
+  tproxy_port: 15080 # main listen port
+  log_level: info    # debug level
+}
+
+outbounds {
+  nodes {
+    main {
+      protocol: socks5
+      address: 127.0.0.1:1080 # local proxy
+    }
+  }
+
+  groups {
+    g {
+      policy: fixed
+      nodes(main)
+    }
+  }
+}
+
+routing {
+  fallback: proxy(g) # default route
+}
+"#;
+        let config = parse_daefile(input).expect("inline comment config parse failed");
+        assert_eq!(config.runtime.tproxy_port, 15080);
+        assert_eq!(config.runtime.log_level, "info");
+        assert_eq!(config.outbounds.nodes[0].address, "127.0.0.1:1080");
+        assert_eq!(config.routing.fallback, "proxy(g)");
+    }
+
+    #[test]
+    fn test_inline_comment_with_quotes_in_config() {
+        let input = r#"global {
+  tproxy_port: 15080
+  log_level: info
+}
+
+outbounds {
+  nodes {
+    main {
+      protocol: socks5
+      address: 127.0.0.1:1080
+    }
+  }
+
+  groups {
+    g {
+      policy: fixed
+      nodes(main)
+    }
+  }
+}
+
+routing {
+  fallback: proxy(g)
+}
+
+api {
+  enabled: true
+  listen: 127.0.0.1:9090
+  token: 'secret#token' # this is the token
+}
+"#;
+        let config = parse_daefile(input).expect("quote+comment config parse failed");
+        let api = config.api.as_ref().expect("api should exist");
+        // The # inside quotes should be preserved
+        assert_eq!(api.token, "secret#token");
+    }
+
+    // ── Multiline (continuation) Tests ──
+
+    #[test]
+    fn test_preprocess_multiline_basic() {
+        // "line1 \\\n  line2" → after removing `\` and newline: "line1   line2"
+        let input = "line1 \\\n  line2";
+        assert_eq!(preprocess_multiline(input), "line1   line2");
+    }
+
+    #[test]
+    fn test_preprocess_multiline_no_continuation() {
+        let input = "line1\nline2";
+        assert_eq!(preprocess_multiline(input), "line1\nline2");
+    }
+
+    #[test]
+    fn test_preprocess_multiline_chained() {
+        // All three lines joined: "line1   line2   line3"
+        let input = "line1 \\\n  line2 \\\n  line3";
+        assert_eq!(preprocess_multiline(input), "line1   line2   line3");
+    }
+
+    #[test]
+    fn test_multiline_in_config() {
+        // Demonstrate multiline value continuation for a long address field
+        let input = r#"global {
+  tproxy_port: 15080
+  log_level: info
+}
+
+outbounds {
+  nodes {
+    main {
+      protocol: socks5
+      address: 127.0.0.1:\
+        1080
+    }
+  }
+
+  groups {
+    g {
+      policy: fixed
+      nodes(main)
+    }
+  }
+}
+
+routing {
+  fallback: proxy(g)
+}
+"#;
+        let config = parse_daefile(input).expect("multiline config parse failed");
+        assert_eq!(config.outbounds.nodes[0].protocol, "socks5");
+        // After continuation: "127.0.0.1:        1080" — address value is joined
+        assert_eq!(config.outbounds.nodes[0].address, "127.0.0.1:        1080");
+    }
+
+    #[test]
+    fn test_multiline_chained_in_config() {
+        // Demonstrate chained multiline continuation
+        let input = r#"global {
+  tproxy_port: 15080
+  log_level: info
+}
+
+outbounds {
+  nodes {
+    main {
+      protocol: socks5
+      address: http://very-long-\
+        url.example.com:\
+        8080/proxy
+    }
+  }
+
+  groups {
+    g {
+      policy: fixed
+      nodes(main)
+    }
+  }
+}
+
+routing {
+  fallback: proxy(g)
+}
+"#;
+        let config = parse_daefile(input).expect("chained multiline config parse failed");
+        assert_eq!(config.outbounds.nodes[0].address, "http://very-long-        url.example.com:        8080/proxy");
+    }
+
+    #[test]
+    fn test_combined_multiline_and_comment() {
+        let input = r#"global {
+  tproxy_port: 15080 \
+  log_level: info  # both multiline and comment
+}
+
+outbounds {
+  nodes {
+    main {
+      protocol: socks5
+      address: 127.0.0.1:1080
+    }
+  }
+
+  groups {
+    g {
+      policy: fixed
+      nodes(main)
+    }
+  }
+}
+
+routing {
+  fallback: proxy(g)
+}
+"#;
+        // The multiline joins "15080" and "log_level: info  # comment"
+        // After joining: "15080 log_level: info  # comment"
+        // Comment stripping happens after multiline, so: "15080 log_level: info"
+        // This should fail to parse because "15080 log_level..." is not a valid global key-value pair
+        let result = parse_daefile(input);
+        assert!(result.is_err(), "should fail because multiline merges two separate fields");
     }
 }

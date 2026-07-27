@@ -10,17 +10,17 @@
 //!
 //! This mirrors dae's `control/domain_routing_tracker.go`.
 
-use crate::ebpf::{EbpfManager, MAX_MATCH_SET_LEN};
+use crate::ebpf::EbpfManager;
 use crate::routing::build_domain_routing_bitmap;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// A single domain→IP mapping with expiry.
+#[allow(dead_code)]
 struct DomainIpMapping {
     ip: IpAddr,
     domain: String,
@@ -65,6 +65,11 @@ impl DomainRoutingTracker {
         let key = ip.to_string();
         let domain_lower = domain.to_lowercase();
 
+        debug!(
+            "DomainRouting: processing {} -> {} (ttl={}s)",
+            domain, ip, ttl_secs
+        );
+
         // Compute the routing bitmap for this domain
         let bitmap = build_domain_routing_bitmap(&domain_lower, &self.domain_sets);
 
@@ -91,7 +96,7 @@ impl DomainRoutingTracker {
 
         // Write to eBPF domain_routing_map
         let ip_bytes = ip_to_16_bytes(ip);
-        ebpf.write_domain_routing_map(&[(ip_bytes, bitmap)])?;
+        ebpf.write_domain_routing_map(&[(ip_bytes, bitmap.clone())])?;
 
         info!(
             "DomainRouting: {} -> {} (ttl={}s, bitmap={:08x?})",
@@ -180,7 +185,10 @@ mod tests {
         );
 
         let bitmap = build_domain_routing_bitmap("unknown.com", &domain_sets);
-        assert_eq!(bitmap, [0u32; 32], "no bits should be set for unknown.com");
+        assert!(
+            bitmap.iter().all(|&w| w == 0),
+            "no bits should be set for unknown.com"
+        );
     }
 
     #[test]

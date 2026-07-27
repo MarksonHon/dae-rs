@@ -3,6 +3,12 @@ global {
   log_level: info
 }
 
+mark {
+  proxy: 0x8000000
+  bypass: 0x04000000
+  mask: 0x0f000000
+}
+
 interface {
   wan_interface: wlp3s0
   # lan_interface: eth1 docker0

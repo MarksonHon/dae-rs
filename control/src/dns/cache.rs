@@ -1,6 +1,6 @@
+use crate::config::DnsCacheConfig;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use crate::config::DnsCacheConfig;
 
 /// A cached DNS response
 struct CachedResponse {
@@ -8,7 +8,8 @@ struct CachedResponse {
     raw_response: Vec<u8>,
     /// When this entry was created
     created_at: Instant,
-    /// Original TTL from response
+    /// Original TTL from response (retained for future use)
+    #[allow(dead_code)]
     original_ttl: u32,
     /// Effective deadline (after min/max TTL clamping)
     deadline: Instant,
@@ -52,8 +53,8 @@ impl DnsCache {
             Some(&entry.raw_response)
         } else if self.config.optimistic_cache && entry.stale {
             // Stale entry but optimistic cache enabled
-            let stale_deadline = entry.deadline
-                + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
+            let stale_deadline =
+                entry.deadline + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
             if now < stale_deadline {
                 Some(&entry.raw_response)
             } else {
@@ -71,14 +72,14 @@ impl DnsCache {
         }
 
         // Clamp TTL
-        let ttl = ttl_secs
-            .max(self.config.min_ttl)
-            .min(self.config.max_ttl);
+        let ttl = ttl_secs.max(self.config.min_ttl).min(self.config.max_ttl);
 
         // Evict if at capacity
         if self.entries.len() >= self.config.max_size as usize {
             // Simple: remove the oldest entry
-            if let Some(oldest_key) = self.entries.iter()
+            if let Some(oldest_key) = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.created_at)
                 .map(|(k, _)| *k)
             {
@@ -86,13 +87,16 @@ impl DnsCache {
             }
         }
 
-        self.entries.insert(key, CachedResponse {
-            raw_response: response,
-            created_at: Instant::now(),
-            original_ttl: ttl_secs,
-            deadline: Instant::now() + Duration::from_secs(ttl as u64),
-            stale: false,
-        });
+        self.entries.insert(
+            key,
+            CachedResponse {
+                raw_response: response,
+                created_at: Instant::now(),
+                original_ttl: ttl_secs,
+                deadline: Instant::now() + Duration::from_secs(ttl as u64),
+                stale: false,
+            },
+        );
     }
 
     /// Mark an entry as stale (for optimistic cache refresh)
@@ -108,8 +112,8 @@ impl DnsCache {
         self.entries.retain(|_, entry| {
             if self.config.optimistic_cache {
                 // Keep stale entries within the optimistic window
-                let stale_deadline = entry.deadline
-                    + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
+                let stale_deadline =
+                    entry.deadline + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
                 now < stale_deadline
             } else {
                 now < entry.deadline

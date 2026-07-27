@@ -10,12 +10,12 @@ use anyhow::{Context, Result};
 use bytemuck::{self, Zeroable};
 use libbpf_rs::{MapCore, MapFlags, ProgramType};
 use libbpf_rs::{Object, ObjectBuilder, TcHook, TC_EGRESS, TC_INGRESS};
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::os::unix::io::AsFd;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
@@ -44,6 +44,8 @@ pub const DEFAULT_EBPF_PATH: &str = "/etc/dae-rs/ebpf.o";
 pub const ROUTING_MAP_MAX: u32 = 1024;
 pub const STATS_MAP_SIZE: u32 = 2;
 pub const MAX_MATCH_SET_LEN: usize = 32 * 32; // 1024, must match tproxy.c
+/// Max entries per inner LPM trie (must match tproxy.c MAX_LPM_SIZE)
+pub const MAX_LPM_SIZE: u32 = 2_048_000;
 
 /// eBPF 文件系统 pinning 路径
 pub const BPFFS_PATH: &str = "/sys/fs/bpf/dae";
@@ -232,6 +234,32 @@ impl ConnState {
     }
 }
 
+// ---- tproxy.c: struct routing_result ----
+/// Size: 36 bytes (aligned to 4). Explicit tail padding for bytemuck::Pod.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RoutingResult {
+    pub mark: u32,
+    pub must: u8,
+    pub mac: [u8; 6],
+    pub outbound: u8,
+    pub pname: [u8; 16],
+    pub pid: u32,
+    pub dscp: u8,
+    pub _pad: [u8; 3],
+}
+
+// ---- tproxy.c: struct routing_handoff_entry ----
+/// Size: 48 bytes (aligned to 8).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RoutingHandoffEntry {
+    pub last_seen_ns: u64,
+    pub result: RoutingResult,
+    pub _pad: [u8; 4],
+}
+
+
 // ---- tproxy.c: struct pid_pname ----
 /// Size: 32 bytes (aligned to 8). Explicit tail padding for bytemuck::Pod.
 #[repr(C)]
@@ -354,28 +382,37 @@ pub struct Daeevent {
 
 /// 确保 bpffs 已挂载到 /sys/fs/bpf。
 /// 如果未挂载则尝试挂载。
+/// bpffs mount 相关的静态 CString（避免重复创建）
+static BPFFS_SOURCE: LazyLock<CString> = LazyLock::new(|| CString::new("bpffs").unwrap());
+static BPFFS_TARGET: LazyLock<CString> =
+    LazyLock::new(|| CString::new("/sys/fs/bpf").unwrap());
+static BPFFS_FSTYPE: LazyLock<CString> = LazyLock::new(|| CString::new("bpf").unwrap());
+
 fn ensure_bpffs_mounted() -> std::io::Result<()> {
     let bpffs_path = std::path::Path::new("/sys/fs/bpf");
     if !bpffs_path.exists() {
         std::fs::create_dir_all(bpffs_path)?;
     }
-    // 检查是否已挂载
+    // 检查是否已挂载（精确匹配挂载点，避免误匹配 /sys/fs/bpf_extra 等路径）
     let mounts = std::fs::read_to_string("/proc/mounts")?;
-    if mounts.lines().any(|line| line.contains("/sys/fs/bpf")) {
+    let already_mounted = mounts.lines().any(|line| {
+        line.split_whitespace().nth(1) == Some("/sys/fs/bpf")
+    });
+    if already_mounted {
         return Ok(());
     }
-    // 挂载 bpffs
-    unsafe {
-        let ret = libc::mount(
-            std::ffi::CString::new("bpffs").unwrap().as_ptr(),
-            std::ffi::CString::new("/sys/fs/bpf").unwrap().as_ptr(),
-            std::ffi::CString::new("bpf").unwrap().as_ptr(),
+    // 挂载 bpffs（使用缓存的 CString）
+    let ret = unsafe {
+        libc::mount(
+            BPFFS_SOURCE.as_ptr(),
+            BPFFS_TARGET.as_ptr(),
+            BPFFS_FSTYPE.as_ptr(),
             0,
             std::ptr::null(),
-        );
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -460,18 +497,15 @@ fn kernel_version() -> Option<(u32, u32)> {
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_default()
     });
-    let release = release.trim().to_string();
+    let release = release.trim();
     let parts: Vec<&str> = release.splitn(3, '.').collect();
     if parts.len() < 2 {
         return None;
     }
     let major: u32 = parts[0].parse().ok()?;
-    let minor: u32 = parts[1]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()?;
+    // 只取数字部分解析 minor 版本（避免 "8-generic" 等后缀干扰）
+    let minor_str: String = parts[1].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let minor: u32 = minor_str.parse().ok()?;
     Some((major, minor))
 }
 
@@ -552,7 +586,10 @@ pub struct EbpfManager {
     conn_state_map_max_entries: u32,
 }
 
-// Safety: EbpfManager is only accessed through RwLock<ControlPlane>
+// Safety: EbpfManager is only ever accessed through `Arc<Mutex<EbpfManager>>`.
+// The caller MUST hold the Mutex lock before calling any mutating method.
+// Direct access to the underlying Object (e.g. via pinned_maps_exist or
+// other static helpers) does not touch Object internals and is thread-safe.
 unsafe impl Sync for EbpfManager {}
 unsafe impl Send for EbpfManager {}
 
@@ -619,9 +656,10 @@ impl EbpfManager {
     /// - conn_state_map: 设置可配置的 max_entries
     fn adjust_maps_pre_load(&self, open_obj: &mut libbpf_rs::OpenObject) {
         // fast_sock: 设置 max_entries=1 以禁用 sockhash 路径
-        if let Some(mut map) = open_obj.maps_mut().find(|m| {
-            m.name().to_str().unwrap_or("") == "fast_sock"
-        }) {
+        if let Some(mut map) = open_obj
+            .maps_mut()
+            .find(|m| m.name().to_str().unwrap_or("") == "fast_sock")
+        {
             if let Err(e) = map.set_max_entries(1) {
                 warn!("Failed to set fast_sock max_entries=1: {}", e);
             } else {
@@ -632,9 +670,10 @@ impl EbpfManager {
         }
 
         // conn_state_map: 使用可配置的 max_entries
-        if let Some(mut map) = open_obj.maps_mut().find(|m| {
-            m.name().to_str().unwrap_or("") == "conn_state_map"
-        }) {
+        if let Some(mut map) = open_obj
+            .maps_mut()
+            .find(|m| m.name().to_str().unwrap_or("") == "conn_state_map")
+        {
             if let Err(e) = map.set_max_entries(self.conn_state_map_max_entries) {
                 warn!(
                     "Failed to set conn_state_map max_entries={}: {}",
@@ -771,16 +810,18 @@ impl EbpfManager {
                     );
                 }
             } else {
-                // No initial value buffer; use set_initial_value with full patched content
-                let value_size = 1024; // reasonable default for rodata
+                // No initial value buffer; fall back to constructing a fresh .rodata
+                // buffer. Use 4 KiB (covers typical kernel rodata sections). Param
+                // is only ~40 bytes, so this is more than sufficient.
+                let value_size = 4096;
                 let mut full_value = vec![0u8; value_size];
-                full_value[..param_bytes.len().min(value_size)].copy_from_slice(
-                    &param_bytes[..param_bytes.len().min(value_size)],
-                );
+                let copy_len = std::cmp::min(param_bytes.len(), value_size);
+                full_value[..copy_len].copy_from_slice(&param_bytes[..copy_len]);
                 map.set_initial_value(&full_value)?;
                 info!(
-                    "PARAM written to .rodata via set_initial_value ({} bytes)",
-                    param_bytes.len()
+                    "PARAM written to .rodata via set_initial_value ({} bytes in {}-byte buffer)",
+                    param_bytes.len(),
+                    value_size,
                 );
             }
         } else {
@@ -790,6 +831,11 @@ impl EbpfManager {
     }
 
     /// Update PARAM in the .rodata map after loading (fallback, may fail with EPERM).
+    ///
+    /// This is kept for potential future use as a post-load fallback. Currently,
+    /// PARAM is written via `update_param_pre_load()` before load (the preferred path),
+    /// because `.rodata` becomes read-only after `bpf_object__load()`.
+    #[allow(dead_code)]
     fn update_param_post_load(&self) {
         let obj = match self.obj.as_ref() {
             Some(obj) => obj,
@@ -934,103 +980,116 @@ impl EbpfManager {
         }
     }
 
-/// 通用 TC attach：将指定的程序列表挂载到目标接口
-///
-/// # 参数
-///
-/// * `ifname` — 目标接口名称
-/// * `progs` — 程序列表，每项为 (程序名, 优先级)
-/// * `handle` — 可选 handle（调用方已将 flip 位合并到 handle 中）
-pub fn attach_tc(
-    &mut self,
-    ifname: &str,
-    progs: &[(&str, u32)],
-    handle: Option<u32>,
-) -> Result<()> {
-    let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
-    let ifindex = if_nametoindex(ifname).map_err(|e| EbpfError::TcAttachError {
-        iface: ifname.into(),
-        detail: format!("if_nametoindex: {}", e),
-    })?;
+    /// 通用 TC attach：将指定的程序列表挂载到目标接口
+    ///
+    /// # 参数
+    ///
+    /// * `ifname` — 目标接口名称
+    /// * `progs` — 程序列表，每项为 (程序名, 优先级)
+    /// * `handle` — 可选 handle（调用方已将 flip 位合并到 handle 中）
+    pub fn attach_tc(
+        &mut self,
+        ifname: &str,
+        progs: &[(&str, u32)],
+        handle: Option<u32>,
+    ) -> Result<()> {
+        let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
+        let ifindex = if_nametoindex(ifname).map_err(|e| EbpfError::TcAttachError {
+            iface: ifname.into(),
+            detail: format!("if_nametoindex: {}", e),
+        })?;
 
-    info!(iface = %ifname, ifindex = %ifindex, count = %progs.len(), "Attaching TC programs");
+        info!(iface = %ifname, ifindex = %ifindex, count = %progs.len(), "Attaching TC programs");
 
-    for (prog_name, priority) in progs {
-        let prog = match find_prog(obj, prog_name) {
-            Ok(p) => p,
-            Err(_) => {
-                warn!("TC program '{}' not found, skipping", prog_name);
-                continue;
+        for (prog_name, priority) in progs {
+            let prog = match find_prog(obj, prog_name) {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!("TC program '{}' not found, skipping", prog_name);
+                    continue;
+                }
+            };
+
+            let attach_point = Self::prog_attach_point(prog_name);
+            let mut hook = TcHook::new(prog.as_fd());
+            hook.ifindex(ifindex);
+            hook.attach_point(attach_point);
+            hook.priority(*priority);
+
+            if let Some(h) = handle {
+                hook.handle(h);
             }
-        };
 
-        let attach_point = Self::prog_attach_point(prog_name);
-        let mut hook = TcHook::new(prog.as_fd());
-        hook.ifindex(ifindex);
-        hook.attach_point(attach_point);
-        hook.priority(*priority);
-
-        if let Some(h) = handle {
-            hook.handle(h);
-        }
-
-        // 对于 dae0/dae0peer（netkit 设备），先删除已存在的 clsact qdisc，
-        // 再重新创建。原因是 netkit 设备上的 clsact 如果已存在，
-        // hook.create() 是 no-op，导致之前设置的 priority 不生效。
-        // 仅当设备不存在（非首次运行）时记录 warning；设备不存在属于
-        // 正常首次运行场景，不视为错误。
-        if ifname == "dae0" || ifname == "dae0peer" {
-            let output = Command::new("tc")
-                .args(["qdisc", "del", "dev", ifname, "clsact"])
-                .output()
-                .map_err(|e| {
-                    EbpfError::TcAttachError {
+            // 对于 dae-rs-host/dae-rs-peer（netkit 设备），先删除已存在的 clsact qdisc，
+            // 再重新创建。原因是 netkit 设备上的 clsact 如果已存在，
+            // hook.create() 是 no-op，导致之前设置的 priority 不生效。
+            if ifname == "dae-rs-host" || ifname == "dae-rs-peer" {
+                let output = Command::new("tc")
+                    .args(["qdisc", "del", "dev", ifname, "clsact"])
+                    .output()
+                    .map_err(|e| EbpfError::TcAttachError {
                         iface: ifname.into(),
                         detail: format!("delete clsact qdisc failed: {}", e),
+                    })?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    // "No such file or directory" is expected on first attach — not an error.
+                    // "Cannot find specified qdisc" is the same error on some kernel versions.
+                    // Any other failure (permission denied, invalid interface, etc.)
+                    // is serious: leaving a stale qdisc will cause hook.create() to be a
+                    // no-op, silently breaking priority/handle configuration. Abort.
+                    if stderr.contains("No such file")
+                        || stderr.contains("Cannot find specified qdisc")
+                    {
+                        debug!(
+                            iface = %ifname,
+                            "clsact qdisc did not exist on {}, OK",
+                            ifname,
+                        );
+                    } else {
+                        return Err(EbpfError::TcAttachError {
+                            iface: ifname.into(),
+                            detail: format!(
+                                "Failed to delete existing clsact qdisc on {}: {}",
+                                ifname,
+                                stderr.trim(),
+                            ),
+                        }
+                        .into());
                     }
-                })?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.contains("No such file or directory") {
-                    warn!(
-                        iface = %ifname,
-                        stderr = %stderr.trim(),
-                        "Failed to delete existing clsact qdisc"
-                    );
                 }
             }
+
+            // Create clsact qdisc (no-op if already exists)
+            hook.create().map_err(|e| EbpfError::TcAttachError {
+                iface: ifname.into(),
+                detail: format!("create({}): {}", prog_name, e),
+            })?;
+
+            // Attach the program
+            let attached = hook.attach().map_err(|e| EbpfError::TcAttachError {
+                iface: ifname.into(),
+                detail: format!("attach({}): {}", prog_name, e),
+            })?;
+
+            self.tc_hooks.push(TcAttachInfo {
+                hook: attached,
+                iface: ifname.into(),
+                prog_name: prog_name.to_string(),
+            });
+            info!(
+                "TC program '{}' attached to {} (ifindex={}, priority={}, handle={:?})",
+                prog_name, ifname, ifindex, priority, handle
+            );
         }
 
-        // Create clsact qdisc (no-op if already exists)
-        hook.create().map_err(|e| EbpfError::TcAttachError {
-            iface: ifname.into(),
-            detail: format!("create({}): {}", prog_name, e),
-        })?;
-
-        // Attach the program
-        let attached = hook.attach().map_err(|e| EbpfError::TcAttachError {
-            iface: ifname.into(),
-            detail: format!("attach({}): {}", prog_name, e),
-        })?;
-
-        self.tc_hooks.push(TcAttachInfo {
-            hook: attached,
-            iface: ifname.into(),
-            prog_name: prog_name.to_string(),
-        });
         info!(
-            "TC program '{}' attached to {} (ifindex={}, priority={}, handle={:?})",
-            prog_name, ifname, ifindex, priority, handle
+            "TC programs attached to {} (total hooks: {})",
+            ifname,
+            self.tc_hooks.len()
         );
+        Ok(())
     }
-
-    info!(
-        "TC programs attached to {} (total hooks: {})",
-        ifname,
-        self.tc_hooks.len()
-    );
-    Ok(())
-}
 
     // ========================================================================
     // 按接口分组 TC attach
@@ -1072,118 +1131,115 @@ pub fn attach_tc(
         }
     }
 
-/// WAN 接口：根据链路头长度选择 L2 或 L3 版本
-///
-/// 与原始 dae Go 行为对齐：
-/// - Egress 方向优先级 2，handle sub = 4
-/// - Ingress 方向优先级 1，handle sub = 2
-pub fn attach_wan(&mut self, ifname: &str) -> Result<()> {
-    let link_h_len = Self::get_link_header_len(ifname)?;
-    let handle_major = 0x2023u32;
-    let flip = self.flip;
-    info!(
-        "Attaching WAN TC programs to {} (link_h_len={}, flip={})",
-        ifname, link_h_len, flip
-    );
+    /// WAN 接口：根据链路头长度选择 L2 或 L3 版本
+    ///
+    /// 与原始 dae Go 行为对齐：
+    /// - Egress 方向优先级 2，handle sub = 4
+    /// - Ingress 方向优先级 1，handle sub = 2
+    pub fn attach_wan(&mut self, ifname: &str) -> Result<()> {
+        let link_h_len = Self::get_link_header_len(ifname)?;
+        let handle_major = 0x2023u32;
+        let flip = self.flip;
+        info!(
+            "Attaching WAN TC programs to {} (link_h_len={}, flip={})",
+            ifname, link_h_len, flip
+        );
 
-    // Egress (优先级 2, handle sub=4)
-    self.attach_tc(
-        ifname,
-        &[if link_h_len > 0 {
-            ("tproxy_wan_egress_l2", 2)
-        } else {
-            ("tproxy_wan_egress_l3", 2)
-        }],
-        Some((handle_major << 16) | ((4 & !1u32) | flip)),
-    )?;
+        // Egress (优先级 2, handle sub=4)
+        self.attach_tc(
+            ifname,
+            &[if link_h_len > 0 {
+                ("tproxy_wan_egress_l2", 2)
+            } else {
+                ("tproxy_wan_egress_l3", 2)
+            }],
+            Some((handle_major << 16) | ((4 & !1u32) | flip)),
+        )?;
 
-    // Ingress (优先级 1, handle sub=2)
-    self.attach_tc(
-        ifname,
-        &[if link_h_len > 0 {
-            ("tproxy_wan_ingress_l2", 1)
-        } else {
-            ("tproxy_wan_ingress_l3", 1)
-        }],
-        Some((handle_major << 16) | ((2 & !1u32) | flip)),
-    )?;
+        // Ingress (优先级 1, handle sub=2)
+        self.attach_tc(
+            ifname,
+            &[if link_h_len > 0 {
+                ("tproxy_wan_ingress_l2", 1)
+            } else {
+                ("tproxy_wan_ingress_l3", 1)
+            }],
+            Some((handle_major << 16) | ((2 & !1u32) | flip)),
+        )?;
 
-    Ok(())
-}
+        Ok(())
+    }
 
-/// LAN 接口：根据链路头长度选择 L2 或 L3 版本
-///
-/// 与原始 dae Go 行为对齐：
-/// - Ingress 方向优先级 2，handle sub = 4
-/// - Egress 方向优先级 1，handle sub = 2
-/// 注意：与 WAN 相反，LAN 的 Egress 优先级更高。
-pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
-    let link_h_len = Self::get_link_header_len(ifname)?;
-    let handle_major = 0x2023u32;
-    let flip = self.flip;
-    info!(
-        "Attaching LAN TC programs to {} (link_h_len={}, flip={})",
-        ifname, link_h_len, flip
-    );
+    /// LAN 接口：根据链路头长度选择 L2 或 L3 版本
+    ///
+    /// 与原始 dae Go 行为对齐：
+    /// - Ingress 方向优先级 2，handle sub = 4
+    /// - Egress 方向优先级 1，handle sub = 2
+    /// 注意：与 WAN 相反，LAN 的 Egress 优先级更高。
+    pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
+        let link_h_len = Self::get_link_header_len(ifname)?;
+        let handle_major = 0x2023u32;
+        let flip = self.flip;
+        info!(
+            "Attaching LAN TC programs to {} (link_h_len={}, flip={})",
+            ifname, link_h_len, flip
+        );
 
-    // Ingress (优先级 2, handle sub=4)
-    self.attach_tc(
-        ifname,
-        &[if link_h_len > 0 {
-            ("tproxy_lan_ingress_l2", 2)
-        } else {
-            ("tproxy_lan_ingress_l3", 2)
-        }],
-        Some((handle_major << 16) | ((4 & !1u32) | flip)),
-    )?;
+        // Ingress (优先级 2, handle sub=4)
+        self.attach_tc(
+            ifname,
+            &[if link_h_len > 0 {
+                ("tproxy_lan_ingress_l2", 2)
+            } else {
+                ("tproxy_lan_ingress_l3", 2)
+            }],
+            Some((handle_major << 16) | ((4 & !1u32) | flip)),
+        )?;
 
-    // Egress (优先级 1, handle sub=2)
-    self.attach_tc(
-        ifname,
-        &[if link_h_len > 0 {
-            ("tproxy_lan_egress_l2", 1)
-        } else {
-            ("tproxy_lan_egress_l3", 1)
-        }],
-        Some((handle_major << 16) | ((2 & !1u32) | flip)),
-    )?;
+        // Egress (优先级 1, handle sub=2)
+        self.attach_tc(
+            ifname,
+            &[if link_h_len > 0 {
+                ("tproxy_lan_egress_l2", 1)
+            } else {
+                ("tproxy_lan_egress_l3", 1)
+            }],
+            Some((handle_major << 16) | ((2 & !1u32) | flip)),
+        )?;
 
-    Ok(())
-}
+        Ok(())
+    }
 
-/// dae0（宿主 NS）：挂载 tproxy_dae0_ingress
-///
-/// 优先级 0，handle major=0x2022，handle sub=2
-pub fn attach_dae0(&mut self, ifname: &str) -> Result<()> {
-    let handle_major = 0x2022u32;
-    let flip = self.flip;
-    info!(
-        "Attaching dae0 TC program to {} (flip={})",
-        ifname, flip
-    );
-    self.attach_tc(
-        ifname,
-        &[("tproxy_dae0_ingress", 0)],
-        Some((handle_major << 16) | ((2 & !1u32) | flip)),
-    )
-}
+    /// dae0（宿主 NS）：挂载 tproxy_dae0_ingress
+    ///
+    /// 优先级 0，handle major=0x2022，handle sub=2
+    pub fn attach_dae0(&mut self, ifname: &str) -> Result<()> {
+        let handle_major = 0x2022u32;
+        let flip = self.flip;
+        info!("Attaching dae0 TC program to {} (flip={})", ifname, flip);
+        self.attach_tc(
+            ifname,
+            &[("tproxy_dae0_ingress", 0)],
+            Some((handle_major << 16) | ((2 & !1u32) | flip)),
+        )
+    }
 
-/// dae0peer（代理 NS）：挂载 tproxy_dae0peer_ingress
-///
-/// 优先级 0，handle major=0x2022，handle sub=2
-pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
-    let handle_major = 0x2022u32;
-    let flip = self.flip;
-    info!(
-        "Attaching dae0peer TC program to {} (flip={})",
-        ifname, flip
-    );
-    self.attach_tc(
-        ifname,
-        &[("tproxy_dae0peer_ingress", 0)],
-        Some((handle_major << 16) | ((2 & !1u32) | flip)),
-    )
-}
+    /// dae0peer（代理 NS）：挂载 tproxy_dae0peer_ingress
+    ///
+    /// 优先级 0，handle major=0x2022，handle sub=2
+    pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
+        let handle_major = 0x2022u32;
+        let flip = self.flip;
+        info!(
+            "Attaching dae0peer TC program to {} (flip={})",
+            ifname, flip
+        );
+        self.attach_tc(
+            ifname,
+            &[("tproxy_dae0peer_ingress", 0)],
+            Some((handle_major << 16) | ((2 & !1u32) | flip)),
+        )
+    }
 
     // ========================================================================
     // cgroup 程序 attach
@@ -1281,24 +1337,38 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
 
     /// 分离所有 TC 程序和 cgroup 程序
     pub fn detach_all(&mut self) -> Result<()> {
+        let start = std::time::Instant::now();
         // Detach TC hooks
         if !self.tc_hooks.is_empty() {
             info!(count = self.tc_hooks.len(), "Detaching TC programs");
+            let mut detached = 0u32;
+            let mut failed = 0u32;
             for info in self.tc_hooks.iter_mut() {
                 if let Err(e) = info.hook.detach() {
                     warn!(
                         "Failed to detach TC hook '{}' on {}: {}",
                         info.prog_name, info.iface, e
                     );
+                    failed += 1;
+                } else {
+                    detached += 1;
                 }
             }
             self.tc_hooks.clear();
+            debug!(
+                "TC detach: {} succeeded, {} failed ({}ms)",
+                detached,
+                failed,
+                start.elapsed().as_millis()
+            );
         }
 
         // Detach cgroup links (drop the ProgramAttachment)
         if !self.cgroup_links.is_empty() {
             info!(count = self.cgroup_links.len(), "Detaching cgroup programs");
+            let n = self.cgroup_links.len();
             self.cgroup_links.clear();
+            debug!("cgroup links detached: {}", n);
         }
 
         Ok(())
@@ -1308,6 +1378,7 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
     /// Used for namespace-aware shutdown: dae0peer hooks must be detached
     /// in the proxy namespace before detaching host-NS hooks.
     pub fn detach_by_iface(&mut self, iface: &str) -> Result<()> {
+        let start = std::time::Instant::now();
         let before = self.tc_hooks.len();
         let mut to_detach: Vec<usize> = Vec::new();
         for (i, info) in self.tc_hooks.iter().enumerate() {
@@ -1315,6 +1386,11 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
                 to_detach.push(i);
             }
         }
+        debug!(
+            "detach_by_iface: {} hooks match interface {}",
+            to_detach.len(),
+            iface
+        );
         // Detach in reverse order to preserve indices
         for &i in to_detach.iter().rev() {
             let mut info = self.tc_hooks.swap_remove(i);
@@ -1329,14 +1405,22 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
         if detached > 0 {
             info!(iface = %iface, count = detached, "Detached TC hooks for interface");
         }
+        debug!(
+            "detach_by_iface {}: {} hooks ({}ms)",
+            iface,
+            detached,
+            start.elapsed().as_millis()
+        );
         Ok(())
     }
 
     /// 卸载 eBPF 程序（先分离所有 hook，再释放对象）
     pub fn unload(&mut self) -> Result<()> {
+        let start = std::time::Instant::now();
         info!("Unloading eBPF program");
         self.detach_all()?;
         self.obj.take();
+        debug!("eBPF program unloaded: {}ms", start.elapsed().as_millis());
         Ok(())
     }
 
@@ -1356,11 +1440,13 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
         use std::ffi::c_void;
         use std::os::unix::io::AsRawFd;
 
+        let start = std::time::Instant::now();
         info!(
             count = match_sets.len(),
             "Writing routing rules to routing_map"
         );
-        let mut map = self.get_map_mut("routing_map")?;
+        debug!("First match_set type={}, outbound={}", match_sets.first().map(|m| m.r#type).unwrap_or(0), match_sets.first().map(|m| m.outbound).unwrap_or(0));
+        let map = self.get_map_mut("routing_map")?;
         let fd = map.as_fd().as_raw_fd();
 
         // Batch update active rules via libbpf-sys bpf_map_update_batch
@@ -1405,10 +1491,15 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
 
         // Update routing_meta_map with active rule count
         drop(map);
-        let mut meta_map = self.get_map_mut("routing_meta_map")?;
+        let meta_map = self.get_map_mut("routing_meta_map")?;
         let meta_key = 0u32.to_ne_bytes();
         let active_len = match_sets.len() as u32;
         meta_map.update(&meta_key, &active_len.to_ne_bytes(), MapFlags::empty())?;
+        debug!(
+            "routing_map write: {} entries, {}ms",
+            match_sets.len(),
+            start.elapsed().as_millis()
+        );
         info!(
             "Wrote {} match sets (active_len={})",
             match_sets.len(),
@@ -1427,12 +1518,19 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
     /// This function groups entries by index, looks up the inner LPM trie FD for each
     /// index from the outer map, and writes `(LpmKey, u32)` entries to the inner trie.
     pub fn write_cidr_table(&mut self, entries: &[(u32, CidrEntry)]) -> Result<()> {
+        let start = std::time::Instant::now();
         use std::ffi::c_void;
         use std::os::unix::io::AsRawFd;
 
         if entries.is_empty() {
+            debug!("write_cidr_table: no entries, skipping");
             return Ok(());
         }
+
+        debug!(
+            "write_cidr_table: {} entries to process",
+            entries.len()
+        );
 
         // Group entries by outer array index (each index → an inner LPM trie)
         let mut by_index: std::collections::BTreeMap<u32, Vec<LpmKey>> =
@@ -1444,52 +1542,96 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
             };
             by_index.entry(*idx).or_default().push(lpm_key);
         }
+        debug!(
+            "CIDR entries grouped into {} inner LPM tries",
+            by_index.len()
+        );
 
         // Get outer map FD then release the mutable borrow so we can use raw syscalls
         let outer_fd = {
             let map = self.get_map_mut("lpm_array_map")?;
             map.as_fd().as_raw_fd()
         };
+        debug!("lpm_array_map outer FD: {}", outer_fd);
 
         let mut total_written: usize = 0;
 
         for (&array_idx, lpm_keys) in &by_index {
-            // Look up inner map FD from the outer ARRAY_OF_MAPS
-            let idx_bytes = array_idx.to_ne_bytes();
-            let mut inner_fd: i32 = 0;
-            let ret = unsafe {
-                libbpf_sys::bpf_map_lookup_elem(
-                    outer_fd,
-                    idx_bytes.as_ptr() as *const c_void,
-                    &mut inner_fd as *mut i32 as *mut c_void,
-                )
-            };
-            if ret != 0 {
-                warn!(
-                    "Inner LPM trie not found at array index {}, skipping {} entries",
-                    array_idx,
-                    lpm_keys.len()
-                );
-                continue;
-            }
+            // Create a new LPM_TRIE inner map for this slot.
+            // lpm_array_map is BPF_MAP_TYPE_ARRAY_OF_MAPS; each slot must hold
+            // an inner map FD before entries can be written to it.
+            let inner_map_name = format!("lpm_{}", array_idx);
+            let mut create_opts = libbpf_sys::bpf_map_create_opts::default();
+            create_opts.sz = std::mem::size_of::<libbpf_sys::bpf_map_create_opts>() as u64;
+            create_opts.map_flags = libbpf_sys::BPF_F_NO_PREALLOC as u32;
 
-            // Write each LpmKey → u32 entry to the inner LPM_TRIE map
+            let inner_map = libbpf_rs::MapHandle::create(
+                libbpf_rs::MapType::LpmTrie,
+                Some(inner_map_name.as_str()),
+                std::mem::size_of::<LpmKey>() as u32,
+                std::mem::size_of::<u32>() as u32,
+                MAX_LPM_SIZE,
+                &create_opts,
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to create inner LPM trie for index {}",
+                    array_idx
+                )
+            })?;
+
+            // Populate the inner map with LPM key → value entries
             let one: u32 = 1;
             for lpm_key in lpm_keys {
                 let key_bytes = bytemuck::bytes_of(lpm_key);
                 let val_bytes = bytemuck::bytes_of(&one);
-                unsafe {
-                    libbpf_sys::bpf_map_update_elem(
-                        inner_fd,
-                        key_bytes.as_ptr() as *const c_void,
-                        val_bytes.as_ptr() as *const c_void,
-                        0u64, // BPF_ANY
-                    );
-                }
+                inner_map
+                    .update(key_bytes, val_bytes, MapFlags::empty())
+                    .with_context(|| {
+                        format!(
+                            "Failed to write LPM key at inner map index {}",
+                            array_idx
+                        )
+                    })?;
             }
+
+            // Insert the inner map FD into the outer ARRAY_OF_MAPS.
+            // For BPF_MAP_TYPE_ARRAY_OF_MAPS, the value in update_elem is the
+            // FD of the inner map (as an i32 in native byte order).
+            let inner_fd = inner_map.as_fd().as_raw_fd() as i32;
+            let idx_bytes = array_idx.to_ne_bytes();
+            let fd_bytes = inner_fd.to_ne_bytes();
+            let ret = unsafe {
+                libbpf_sys::bpf_map_update_elem(
+                    outer_fd,
+                    idx_bytes.as_ptr() as *const c_void,
+                    fd_bytes.as_ptr() as *const c_void,
+                    0u64, // BPF_ANY
+                )
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    "Failed to insert inner LPM trie FD at lpm_array_map[{}]: {}",
+                    array_idx, err
+                );
+                continue;
+            }
+
             total_written += lpm_keys.len();
+            debug!(
+                "Inner LPM trie at index {}: created, {} keys written",
+                array_idx,
+                lpm_keys.len()
+            );
         }
 
+        debug!(
+            "CIDR table write: {} entries in {} tries, {}ms",
+            total_written,
+            by_index.len(),
+            start.elapsed().as_millis()
+        );
         info!(
             "Wrote {} CIDR entries across {} inner LPM tries",
             total_written,
@@ -1500,7 +1642,7 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
 
     /// Read conntrack entry from conn_state_map.
     pub fn read_conntrack(&mut self, key: &TuplesKey) -> Result<Option<ConnState>> {
-        let mut map = self.get_map_mut("conn_state_map")?;
+        let map = self.get_map_mut("conn_state_map")?;
         let key_bytes = bytemuck::bytes_of(key);
         match map.lookup(key_bytes, MapFlags::empty()) {
             Ok(Some(val)) => Ok(Some(bytemuck::pod_read_unaligned(&val))),
@@ -1511,14 +1653,14 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
 
     /// Delete conntrack entry from conn_state_map.
     pub fn delete_conntrack(&mut self, key: &TuplesKey) -> Result<()> {
-        let mut map = self.get_map_mut("conn_state_map")?;
+        let map = self.get_map_mut("conn_state_map")?;
         let _ = map.delete(bytemuck::bytes_of(key));
         Ok(())
     }
 
     /// Read stats from bpf_stats_map.
     pub fn read_stats(&mut self) -> Result<[u64; STATS_MAP_SIZE as usize]> {
-        let mut map = self.get_map_mut("bpf_stats_map")?;
+        let map = self.get_map_mut("bpf_stats_map")?;
         let mut stats = [0u64; STATS_MAP_SIZE as usize];
         for i in 0..STATS_MAP_SIZE {
             let key = i.to_ne_bytes();
@@ -1531,10 +1673,126 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
         Ok(stats)
     }
 
+    /// Read debug counters from debug_counter_map.
+    ///
+    /// Map keys (from tproxy.c):
+    /// Failure counters (0-5):
+    ///   0 = DBG_LISTEN_SOCKET_NULL   — SOCKMAP lookup in assign_listener returned NULL
+    ///   1 = DBG_ASSIGN_LISTENER_FAIL — bpf_sk_assign() in dae0peer_ingress failed
+    ///   2 = DBG_WAN_REDIRECT_FAIL    — bpf_redirect() from WAN egress to dae0 failed
+    ///   3 = DBG_WAN_ROUTE_FAIL       — route() returned error in WAN egress
+    ///   4 = DBG_WAN_OUTBOUND_DEAD    — outbound marked dead by wan_outbound_is_alive()
+    ///   5 = DBG_WAN_PARSE_FAIL       — parse_packet/parse_transport failed
+    /// All-path counters (6-14):
+    ///   6 = DBG_WAN_EGRESS_ENTERED   — do_tproxy_wan_egress was called
+    ///   7 = DBG_WAN_EGRESS_SKIPPED   — skipped due to ingress_ifindex check
+    ///   8 = DBG_WAN_TCP_ENTERED      — do_tproxy_wan_egress_tcp was called
+    ///   9 = DBG_WAN_TCP_DIRECT       — TCP went DIRECT path (TC_ACT_OK)
+    ///  10 = DBG_WAN_TCP_PROXY        — TCP went PROXY path (redirect)
+    ///  11 = DBG_WAN_UDP_ENTERED      — do_tproxy_wan_egress_udp was called
+    ///  12 = DBG_WAN_UDP_DIRECT       — UDP went DIRECT path
+    ///  13 = DBG_WAN_UDP_PROXY        — UDP went PROXY path
+    ///  14 = DBG_DAE0PEER_ENTERED     — dae0peer_ingress was called
+    ///  15 = DBG_ASSIGN_CALLED        — bpf_sk_assign called in dae0peer_ingress
+    ///  16 = DBG_BPF_SK_ASSIGN_OK     — bpf_sk_assign returned success
+    ///  17 = DBG_SK_MATCH              — skb->sk lookup matched
+    ///  18 = DBG_SK_NULL               — skb->sk lookup returned NULL
+    ///  19 = DBG_SK_MISMATCH           — skb->sk socket mismatch detected
+    ///  20 = DBG_DAE0_INGRESS_ENTERED — dae0_ingress was called
+    ///  21 = DBG_DAE0_REDIRECT_TUPLE_OK — redirect_tuple_ok in dae0_ingress
+    ///  22 = DBG_DAE0_REDIRECT_TRACK_HIT — redirect_track_hit in dae0_ingress
+    ///  23 = DBG_DAE0_REDIRECT_SUCCESS — redirect succeeded in dae0_ingress
+    pub fn read_debug_counters(&mut self) -> Result<[u64; 24]> {
+        let map = self.get_map_mut("debug_counter_map")?;
+        let mut counters = [0u64; 24];
+        for i in 0u32..24 {
+            let key = i.to_ne_bytes();
+            if let Ok(Some(val_bytes)) = map.lookup(&key, MapFlags::empty()) {
+                if val_bytes.len() >= 8 {
+                    counters[i as usize] = u64::from_ne_bytes(val_bytes[..8].try_into().unwrap());
+                }
+            }
+        }
+        Ok(counters)
+    }
+
+    /// Log debug counters for diagnostic purposes.
+    pub fn log_debug_counters(&mut self, label: &str) {
+        match self.read_debug_counters() {
+            Ok(counters) => {
+                info!("[{}] Debug counters: egress_entered={} skipped={} tcp_entered={} tcp_direct={} tcp_proxy={} udp_entered={} udp_direct={} udp_proxy={} dae0peer_entered={} listen_null={} assign_fail={} redirect_fail={} route_fail={} outbound_dead={} parse_fail={}",
+                    label,
+                    counters[6],  // DBG_WAN_EGRESS_ENTERED
+                    counters[7],  // DBG_WAN_EGRESS_SKIPPED
+                    counters[8],  // DBG_WAN_TCP_ENTERED
+                    counters[9],  // DBG_WAN_TCP_DIRECT
+                    counters[10], // DBG_WAN_TCP_PROXY
+                    counters[11], // DBG_WAN_UDP_ENTERED
+                    counters[12], // DBG_WAN_UDP_DIRECT
+                    counters[13], // DBG_WAN_UDP_PROXY
+                    counters[14], // DBG_DAE0PEER_ENTERED
+                    counters[0],  // DBG_LISTEN_SOCKET_NULL
+                    counters[1],  // DBG_ASSIGN_LISTENER_FAIL
+                    counters[2],  // DBG_WAN_REDIRECT_FAIL
+                    counters[3],  // DBG_WAN_ROUTE_FAIL
+                    counters[4],  // DBG_WAN_OUTBOUND_DEAD
+                    counters[5],  // DBG_WAN_PARSE_FAIL
+                );
+                info!(
+                    "[{}] Assign counters: assign_called={} bpf_sk_assign_ok={}",
+                    label,
+                    counters[15], // DBG_ASSIGN_CALLED
+                    counters[16], // DBG_BPF_SK_ASSIGN_OK
+                );
+                info!(
+                    sk_match = counters[17],
+                    sk_null = counters[18],
+                    sk_mismatch = counters[19],
+                    "[{}] skb->sk verification",
+                    label,
+                );
+                info!(
+                    dae0_ingress_entered = counters[20],
+                    dae0_redirect_tuple_ok = counters[21],
+                    dae0_redirect_track_hit = counters[22],
+                    dae0_redirect_success = counters[23],
+                    "[{}] dae0_ingress return path",
+                    label,
+                );
+                // Log individual failure counters for diagnostic detail
+                let failure_names = [
+                    "listen_sock_null",
+                    "assign_listener_fail",
+                    "wan_redirect_fail",
+                    "wan_route_fail",
+                    "wan_outbound_dead",
+                    "wan_parse_fail",
+                ];
+                for (i, &val) in counters[..6].iter().enumerate() {
+                    if val > 0 {
+                        info!(
+                            "[{}]  ! {} = {} (check tproxy.c for details)",
+                            label, failure_names[i], val
+                        );
+                    }
+                }
+                if counters.iter().all(|&v| v == 0) {
+                    info!(
+                        "[{}] All debug counters are zero — no failures detected in eBPF data path",
+                        label
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("[{}] Failed to read debug counters: {}", label, e);
+            }
+        }
+    }
+
     /// Write excluded comm hashes to cookie_pid_map.
     pub fn write_excluded_comm(&mut self, comm_hashes: &[u32]) -> Result<()> {
         info!(count = comm_hashes.len(), "Writing excluded comm hashes");
-        let mut map = self.get_map_mut("cookie_pid_map")?;
+        let map = self.get_map_mut("cookie_pid_map")?;
         for hash in comm_hashes {
             let key = (*hash as u64).to_ne_bytes();
             let val = ProcInfo::zeroed();
@@ -1547,7 +1805,7 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
     /// Write excluded PIDs to cookie_pid_map.
     pub fn write_excluded_pids(&mut self, pids: &[u32]) -> Result<()> {
         info!(count = pids.len(), "Writing excluded PIDs");
-        let mut map = self.get_map_mut("cookie_pid_map")?;
+        let map = self.get_map_mut("cookie_pid_map")?;
         for pid in pids {
             let key = (*pid as u64).to_ne_bytes();
             let val = ProcInfo {
@@ -1567,10 +1825,12 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
     /// The SOCKMAP keys are: 0 = tcp4, 1 = udp, 2 = tcp6.
     /// The value is the socket file descriptor (as u64).
     pub fn update_listen_socket_map(&mut self, key: u32, fd: i32) -> Result<()> {
+        let start = std::time::Instant::now();
         let map = self.get_map_mut("listen_socket_map")?;
         let fd_val = fd as u64;
         map.update(&key.to_ne_bytes(), &fd_val.to_ne_bytes(), MapFlags::empty())
             .with_context(|| format!("update listen_socket_map key={}", key))?;
+        debug!("listen_socket_map[{}] = {} ({}ms)", key, fd, start.elapsed().as_micros());
         info!(key = key, fd = fd, "Updated listen_socket_map");
         Ok(())
     }
@@ -1732,17 +1992,28 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
     ///
     /// Each entry maps an IPv6 address (IPv4 mapped as ::ffff:x.x.x.x) to a bitmap
     /// where each bit corresponds to a domain set rule in routing_map.
+    ///
+    /// The bitmap is a dynamically-sized `Vec<u32>`. It is padded with zeros to
+    /// the eBPF map's fixed value size of `MAX_MATCH_SET_LEN / 8` bytes (128 bytes)
+    /// before writing.
     pub fn write_domain_routing_map(
         &mut self,
-        entries: &[([u8; 16], [u32; MAX_MATCH_SET_LEN / 32])],
+        entries: &[([u8; 16], Vec<u32>)],
     ) -> Result<()> {
         info!(count = entries.len(), "Writing domain routing entries");
-        let mut map = self.get_map_mut("domain_routing_map")?;
+        let map = self.get_map_mut("domain_routing_map")?;
+        let expected_bytes = MAX_MATCH_SET_LEN / 8; // 128 bytes = 32 u32 words
 
         for (ip, bitmap) in entries {
+            // Convert Vec<u32> to bytes, padding to expected size for eBPF map.
+            let raw = bytemuck::cast_slice::<u32, u8>(bitmap);
+            let mut padded = vec![0u8; expected_bytes];
+            let copy_len = raw.len().min(expected_bytes);
+            padded[..copy_len].copy_from_slice(&raw[..copy_len]);
+
             map.update(
                 bytemuck::bytes_of(ip),
-                bytemuck::bytes_of(bitmap),
+                &padded,
                 MapFlags::empty(),
             )
             .with_context(|| "Failed to write domain routing entry")?;
@@ -1752,7 +2023,7 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
 
     /// Delete IP entries from domain_routing_map.
     pub fn delete_domain_routing_entries(&mut self, ips: &[[u8; 16]]) -> Result<()> {
-        let mut map = self.get_map_mut("domain_routing_map")?;
+        let map = self.get_map_mut("domain_routing_map")?;
         for ip in ips {
             let _ = map.delete(bytemuck::bytes_of(ip));
         }
@@ -1844,7 +2115,7 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
         let ip_idx = if is_ipv6 { 1 } else { 0 };
         let key = (outbound_id as u32) * 6 + (domain_idx as u32) * 2 + (ip_idx as u32);
 
-        let mut map = self.get_map_mut("outbound_connectivity_map")?;
+        let map = self.get_map_mut("outbound_connectivity_map")?;
         let value = if alive { 1u32 } else { 0u32 };
         map.update(&key.to_ne_bytes(), &value.to_ne_bytes(), MapFlags::empty())?;
         Ok(())
@@ -1856,16 +2127,17 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
     /// tproxy.c treats 0 as dead. Without this initialization, ALL proxied
     /// traffic is SHOT (dropped) until the first connectivity check writes 1.
     pub fn init_outbound_connectivity_map(&mut self) -> Result<()> {
-        let mut map = self.get_map_mut("outbound_connectivity_map")?;
+        let start = std::time::Instant::now();
+        let map = self.get_map_mut("outbound_connectivity_map")?;
         let one: u32 = 1;
         // Initialize all 1536 entries (256 outbounds * 3 domains * 2 ipversions)
         for key in 0u32..1536 {
-            map.update(
-                &key.to_ne_bytes(),
-                &one.to_ne_bytes(),
-                MapFlags::empty(),
-            )?;
+            map.update(&key.to_ne_bytes(), &one.to_ne_bytes(), MapFlags::empty())?;
         }
+        debug!(
+            "outbound_connectivity_map initialized (1536 entries): {}ms",
+            start.elapsed().as_millis()
+        );
         info!("Initialized outbound_connectivity_map (all outbounds alive)");
         Ok(())
     }
@@ -2263,6 +2535,112 @@ pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
 
         Ok(count)
     }
+
+    // ============================================================================
+    // Routing Handoff Map Operations
+    // ============================================================================
+
+    /// Read all entries from routing_handoff_map.
+    ///
+    /// Iterates the HASH map via `BPF_MAP_GET_NEXT_KEY`, reads the value for each
+    /// key, and returns a vector of `(TuplesKey, RoutingHandoffEntry)` pairs.
+    pub fn get_routing_handoff_entries(&mut self) -> Result<Vec<(TuplesKey, RoutingHandoffEntry)>> {
+        use std::os::fd::AsRawFd;
+
+        let map = self.get_map_mut("routing_handoff_map")?;
+        let map_fd = map.as_fd().as_raw_fd();
+
+        let mut entries: Vec<(TuplesKey, RoutingHandoffEntry)> = Vec::new();
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        loop {
+            let next_key = {
+                let mut buf = vec![0u8; 48]; // TuplesKey is 40 bytes, rounded up
+                let ret = unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        3i64, // BPF_MAP_GET_NEXT_KEY
+                        &(map_fd as u32),
+                        if prev_key.is_empty() {
+                            std::ptr::null::<u8>()
+                        } else {
+                            prev_key.as_ptr()
+                        },
+                        buf.as_mut_ptr(),
+                    )
+                };
+                if ret < 0 {
+                    break;
+                }
+                buf
+            };
+
+            // Read the value for this key
+            let mut val = vec![0u8; std::mem::size_of::<RoutingHandoffEntry>()];
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    4i64, // BPF_MAP_LOOKUP_ELEM
+                    &(map_fd as u32),
+                    next_key.as_ptr(),
+                    val.as_mut_ptr(),
+                )
+            };
+            if ret < 0 {
+                prev_key = next_key;
+                continue;
+            }
+
+            // Parse key and value
+            if next_key.len() >= std::mem::size_of::<TuplesKey>()
+                && val.len() >= std::mem::size_of::<RoutingHandoffEntry>()
+            {
+                let key: TuplesKey = bytemuck::pod_read_unaligned(&next_key[..std::mem::size_of::<TuplesKey>()]);
+                let entry: RoutingHandoffEntry = bytemuck::pod_read_unaligned(&val[..std::mem::size_of::<RoutingHandoffEntry>()]);
+                entries.push((key, entry));
+            }
+
+            prev_key = next_key;
+        }
+
+        Ok(entries)
+    }
+
+    /// Delete a single entry from routing_handoff_map by key.
+    pub fn delete_routing_handoff_entry(&mut self, key: &TuplesKey) -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let map = self.get_map_mut("routing_handoff_map")?;
+        let map_fd = map.as_fd().as_raw_fd();
+
+        unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                5i64, // BPF_MAP_DELETE_ELEM
+                &(map_fd as u32),
+                bytemuck::bytes_of(key).as_ptr(),
+                std::ptr::null::<u8>(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Write a ConnState entry to conn_state_map.
+    ///
+    /// This is used by the routing handoff consumer to inject the final routing
+    /// decision (outbound, mark, etc.) into the connection state so that subsequent
+    /// packets of the same flow are properly handled by the eBPF program.
+    pub fn set_conn_state(&mut self, key: &TuplesKey, value: &ConnState) -> Result<()> {
+        let map = self.get_map_mut("conn_state_map")?;
+        map.update(
+            bytemuck::bytes_of(key),
+            bytemuck::bytes_of(value),
+            MapFlags::empty(),
+        )
+        .with_context(|| "Failed to write conn_state_map entry")?;
+        Ok(())
+    }
 }
 
 impl Drop for EbpfManager {
@@ -2314,6 +2692,16 @@ mod tests {
     #[test]
     fn test_redirect_entry_size() {
         assert_eq!(std::mem::size_of::<RedirectEntry>(), 32);
+    }
+
+    #[test]
+    fn test_routing_result_size() {
+        assert_eq!(std::mem::size_of::<RoutingResult>(), 36);
+    }
+
+    #[test]
+    fn test_routing_handoff_entry_size() {
+        assert_eq!(std::mem::size_of::<RoutingHandoffEntry>(), 48);
     }
 
     #[test]

@@ -231,7 +231,9 @@ async fn auth_middleware(
 
 /// 从请求中提取的认证信息
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct AuthInfo {
+    #[allow(dead_code)]
     token: String,
 }
 
@@ -471,7 +473,7 @@ async fn metrics_handler(
     // 验证认证
     verify_auth(api_state, &headers)?;
 
-    let mut control = api_state.control.write().await;
+    let control = api_state.control.write().await;
 
     // 从 eBPF STATS_MAP 读取指标，如果 eBPF 未加载则返回零值
     let stats = control

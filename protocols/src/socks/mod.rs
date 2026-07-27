@@ -417,7 +417,7 @@ impl UdpAssociateSession {
                 if data.len() < 5 + name_len + 2 {
                     return None;
                 }
-                let name = std::str::from_utf8(&data[5..5 + name_len]).ok()?;
+                let _name = std::str::from_utf8(&data[5..5 + name_len]).ok()?;
                 let port = u16::from_be_bytes([data[5 + name_len], data[5 + name_len + 1]]);
                 (
                     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port),

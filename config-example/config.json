@@ -7,8 +7,8 @@
   },
   "namespace": {
     "mode": "isolated",
-    "host_if": "dae0",
-    "peer_if": "dae0peer",
+    "host_if": "dae-rs-host",
+    "peer_if": "dae-rs-peer",
     "host_addr": "169.254.100.1/30",
     "peer_addr": "169.254.100.2/30",
     "mtu": 1500,

@@ -20,7 +20,6 @@
 use crate::ebpf::TuplesKey;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
-use tracing::debug;
 
 /// Minimum time (seconds) to retain a UDP flow after it was last seen.
 const MIN_RETAIN_SECS: u64 = 10;

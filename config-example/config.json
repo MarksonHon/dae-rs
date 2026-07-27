@@ -5,20 +5,6 @@
     "log_level": "info",
     "temp_json": true
   },
-  "namespace": {
-    "mode": "isolated",
-    "host_if": "dae-rs-host",
-    "peer_if": "dae-rs-peer",
-    "host_addr": "169.254.100.1/30",
-    "peer_addr": "169.254.100.2/30",
-    "mtu": 1500,
-    "route_table": 20230
-  },
-  "marks": {
-    "proxy": "0x02000000",
-    "bypass": "0x04000000",
-    "mask": "0x0f000000"
-  },
   "process_exclusion": {
     "enabled": true,
     "protect_self": true,

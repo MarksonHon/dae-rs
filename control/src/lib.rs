@@ -100,9 +100,9 @@ const DAE_EVENT_TCP_CONN_OVERFLOW: u32 = 2;
 /// |-----------|---------|-------------|
 /// | `tproxy_port` | 15080 | TProxy listen port |
 /// | `route_table` | 2023 | Policy routing table ID |
-/// | `fwmark_proxy` | 0x8000000 | Proxy traffic mark (TPROXY_MARK) |
+/// | `fwmark_proxy` | 0x08000000 | Proxy traffic mark (TPROXY_MARK) |
 /// | `fwmark_bypass` | 0x04000000 | Bypass mark |
-/// | `fwmark_mask` | 0x8000000 | Mark mask |
+/// | `fwmark_mask` | 0x08000000 | Mark mask |
 /// | `mtu` | 1500 | Interface MTU |
 /// | `log_level` | "info" | Log level |
 /// | `proxy_addr` | 127.0.0.1:1080 | SOCKS5 proxy address |
@@ -152,7 +152,7 @@ impl Default for Config {
         Self {
             tproxy_port: 15080,
             route_table: 2023,
-            fwmark_proxy: 0x8000000,
+            fwmark_proxy: 0x08000000,
             fwmark_bypass: 0x04000000,
             fwmark_mask: 0x08000000,
             mtu: 1500,
@@ -213,8 +213,6 @@ impl Config {
 
         // Map DaefileConfig to Config (flat control plane structure)
         let runtime = &daefile_config.runtime;
-        let ns = daefile_config.namespace.as_ref();
-        let marks = daefile_config.marks.as_ref();
         let iface = daefile_config.interface.as_ref();
 
         // Get proxy address from the first node (Phase 1 simplification: take first socks5 node)
@@ -235,11 +233,12 @@ impl Config {
 
         Ok(Self {
             tproxy_port: runtime.tproxy_port,
-            route_table: ns.map(|n| n.route_table).unwrap_or(2023),
-            fwmark_proxy: marks.map(|m| m.proxy).unwrap_or(0x8000000),
-            fwmark_bypass: marks.map(|m| m.bypass).unwrap_or(0x04000000),
-            fwmark_mask: marks.map(|m| m.mask).unwrap_or(0x08000000),
-            mtu: ns.map(|n| n.mtu).unwrap_or(1500),
+            // namespace/marks are hardcoded in Config::default() — not configurable via daefile
+            route_table: 2023,
+            fwmark_proxy: 0x08000000,
+            fwmark_bypass: 0x04000000,
+            fwmark_mask: 0x08000000,
+            mtu: 1500,
             log_level: runtime.log_level.clone(),
             ebpf_path: ebpf::DEFAULT_EBPF_PATH.to_string(),
             proxy_addr,
@@ -336,6 +335,12 @@ pub struct ControlPlane {
     udp_tracker: Option<Arc<Mutex<crate::udp_tracker::UdpConnStateTracker>>>,
     /// Userspace routing matcher (used by routing handoff consumer)
     routing_matcher: Option<Arc<crate::routing::RoutingMatcher>>,
+    /// Current routing epoch slot (0 or 1) for double-buffering.
+    /// On each reload, we write to the non-active slot, then flip.
+    current_epoch_slot: u32,
+    /// Datapath generation counter. Incremented on each reload so the
+    /// eBPF datapath can detect stale conn_state entries.
+    datapath_generation: u16,
 }
 
 impl ControlPlane {
@@ -355,10 +360,10 @@ impl ControlPlane {
     /// * `config` — Control plane configuration
     pub fn new(config: Config) -> Self {
         let ebpf_mgr = Arc::new(Mutex::new(ebpf::EbpfManager::new_with_path(
-            "dae-rs-host",
+            netns::HOST_IF,
             &config.ebpf_path,
         )));
-        let netns_mgr = netns::NetnsManager::new(&config);
+        let netns_mgr = netns::NetnsManager::new();
         let daefile_config = config.daefile_config.clone();
 
         Self {
@@ -388,6 +393,8 @@ impl ControlPlane {
             embedded_ebpf: None,
             ebpf_param: None,
             routing_matcher: None,
+            current_epoch_slot: 0,
+            datapath_generation: 0,
         }
     }
 
@@ -555,6 +562,19 @@ impl ControlPlane {
             debug!("outbound_connectivity_map init error: {:?}", e);
         } else {
             debug!("outbound_connectivity_map initialized (all outbounds marked alive)");
+        }
+
+        // ---- Step 2.51: Initialize dae_ifindex_map with current dae0 ifindex ----
+        // This allows the BPF datapath to pick up the ifindex via get_dae0_ifindex()
+        // without relying solely on the frozen .rodata PARAM.dae0_ifindex.
+        if let Some(ref param) = self.ebpf_param {
+            if param.dae0_ifindex != 0 {
+                if let Err(e) = self.ebpf().update_dae_ifindex_map(param.dae0_ifindex) {
+                    warn!("Failed to init dae_ifindex_map: {}", e);
+                } else {
+                    debug!("dae_ifindex_map initialized with ifindex={}", param.dae0_ifindex);
+                }
+            }
         }
 
         // ---- Step 2.6: Initialize InterfaceManager for dynamic WAN/LAN management ----
@@ -784,13 +804,15 @@ impl ControlPlane {
                     "Routing rules compiled"
                 );
 
-                // Write MatchSet entries to routing_map
+                // Write MatchSet entries to routing_map (initial slot = 0)
+                let init_slot = self.current_epoch_slot;
                 if !compiled.match_sets.is_empty() {
                     let write_start = std::time::Instant::now();
-                    self.ebpf().write_routing_rules(&compiled.match_sets)?;
+                    self.ebpf().write_routing_rules(&compiled.match_sets, init_slot)?;
                     info!(
-                        "Wrote {} MatchSet entries to routing_map ({}ms)",
+                        "Wrote {} MatchSet entries to routing_map slot {} ({}ms)",
                         compiled.match_sets.len(),
+                        init_slot,
                         write_start.elapsed().as_millis()
                     );
                 }
@@ -808,16 +830,24 @@ impl ControlPlane {
                     }
                     if !all_cidr_entries.is_empty() {
                         let write_start = std::time::Instant::now();
-                        self.ebpf().write_cidr_table(&all_cidr_entries)?;
+                        self.ebpf().write_cidr_table(&all_cidr_entries, init_slot)?;
                         info!(
-                            "Wrote {} CIDR entries across {} LPM tries ({}ms)",
+                            "Wrote {} CIDR entries across {} LPM tries slot {} ({}ms)",
                             all_cidr_entries.len(),
                             compiled.lpm_tries.len(),
+                            init_slot,
                             write_start.elapsed().as_millis(),
                         );
                     } else {
                         debug!("No CIDR entries to write (no LPM rules)");
                     }
+                }
+
+                // Set the initial active routing epoch
+                if let Err(e) = self.ebpf().update_active_routing_epoch(init_slot) {
+                    warn!("Failed to set initial active_routing_epoch: {}", e);
+                } else {
+                    info!("Initial active_routing_epoch set to slot {}", init_slot);
                 }
 
                 // Set up userspace routing matcher (used by RoutingHandoffConsumer)
@@ -831,6 +861,7 @@ impl ControlPlane {
                     let n_sets = compiled.domain_sets.len();
                     self.domain_routing = Some(crate::domain_routing::DomainRoutingTracker::new(
                         std::sync::Arc::new(compiled.domain_sets),
+                        init_slot,
                     ));
                     info!(
                         "Domain routing tracker initialized with {} domain sets",
@@ -1963,25 +1994,52 @@ impl ControlPlane {
         )
         .context("Failed to compile routing rules")?;
 
-        // 3. Write to eBPF maps (skip if not loaded)
+        // 3. Epoch double-buffer: write to non-active slot, then flip
+        //
+        // The routing epoch double-buffer mechanism works as follows:
+        //   - Compute next_slot = (current + 1) % 2
+        //   - Clear the NEXT slot's domain_routing entries (prepare fresh state)
+        //   - Write new rules to next_slot's routing_map and lpm_array_map
+        //   - Switch active_routing_epoch_map to next_slot
+        //   - Flip current_epoch_slot to next_slot
+        //   - Clear the PREVIOUS slot's domain_routing entries (stale now)
+        //
+        // This ensures the eBPF datapath always sees a consistent routing state:
+        // either the old rules (until the flip) or the new rules (after the flip).
+
+        // 3a. Increment datapath_generation
+        self.datapath_generation = self.datapath_generation.wrapping_add(1);
+        info!(
+            "Hot-reload: datapath_generation incremented to {}",
+            self.datapath_generation
+        );
+
+        // Compute the next (target) epoch slot
+        let next_slot = (self.current_epoch_slot + 1) % crate::ebpf::ROUTING_EPOCH_SLOT_NUM;
+        let prev_slot = self.current_epoch_slot;
+        info!(
+            "Hot-reload: epoch switching slot {} -> {}",
+            prev_slot, next_slot
+        );
+
+        // 3b. Write to eBPF maps (skip if not loaded)
         {
             let mut ebpf = self.ebpf();
             if !ebpf.is_loaded() {
                 info!("Hot-reload: eBPF not loaded, skipping map writes");
             } else {
-                // 3a. 清空 domain_routing_map 中的旧条目（对应 dae Go 的 clearReloadDomainRoutingMap）
-                // 必须在写入新规则之前清理，避免残留的旧映射导致错误路由
-                if let Err(e) = ebpf.clear_domain_routing_map() {
-                    warn!("Hot-reload: failed to clear domain_routing_map: {}", e);
-                } else {
-                    info!("Hot-reload: domain_routing_map cleared");
+                // Clear the TARGET slot's domain_routing entries (fresh start)
+                if let Err(e) = ebpf.clear_domain_routing_slot(next_slot) {
+                    warn!("Hot-reload: failed to clear domain_routing slot {}: {}", next_slot, e);
                 }
 
+                // Write new rules to the NEXT slot
                 if !compiled.match_sets.is_empty() {
-                    ebpf.write_routing_rules(&compiled.match_sets)?;
+                    ebpf.write_routing_rules(&compiled.match_sets, next_slot)?;
                     info!(
-                        "Hot-reload: wrote {} match sets to routing_map",
-                        compiled.match_sets.len()
+                        "Hot-reload: wrote {} match sets to routing_map slot {}",
+                        compiled.match_sets.len(),
+                        next_slot
                     );
                 }
 
@@ -1995,16 +2053,29 @@ impl ControlPlane {
                         }
                     }
                     if !all_cidr_entries.is_empty() {
-                        if let Err(e) = ebpf.write_cidr_table(&all_cidr_entries) {
-                            warn!("Hot-reload: failed to write CIDR entries: {}", e);
+                        if let Err(e) = ebpf.write_cidr_table(&all_cidr_entries, next_slot) {
+                            warn!("Hot-reload: failed to write CIDR entries to slot {}: {}", next_slot, e);
                         } else {
                             info!(
-                                "Hot-reload: wrote {} CIDR entries across {} LPM tries",
+                                "Hot-reload: wrote {} CIDR entries across {} LPM tries to slot {}",
                                 all_cidr_entries.len(),
-                                compiled.lpm_tries.len()
+                                compiled.lpm_tries.len(),
+                                next_slot
                             );
                         }
                     }
+                }
+
+                // Atomically switch the active routing epoch to the new slot
+                if let Err(e) = ebpf.update_active_routing_epoch(next_slot) {
+                    warn!("Hot-reload: failed to update active_routing_epoch: {}", e);
+                } else {
+                    info!("Hot-reload: active_routing_epoch switched to slot {}", next_slot);
+                }
+
+                // Clear the PREVIOUS slot's domain_routing entries (now stale)
+                if let Err(e) = ebpf.clear_domain_routing_slot(prev_slot) {
+                    warn!("Hot-reload: failed to clear domain_routing slot {}: {}", prev_slot, e);
                 }
 
                 // Update excluded comm/PID lists
@@ -2030,10 +2101,14 @@ impl ControlPlane {
             }
         }
 
-        // 4. Re-initialize domain routing tracker
+        // 4. Flip epoch slot and update domain routing tracker
+        self.current_epoch_slot = next_slot;
+
+        // 4a. Re-initialize domain routing tracker with the new epoch slot
         if !compiled.domain_sets.is_empty() {
             self.domain_routing = Some(crate::domain_routing::DomainRoutingTracker::new(
                 std::sync::Arc::new(compiled.domain_sets),
+                next_slot,
             ));
             info!(
                 "Hot-reload: domain routing tracker updated ({} sets)",
@@ -2317,9 +2392,9 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.tproxy_port, 15080);
         assert_eq!(config.route_table, 2023);
-        assert_eq!(config.fwmark_proxy, 0x8000000);
+        assert_eq!(config.fwmark_proxy, 0x08000000);
         assert_eq!(config.fwmark_bypass, 0x04000000);
-        assert_eq!(config.fwmark_mask, 0x8000000);
+        assert_eq!(config.fwmark_mask, 0x08000000);
         assert_eq!(config.mtu, 1500);
         assert_eq!(config.log_level, "info");
         assert_eq!(config.proxy_addr, "127.0.0.1:1080");
@@ -2349,7 +2424,7 @@ mod tests {
         assert_eq!(config.log_level, "info");
         assert_eq!(config.mtu, 1500);
         assert_eq!(config.route_table, 2023);
-        assert_eq!(config.fwmark_proxy, 0x8000000);
+        assert_eq!(config.fwmark_proxy, 0x08000000);
         assert_eq!(config.fwmark_bypass, 0x04000000);
         assert_eq!(config.fwmark_mask, 0x08000000);
         assert_eq!(config.proxy_addr, "127.0.0.1:1080");

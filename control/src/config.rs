@@ -462,12 +462,6 @@ pub struct DaefileConfig {
     pub version: u32,
     /// Runtime parameters
     pub runtime: RuntimeConfig,
-    /// Namespace and veth configuration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<NamespaceConfig>,
-    /// Traffic mark configuration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub marks: Option<MarksConfig>,
     /// Network interface configuration (WAN/LAN)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<InterfaceConfig>,
@@ -491,8 +485,6 @@ impl Default for DaefileConfig {
         Self {
             version: 1,
             runtime: RuntimeConfig::default(),
-            namespace: Some(NamespaceConfig::default()),
-            marks: Some(MarksConfig::default()),
             interface: None,
             process_exclusion: Some(ProcessExclusionConfig::default()),
             outbounds: OutboundsConfig::default(),
@@ -530,40 +522,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Namespace configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct NamespaceConfig {
-    /// Isolation mode (Phase 1 only supports 'isolated')
-    pub mode: String,
-    /// Host-side veth interface name
-    pub host_if: String,
-    /// Proxy-side veth interface name
-    pub peer_if: String,
-    /// Host-side address (CIDR)
-    pub host_addr: String,
-    /// Proxy-side address (CIDR)
-    pub peer_addr: String,
-    /// Interface MTU (576-9000)
-    pub mtu: u32,
-    /// Policy routing table ID
-    pub route_table: u32,
-}
-
-impl Default for NamespaceConfig {
-    fn default() -> Self {
-        Self {
-            mode: "isolated".into(),
-            host_if: "dae-rs-host".into(),
-            peer_if: "dae-rs-peer".into(),
-            host_addr: "169.254.0.1/16".into(),
-            peer_addr: "169.254.0.11/16".into(),
-            mtu: 1500,
-            route_table: 2023,
-        }
-    }
-}
-
 /// Network interface configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -577,28 +535,6 @@ pub struct InterfaceConfig {
     /// Bind interface (auto-detect if set to "auto")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
-}
-
-/// Traffic mark configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct MarksConfig {
-    /// Proxy traffic mark
-    pub proxy: u32,
-    /// Bypass traffic mark
-    pub bypass: u32,
-    /// Mark mask
-    pub mask: u32,
-}
-
-impl Default for MarksConfig {
-    fn default() -> Self {
-        Self {
-            proxy: 0x08000000,
-            bypass: 0x04000000,
-            mask: 0x0f000000,
-        }
-    }
 }
 
 /// Process exclusion match rules
@@ -831,12 +767,8 @@ enum ParseState {
     Top,
     /// Inside global section
     Global,
-    /// Inside namespace section
-    Namespace,
     /// Inside interface section
     Interface,
-    /// Inside mark section
-    Mark,
     /// Inside process_exclusion section
     ProcessExclusion,
     /// Inside process_exclusion > match block
@@ -953,9 +885,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
                     match section_name {
                         "global" => state = ParseState::Global,
-                        "namespace" => state = ParseState::Namespace,
                         "interface" => state = ParseState::Interface,
-                        "mark" => state = ParseState::Mark,
                         "process_exclusion" => state = ParseState::ProcessExclusion,
                         "outbounds" => state = ParseState::Outbounds,
                         "routing" => state = ParseState::Routing,
@@ -1009,45 +939,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 })?;
             }
 
-            // ── namespace ──
-            ParseState::Namespace => {
-                if line == "}" {
-                    state = ParseState::Top;
-                    continue;
-                }
-                let ns = config.namespace.get_or_insert_with(NamespaceConfig::default);
-                parse_kv_pair(line, line_number, |key, value| {
-                    match key {
-                        "mode" => ns.mode = unquote(value).to_string(),
-                        "veth_host" => ns.host_if = unquote(value).to_string(),
-                        "veth_peer" => ns.peer_if = unquote(value).to_string(),
-                        "host_addr" => ns.host_addr = unquote(value).to_string(),
-                        "peer_addr" => ns.peer_addr = unquote(value).to_string(),
-                        "mtu" => {
-                            ns.mtu = value.parse().map_err(|_| ConfigError::FieldType {
-                                line: line_number,
-                                field: key.into(),
-                                message: format!("cannot parse as integer: '{}'", value),
-                            })?;
-                        }
-                        "route_table" => {
-                            ns.route_table = value.parse().map_err(|_| ConfigError::FieldType {
-                                line: line_number,
-                                field: key.into(),
-                                message: format!("cannot parse as integer: '{}'", value),
-                            })?;
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown namespace field: '{}'", key),
-                            });
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-
             // ── interface ──
             ParseState::Interface => {
                 if line == "}" {
@@ -1074,39 +965,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                             return Err(ConfigError::Syntax {
                                 line: line_number,
                                 message: format!("unknown interface field: '{}'", key),
-                            });
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-
-            // ── mark ──
-            ParseState::Mark => {
-                if line == "}" {
-                    state = ParseState::Top;
-                    continue;
-                }
-                let marks = config.marks.get_or_insert_with(MarksConfig::default);
-                parse_kv_pair(line, line_number, |key, value| {
-                    match key {
-                        "proxy" | "bypass" | "mask" => {
-                            let v = parse_hex(value).map_err(|_| ConfigError::FieldType {
-                                line: line_number,
-                                field: key.into(),
-                                message: format!("cannot parse as hex: '{}'", value),
-                            })?;
-                            match key {
-                                "proxy" => marks.proxy = v,
-                                "bypass" => marks.bypass = v,
-                                "mask" => marks.mask = v,
-                                _ => unreachable!(),
-                            }
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown mark field: '{}'", key),
                             });
                         }
                     }
@@ -2195,25 +2053,6 @@ fn validate_ranges(config: &DaefileConfig) -> std::result::Result<(), ConfigErro
         });
     }
 
-    if let Some(ref ns) = config.namespace {
-        // mtu: 576-9000
-        if ns.mtu < 576 || ns.mtu > 9000 {
-            return Err(ConfigError::OutOfRange {
-                line: 0,
-                field: "mtu".into(),
-                message: format!("MTU {} is not in range 576-9000", ns.mtu),
-            });
-        }
-        // route_table: 1-4294967295
-        if ns.route_table < 1 {
-            return Err(ConfigError::OutOfRange {
-                line: 0,
-                field: "route_table".into(),
-                message: format!("route table ID {} is invalid", ns.route_table),
-            });
-        }
-    }
-
     // Node dial_timeout_ms: 100-600000
     for node in &config.outbounds.nodes {
         if node.dial_timeout_ms < 100 || node.dial_timeout_ms > 600_000 {
@@ -2224,24 +2063,6 @@ fn validate_ranges(config: &DaefileConfig) -> std::result::Result<(), ConfigErro
                     "node '{}' dial_timeout_ms {} is not in range 100-600000",
                     node.name, node.dial_timeout_ms
                 ),
-            });
-        }
-    }
-
-    // Marks validation
-    if let Some(ref marks) = config.marks {
-        if marks.proxy & marks.mask == 0 {
-            return Err(ConfigError::OutOfRange {
-                line: 0,
-                field: "mark.proxy".into(),
-                message: "proxy & mask must not be 0".into(),
-            });
-        }
-        if marks.bypass & marks.mask == 0 {
-            return Err(ConfigError::OutOfRange {
-                line: 0,
-                field: "mark.bypass".into(),
-                message: "bypass & mask must not be 0".into(),
             });
         }
     }
@@ -2667,22 +2488,6 @@ mod tests {
   log_level: info
 }
 
-namespace {
-  mode: isolated
-  veth_host: dae-rs-host
-  veth_peer: dae-rs-peer
-  host_addr: 169.254.0.1/16
-  peer_addr: 169.254.0.11/16
-  mtu: 1500
-  route_table: 2023
-}
-
-mark {
-  proxy: 0x02000000
-  bypass: 0x04000000
-  mask: 0x0f000000
-}
-
 process_exclusion {
   enabled: true
   protect_self: true
@@ -2751,22 +2556,6 @@ api {
         assert_eq!(config.runtime.tproxy_port, 15080);
         assert_eq!(config.runtime.log_level, "info");
         assert!(config.runtime.temp_json);
-
-        // namespace
-        let ns = config.namespace.as_ref().expect("namespace should exist");
-        assert_eq!(ns.mode, "isolated");
-        assert_eq!(ns.host_if, "dae-rs-host");
-        assert_eq!(ns.peer_if, "dae-rs-peer");
-        assert_eq!(ns.host_addr, "169.254.0.1/16");
-        assert_eq!(ns.peer_addr, "169.254.0.11/16");
-        assert_eq!(ns.mtu, 1500);
-        assert_eq!(ns.route_table, 2023);
-
-        // marks
-        let marks = config.marks.as_ref().expect("marks should exist");
-        assert_eq!(marks.proxy, 0x02000000);
-        assert_eq!(marks.bypass, 0x04000000);
-        assert_eq!(marks.mask, 0x0f000000);
 
         // process_exclusion
         let pe = config.process_exclusion.as_ref().expect("process_exclusion should exist");
@@ -3170,45 +2959,8 @@ routing {
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
 
-    #[test]
-    fn test_mtu_out_of_range() {
-        let input = r#"global {
-  tproxy_port: 15080
-  log_level: info
-}
-
-namespace {
-  mode: isolated
-  mtu: 9999
-}
-
-outbounds {
-  nodes {
-    main {
-      protocol: socks5
-      address: 127.0.0.1:1080
-    }
-  }
-
-  groups {
-    g {
-      policy: fixed
-      nodes(main)
-    }
-  }
-}
-
-routing {
-  fallback: proxy(g)
-}
-"#;
-        let config = parse_daefile(input).expect("parse failed");
-        let err = validate_config(&config).unwrap_err();
-        assert!(matches!(err, ConfigError::OutOfRange { .. }));
-        if let ConfigError::OutOfRange { field, .. } = &err {
-            assert_eq!(field, "mtu");
-        }
-    }
+    // test_mtu_out_of_range removed: namespace/marks are now hardcoded,
+    // no longer configurable via daefile.
 
     #[test]
     fn test_import_node() {

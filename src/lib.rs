@@ -144,11 +144,16 @@ pub async fn run(
     let mut ebpf_param = control::ebpf::Daeparam::default();
     ebpf_param.tproxy_port = cp.config.tproxy_port as u32;
     ebpf_param.control_plane_pid = std::process::id();
+    // dae_socket_mark: used by eBPF pid_is_control_plane() to identify
+    // dae-rs's own sockets and skip them (prevents self-loop).
+    // Must match socket_mark (0x100) used by TProxy and SOCKS5 dialers.
+    ebpf_param.dae_socket_mark = 0x100;
     // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
     cp.ebpf_param = Some(ebpf_param);
     debug!(
         tproxy_port = ebpf_param.tproxy_port,
         control_plane_pid = ebpf_param.control_plane_pid,
+        dae_socket_mark = ebpf_param.dae_socket_mark,
         "Initial eBPF PARAM configured"
     );
 

@@ -39,14 +39,27 @@ pub struct DomainRoutingTracker {
     entries: HashMap<String, DomainIpMapping>,
     /// Reference to domain sets from compiled routing rules.
     domain_sets: Arc<Vec<Vec<String>>>,
+    /// Current routing epoch slot (0 or 1) that domain entries are written to.
+    epoch_slot: u32,
 }
 
 impl DomainRoutingTracker {
-    pub fn new(domain_sets: Arc<Vec<Vec<String>>>) -> Self {
+    pub fn new(domain_sets: Arc<Vec<Vec<String>>>, epoch_slot: u32) -> Self {
         Self {
             entries: HashMap::new(),
             domain_sets,
+            epoch_slot,
         }
+    }
+
+    /// Update the epoch slot for subsequent writes.
+    pub fn set_epoch_slot(&mut self, slot: u32) {
+        self.epoch_slot = slot;
+    }
+
+    /// Get the current epoch slot.
+    pub fn epoch_slot(&self) -> u32 {
+        self.epoch_slot
     }
 
     /// Add a DNS resolution result.
@@ -94,9 +107,9 @@ impl DomainRoutingTracker {
             },
         );
 
-        // Write to eBPF domain_routing_map
+        // Write to eBPF domain_routing_map (with epoch slot prefix)
         let ip_bytes = ip_to_16_bytes(ip);
-        ebpf.write_domain_routing_map(&[(ip_bytes, bitmap.clone())])?;
+        ebpf.write_domain_routing_map(&[(ip_bytes, bitmap.clone())], self.epoch_slot)?;
 
         info!(
             "DomainRouting: {} -> {} (ttl={}s, bitmap={:08x?})",
@@ -111,7 +124,7 @@ impl DomainRoutingTracker {
         let key = ip.to_string();
         if self.entries.remove(&key).is_some() {
             let ip_bytes = ip_to_16_bytes(*ip);
-            ebpf.delete_domain_routing_entries(&[ip_bytes])?;
+            ebpf.delete_domain_routing_entries(&[ip_bytes], self.epoch_slot)?;
             debug!("DomainRouting: removed {}", ip);
         }
         Ok(())
@@ -129,7 +142,7 @@ impl DomainRoutingTracker {
 
         for ip in &expired {
             let ip_bytes = ip_to_16_bytes(*ip);
-            ebpf.delete_domain_routing_entries(&[ip_bytes])?;
+            ebpf.delete_domain_routing_entries(&[ip_bytes], self.epoch_slot)?;
             self.entries.remove(&ip.to_string());
         }
 

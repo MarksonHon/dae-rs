@@ -47,6 +47,11 @@ pub const MAX_MATCH_SET_LEN: usize = 32 * 32; // 1024, must match tproxy.c
 /// Max entries per inner LPM trie (must match tproxy.c MAX_LPM_SIZE)
 pub const MAX_LPM_SIZE: u32 = 2_048_000;
 
+/// Number of routing epoch slots for double-buffering (must match tproxy.c ROUTING_EPOCH_SLOT_NUM).
+pub const ROUTING_EPOCH_SLOT_NUM: u32 = 2;
+/// Encoded value for "unknown" epoch slot (not slot 0 or 1).
+pub const ROUTING_EPOCH_SLOT_UNKNOWN: u8 = 0;
+
 /// eBPF 文件系统 pinning 路径
 pub const BPFFS_PATH: &str = "/sys/fs/bpf/dae";
 
@@ -88,7 +93,9 @@ pub struct Daeparam {
     pub padding_after_mac: [u8; 2],
     pub use_redirect_peer: u8,
     pub has_bpf_get_current_task: u8,
-    pub padding2: u16,
+    /// Datapath generation counter. Initial value is 0; incremented on datapath
+    /// reload (e.g. configuration change). Must match `struct dae_param` in tproxy.c.
+    pub datapath_generation: u16,
     pub dae_socket_mark: u32,
 }
 
@@ -103,7 +110,7 @@ impl Default for Daeparam {
             padding_after_mac: [0u8; 2],
             use_redirect_peer: 0,
             has_bpf_get_current_task: 0,
-            padding2: 0,
+            datapath_generation: 0,
             // 原版 dae 使用 0x100 作为内部 socket 标记
             // 用于 bpf_sock_is_dae_socket() 和 pid_is_control_plane() 中的 mark 检查
             dae_socket_mark: 0x100,
@@ -212,7 +219,20 @@ pub struct RoutingMeta {
 }
 
 // ---- tproxy.c: struct conn_state ----
-/// Size: 56 bytes (aligned to 8). Explicit tail padding for bytemuck::Pod compatibility.
+/// Size: 64 bytes (aligned to 8). Must match C struct layout exactly.
+/// Field layout:
+/// - is_wan_ingress_direction: offset 0,  1 byte  (bool)
+/// - state:                     offset 1,  1 byte  (u8)
+/// - _pad1:                     offset 2,  6 bytes (pad to align u64)
+/// - last_seen_ns:             offset 8,  8 bytes (u64)
+/// - meta:                      offset 16, ? bytes (RoutingMeta)
+/// - mac:                       ?        , 6 bytes
+/// - _pad2:                     ?        , 2 bytes
+/// - pname:                     ?        , 16 bytes
+/// - pid:                       ?        , 4 bytes
+/// - routing_epoch_slot:        ?        , 1 byte
+/// - padding_after_pid:         ?        , 1 byte
+/// - datapath_generation:       ?        , 2 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ConnState {
@@ -225,7 +245,13 @@ pub struct ConnState {
     pub _pad2: [u8; 2], // pad to align pname
     pub pname: [u8; 16],
     pub pid: u32,
-    pub _tail_pad: [u8; 4], // pad total to 56 (multiple of max alignment 8)
+    /// 0 is unknown; active routing slots 0 and 1 are encoded as 1 and 2.
+    /// Must match `struct conn_state.routing_epoch_slot` in tproxy.c.
+    pub routing_epoch_slot: u8,
+    pub padding_after_pid: u8,
+    /// Datapath generation counter from PARAM. Used to detect stale routing entries
+    /// when the datapath is reloaded. Must match `struct conn_state.datapath_generation` in tproxy.c.
+    pub datapath_generation: u16,
 }
 
 impl ConnState {
@@ -235,7 +261,18 @@ impl ConnState {
 }
 
 // ---- tproxy.c: struct routing_result ----
-/// Size: 36 bytes (aligned to 4). Explicit tail padding for bytemuck::Pod.
+/// Size: 36 bytes (aligned to 4). Must match C struct layout exactly.
+///
+/// Field layout:
+/// - mark:        offset 0,  4 bytes (u32)
+/// - must:        offset 4,  1 byte  (u8)
+/// - mac:         offset 5,  6 bytes (u8[6])
+/// - outbound:    offset 11, 1 byte  (u8)
+/// - pname:       offset 12, 16 bytes (u8[16])
+/// - pid:         offset 28, 4 bytes (u32)
+/// - dscp:        offset 32, 1 byte  (u8)
+/// - routing_epoch_slot: offset 33, 1 byte (u8)
+/// - datapath_generation: offset 34, 2 bytes (u16)
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RoutingResult {
@@ -246,7 +283,24 @@ pub struct RoutingResult {
     pub pname: [u8; 16],
     pub pid: u32,
     pub dscp: u8,
-    pub _pad: [u8; 3],
+    /// Active routing epoch slot. 0 = unknown; slots 0 and 1 encoded as 1 and 2.
+    /// Must match `struct routing_result.routing_epoch_slot` in tproxy.c.
+    pub routing_epoch_slot: u8,
+    /// Datapath generation counter from PARAM. Used to detect stale routing entries
+    /// when the datapath is reloaded. Must match `struct routing_result.datapath_generation` in tproxy.c.
+    pub datapath_generation: u16,
+}
+
+// ---- tproxy.c: struct routing_epoch_ip ----
+/// Key for domain_routing_map: (slot, addr) → routing bitmap cache.
+/// Must match `struct routing_epoch_ip` in tproxy.c exactly.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct RoutingEpochIp {
+    /// Epoch slot (0 or 1)
+    pub slot: u32,
+    /// IPv6 address (IPv4 mapped as ::ffff:x.x.x.x), stored as __be32[4]
+    pub addr: [u32; 4],
 }
 
 // ---- tproxy.c: struct routing_handoff_entry ----
@@ -440,6 +494,47 @@ pub fn hash_comm(comm: &str) -> u32 {
         i += 1;
     }
     hash
+}
+
+/// Compute the base index in routing_map/lpm_array_map for a given epoch slot.
+///
+/// Each epoch slot owns `MAX_MATCH_SET_LEN` entries in routing_map and
+/// `MAX_MATCH_SET_LEN` entries in lpm_array_map.
+///
+/// Matches kdae's `routingEpochSlotBase()` function.
+pub fn routing_epoch_slot_base(slot: u32) -> Result<u32> {
+    if slot >= ROUTING_EPOCH_SLOT_NUM {
+        return Err(anyhow::anyhow!(
+            "invalid routing epoch slot {} (max {})",
+            slot,
+            ROUTING_EPOCH_SLOT_NUM
+        ));
+    }
+    Ok(slot * MAX_MATCH_SET_LEN as u32)
+}
+
+/// Encode an epoch slot for wire use in routing_result and conn_state.
+///
+/// The C side encodes slot N as (N + 1), with 0 meaning "unknown".
+/// Matches `routing_epoch_slot_encode()` in tproxy.c.
+pub fn routing_epoch_slot_encode(slot: u32) -> u8 {
+    if slot >= ROUTING_EPOCH_SLOT_NUM {
+        ROUTING_EPOCH_SLOT_UNKNOWN
+    } else {
+        (slot + 1) as u8
+    }
+}
+
+/// Decode a wire-encoded epoch slot back to the slot number.
+///
+/// Returns `(slot, true)` if valid, or `(0, false)` if unknown.
+/// Matches `decodeBpfRoutingEpochSlot()` in kdae.
+pub fn routing_epoch_slot_decode(encoded: u8) -> (u32, bool) {
+    match encoded {
+        1 => (0, true),
+        2 => (1, true),
+        _ => (0, false),
+    }
 }
 
 /// Find a program by name in the loaded object.
@@ -915,6 +1010,34 @@ impl EbpfManager {
         // 获取 eBPF 对象（可变引用，因为 Map::pin() 需要 &mut self）
         let obj = self.obj.as_mut().ok_or("eBPF object not loaded")?;
 
+        // 收集所有需要 pin 的 map 名称（先收集，再清理旧 pin，最后 pin）
+        // 这样避免在遍历 maps_mut() 时同时做清理操作。
+        let map_names: Vec<String> = obj
+            .maps()
+            .filter_map(|m| {
+                let name = m.name().to_string_lossy().to_string();
+                if name.starts_with('.') || name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            })
+            .collect();
+
+        // 清理旧 pin：移除 /sys/fs/bpf/ 根目录下的旧 dae map 文件
+        // 上一次 dae-rs 运行可能在 /sys/fs/bpf/<map_name> 留下了旧 pin，
+        // 而 libbpf 要求 map 只能 pin 到一个路径，否则 pin 会失败。
+        let bpffs_root = std::path::Path::new("/sys/fs/bpf");
+        if bpffs_root.exists() {
+            for name in &map_names {
+                let old_pin = bpffs_root.join(name);
+                if old_pin.exists() && old_pin != dir.join(name) {
+                    debug!("Removing stale pin at {:?}", old_pin);
+                    let _ = std::fs::remove_file(&old_pin);
+                }
+            }
+        }
+
         // 遍历所有 maps 并 pin
         for mut map in obj.maps_mut() {
             let map_name = map.name().to_string_lossy().to_string();
@@ -1020,10 +1143,14 @@ impl EbpfManager {
                 hook.handle(h);
             }
 
-            // 对于 dae-rs-host/dae-rs-peer（netkit 设备），先删除已存在的 clsact qdisc，
-            // 再重新创建。原因是 netkit 设备上的 clsact 如果已存在，
-            // hook.create() 是 no-op，导致之前设置的 priority 不生效。
-            if ifname == "dae-rs-host" || ifname == "dae-rs-peer" {
+            // 对所有接口（包括 WAN、LAN、netkit 设备），先删除已存在的 clsact qdisc，
+            // 再重新创建。原因：
+            // 1. netkit 设备上的 clsact 如果已存在，hook.create() 是 no-op，
+            //    导致之前设置的 priority 不生效。
+            // 2. WAN/LAN 接口上可能有上一次 dae-rs 运行遗留的旧 TC filter，
+            //    "Exclusivity flag on, cannot modify" 错误会导致新 filter 无法安装，
+            //    使得 egress_entered=0，整个代理管道失效。
+            {
                 let output = Command::new("tc")
                     .args(["qdisc", "del", "dev", ifname, "clsact"])
                     .output()
@@ -1433,16 +1560,53 @@ impl EbpfManager {
         find_map_mut(obj, name)
     }
 
+    /// Update the `dae_ifindex_map` with the current dae0 ifindex.
+    ///
+    /// This allows the BPF datapath to pick up a new ifindex without reloading
+    /// the eBPF program (e.g. when the kernel recreates dae0).
+    pub fn update_dae_ifindex_map(&mut self, ifindex: u32) -> Result<()> {
+        let map = self.get_map_mut("dae_ifindex_map")?;
+        let key = 0u32.to_ne_bytes();
+        let val = ifindex.to_ne_bytes();
+        map.update(&key, &val, MapFlags::empty())
+            .context("Failed to update dae_ifindex_map")?;
+        info!("Updated dae_ifindex_map: ifindex={}", ifindex);
+        Ok(())
+    }
+
+    /// Update the `active_routing_epoch_map` to point to the given slot.
+    ///
+    /// The eBPF datapath reads this map at the start of every `route()` call
+    /// to determine which epoch slot is active. Writing to this map atomically
+    /// switches the datapath to the new routing rules.
+    pub fn update_active_routing_epoch(&mut self, slot: u32) -> Result<()> {
+        let map = self.get_map_mut("active_routing_epoch_map")?;
+        let key = 0u32.to_ne_bytes();
+        let val = slot.to_ne_bytes();
+        map.update(&key, &val, MapFlags::empty())
+            .context("Failed to update active_routing_epoch_map")?;
+        info!("Updated active_routing_epoch_map: slot={}", slot);
+        Ok(())
+    }
+
     /// Write MatchSet entries to routing_map using batch update (single syscall).
     ///
+    /// `epoch_slot` specifies which routing epoch slot to write into (0 or 1).
+    /// Each slot owns `MAX_MATCH_SET_LEN` entries in routing_map, starting at
+    /// `epoch_slot * MAX_MATCH_SET_LEN`.
+    ///
+    /// Also writes the active rules length to `routing_meta_map[epoch_slot]`.
+    ///
     /// Falls back to individual updates if the kernel doesn't support batch operations.
-    pub fn write_routing_rules(&mut self, match_sets: &[MatchSet]) -> Result<()> {
+    pub fn write_routing_rules(&mut self, match_sets: &[MatchSet], epoch_slot: u32) -> Result<()> {
         use std::ffi::c_void;
         use std::os::unix::io::AsRawFd;
 
+        let slot_base = routing_epoch_slot_base(epoch_slot)?;
         let start = std::time::Instant::now();
         info!(
             count = match_sets.len(),
+            epoch_slot,
             "Writing routing rules to routing_map"
         );
         debug!("First match_set type={}, outbound={}", match_sets.first().map(|m| m.r#type).unwrap_or(0), match_sets.first().map(|m| m.outbound).unwrap_or(0));
@@ -1450,10 +1614,11 @@ impl EbpfManager {
         let fd = map.as_fd().as_raw_fd();
 
         // Batch update active rules via libbpf-sys bpf_map_update_batch
+        // Keys are offset by slot_base so each epoch slot gets its own range.
         if !match_sets.is_empty() {
             let num = match_sets.len() as u32;
             let mut count = num;
-            let keys: Vec<u32> = (0..num).collect();
+            let keys: Vec<u32> = (0..num).map(|i| i + slot_base).collect();
             let values: Vec<MatchSet> = match_sets.to_vec();
 
             let ret = unsafe {
@@ -1473,7 +1638,7 @@ impl EbpfManager {
                 );
                 // Fall back to individual updates
                 for (i, ms) in match_sets.iter().enumerate() {
-                    let key = (i as u32).to_ne_bytes();
+                    let key = (slot_base + i as u32).to_ne_bytes();
                     map.update(&key, bytemuck::bytes_of(ms), MapFlags::empty())
                         .with_context(|| format!("Failed to write match_set at index {}", i))?;
                 }
@@ -1482,27 +1647,30 @@ impl EbpfManager {
             }
         }
 
-        // Zero-fill unused entries (individually — they're few and rarely change)
+        // Zero-fill unused entries in this slot's range
         let empty = MatchSet::zeroed();
-        for i in match_sets.len()..ROUTING_MAP_MAX as usize {
-            let key = (i as u32).to_ne_bytes();
+        for i in match_sets.len()..MAX_MATCH_SET_LEN {
+            let key = (slot_base + i as u32).to_ne_bytes();
             let _ = map.update(&key, bytemuck::bytes_of(&empty), MapFlags::empty())?;
         }
 
-        // Update routing_meta_map with active rule count
+        // Update routing_meta_map[epoch_slot] with active rule count
         drop(map);
         let meta_map = self.get_map_mut("routing_meta_map")?;
-        let meta_key = 0u32.to_ne_bytes();
+        let meta_key = epoch_slot.to_ne_bytes();
         let active_len = match_sets.len() as u32;
         meta_map.update(&meta_key, &active_len.to_ne_bytes(), MapFlags::empty())?;
         debug!(
-            "routing_map write: {} entries, {}ms",
+            "routing_map write: {} entries (slot={}, base={}), {}ms",
             match_sets.len(),
+            epoch_slot,
+            slot_base,
             start.elapsed().as_millis()
         );
         info!(
-            "Wrote {} match sets (active_len={})",
+            "Wrote {} match sets to slot {} (active_len={})",
             match_sets.len(),
+            epoch_slot,
             active_len
         );
         Ok(())
@@ -1515,9 +1683,13 @@ impl EbpfManager {
     ///   - `index`: slot index in the outer ARRAY_OF_MAPS (corresponds to `match_set->index`)
     ///   - `CidrEntry`: the CIDR entry containing IP (16 bytes) and prefix_len
     ///
+    /// `epoch_slot` offsets the outer array index by `epoch_slot * MAX_MATCH_SET_LEN`
+    /// so each epoch slot gets its own LPM index range.
+    ///
     /// This function groups entries by index, looks up the inner LPM trie FD for each
     /// index from the outer map, and writes `(LpmKey, u32)` entries to the inner trie.
-    pub fn write_cidr_table(&mut self, entries: &[(u32, CidrEntry)]) -> Result<()> {
+    pub fn write_cidr_table(&mut self, entries: &[(u32, CidrEntry)], epoch_slot: u32) -> Result<()> {
+        let slot_base = routing_epoch_slot_base(epoch_slot)?;
         let start = std::time::Instant::now();
         use std::ffi::c_void;
         use std::os::unix::io::AsRawFd;
@@ -1599,7 +1771,8 @@ impl EbpfManager {
             // For BPF_MAP_TYPE_ARRAY_OF_MAPS, the value in update_elem is the
             // FD of the inner map (as an i32 in native byte order).
             let inner_fd = inner_map.as_fd().as_raw_fd() as i32;
-            let idx_bytes = array_idx.to_ne_bytes();
+            let outer_idx = slot_base + array_idx;
+            let idx_bytes = outer_idx.to_ne_bytes();
             let fd_bytes = inner_fd.to_ne_bytes();
             let ret = unsafe {
                 libbpf_sys::bpf_map_update_elem(
@@ -1990,21 +2163,36 @@ impl EbpfManager {
 
     /// Write IP → domain bitmap entries to domain_routing_map.
     ///
-    /// Each entry maps an IPv6 address (IPv4 mapped as ::ffff:x.x.x.x) to a bitmap
-    /// where each bit corresponds to a domain set rule in routing_map.
+    /// Each entry maps a `(epoch_slot, IPv6 address)` pair to a bitmap where
+    /// each bit corresponds to a domain set rule in routing_map.
     ///
-    /// The bitmap is a dynamically-sized `Vec<u32>`. It is padded with zeros to
-    /// the eBPF map's fixed value size of `MAX_MATCH_SET_LEN / 8` bytes (128 bytes)
-    /// before writing.
+    /// The key is `RoutingEpochIp { slot, addr }` (20 bytes) to match the C-side
+    /// `struct routing_epoch_ip`. The bitmap is padded to `MAX_MATCH_SET_LEN / 8`
+    /// bytes (128 bytes) before writing.
+    ///
+    /// `epoch_slot` specifies which routing epoch slot the domain entries belong to.
     pub fn write_domain_routing_map(
         &mut self,
         entries: &[([u8; 16], Vec<u32>)],
+        epoch_slot: u32,
     ) -> Result<()> {
-        info!(count = entries.len(), "Writing domain routing entries");
+        info!(count = entries.len(), epoch_slot, "Writing domain routing entries");
         let map = self.get_map_mut("domain_routing_map")?;
         let expected_bytes = MAX_MATCH_SET_LEN / 8; // 128 bytes = 32 u32 words
 
         for (ip, bitmap) in entries {
+            // Build RoutingEpochIp key: slot + IPv6 address (as __be32[4])
+            let addr_u32: [u32; 4] = [
+                u32::from_ne_bytes([ip[0], ip[1], ip[2], ip[3]]),
+                u32::from_ne_bytes([ip[4], ip[5], ip[6], ip[7]]),
+                u32::from_ne_bytes([ip[8], ip[9], ip[10], ip[11]]),
+                u32::from_ne_bytes([ip[12], ip[13], ip[14], ip[15]]),
+            ];
+            let key = RoutingEpochIp {
+                slot: epoch_slot,
+                addr: addr_u32,
+            };
+
             // Convert Vec<u32> to bytes, padding to expected size for eBPF map.
             let raw = bytemuck::cast_slice::<u32, u8>(bitmap);
             let mut padded = vec![0u8; expected_bytes];
@@ -2012,7 +2200,7 @@ impl EbpfManager {
             padded[..copy_len].copy_from_slice(&raw[..copy_len]);
 
             map.update(
-                bytemuck::bytes_of(ip),
+                bytemuck::bytes_of(&key),
                 &padded,
                 MapFlags::empty(),
             )
@@ -2021,21 +2209,32 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// Delete IP entries from domain_routing_map.
-    pub fn delete_domain_routing_entries(&mut self, ips: &[[u8; 16]]) -> Result<()> {
+    /// Delete IP entries from domain_routing_map for a specific epoch slot.
+    pub fn delete_domain_routing_entries(&mut self, ips: &[[u8; 16]], epoch_slot: u32) -> Result<()> {
         let map = self.get_map_mut("domain_routing_map")?;
         for ip in ips {
-            let _ = map.delete(bytemuck::bytes_of(ip));
+            let addr_u32: [u32; 4] = [
+                u32::from_ne_bytes([ip[0], ip[1], ip[2], ip[3]]),
+                u32::from_ne_bytes([ip[4], ip[5], ip[6], ip[7]]),
+                u32::from_ne_bytes([ip[8], ip[9], ip[10], ip[11]]),
+                u32::from_ne_bytes([ip[12], ip[13], ip[14], ip[15]]),
+            ];
+            let key = RoutingEpochIp {
+                slot: epoch_slot,
+                addr: addr_u32,
+            };
+            let _ = map.delete(bytemuck::bytes_of(&key));
         }
         Ok(())
     }
 
-    /// 清空 domain_routing_map 的所有条目。
+    /// 清空 domain_routing_map 中指定 epoch slot 的所有条目。
     ///
-    /// 遍历所有 key（16 字节 IP 地址）并逐个删除。
+    /// 遍历所有 key（`RoutingEpochIp` = slot + addr，20 字节）并逐个删除
+    /// 属于指定 slot 的条目。
     /// 在热重载（reload_config）时调用，以清除旧的路由规则映射。
     /// 返回删除的条目数。
-    pub fn clear_domain_routing_map(&mut self) -> Result<u32> {
+    pub fn clear_domain_routing_slot(&mut self, epoch_slot: u32) -> Result<u32> {
         use std::os::fd::AsRawFd;
 
         let map = self.get_map_mut("domain_routing_map")?;
@@ -2046,7 +2245,7 @@ impl EbpfManager {
 
         loop {
             let next_key = {
-                let mut buf = vec![0u8; 16]; // 16-byte IP key (IPv4-mapped IPv6)
+                let mut buf = vec![0u8; std::mem::size_of::<RoutingEpochIp>()];
                 let ret = unsafe {
                     libc::syscall(
                         libc::SYS_bpf,
@@ -2066,22 +2265,29 @@ impl EbpfManager {
                 buf
             };
 
-            // Delete this entry
-            unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    5i64, // BPF_MAP_DELETE_ELEM
-                    &(map_fd as u32),
-                    next_key.as_ptr(),
-                    std::ptr::null::<u8>(),
-                );
+            // Only delete entries belonging to the specified epoch slot
+            if next_key.len() >= 4 {
+                let key_slot = u32::from_ne_bytes([
+                    next_key[0], next_key[1], next_key[2], next_key[3],
+                ]);
+                if key_slot == epoch_slot {
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_bpf,
+                            5i64, // BPF_MAP_DELETE_ELEM
+                            &(map_fd as u32),
+                            next_key.as_ptr(),
+                            std::ptr::null::<u8>(),
+                        );
+                    }
+                    count += 1;
+                }
             }
-            count += 1;
             prev_key = next_key;
         }
 
         if count > 0 {
-            info!("Cleared {} entries from domain_routing_map", count);
+            info!("Cleared {} entries from domain_routing_map slot {}", count, epoch_slot);
         }
 
         Ok(count)
@@ -2700,8 +2906,34 @@ mod tests {
     }
 
     #[test]
+    fn test_routing_epoch_ip_size() {
+        // RoutingEpochIp: slot(u32) + addr(__be32[4]) = 4 + 16 = 20 bytes
+        assert_eq!(std::mem::size_of::<RoutingEpochIp>(), 20);
+    }
+
+    #[test]
     fn test_routing_handoff_entry_size() {
         assert_eq!(std::mem::size_of::<RoutingHandoffEntry>(), 48);
+    }
+
+    #[test]
+    fn test_routing_epoch_slot_base() {
+        assert_eq!(routing_epoch_slot_base(0).unwrap(), 0);
+        assert_eq!(routing_epoch_slot_base(1).unwrap(), MAX_MATCH_SET_LEN as u32);
+        assert!(routing_epoch_slot_base(2).is_err());
+    }
+
+    #[test]
+    fn test_routing_epoch_slot_encode_decode() {
+        // Encode/decode round-trip
+        assert_eq!(routing_epoch_slot_encode(0), 1);
+        assert_eq!(routing_epoch_slot_encode(1), 2);
+        assert_eq!(routing_epoch_slot_encode(2), ROUTING_EPOCH_SLOT_UNKNOWN);
+
+        assert_eq!(routing_epoch_slot_decode(1), (0, true));
+        assert_eq!(routing_epoch_slot_decode(2), (1, true));
+        assert_eq!(routing_epoch_slot_decode(0), (0, false));
+        assert_eq!(routing_epoch_slot_decode(3), (0, false));
     }
 
     #[test]

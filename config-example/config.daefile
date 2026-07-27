@@ -9,22 +9,6 @@ interface {
   # bind_interface: auto
 }
 
-namespace {
-  mode: isolated
-  veth_host: dae-rs-host
-  veth_peer: dae-rs-peer
-  host_addr: 169.254.0.1/16
-  peer_addr: 169.254.0.11/16
-  mtu: 1500
-  route_table: 2023
-}
-
-mark {
-  proxy: 0x8000000
-  bypass: 0x04000000
-  mask: 0x8000000
-}
-
 process_exclusion {
   enabled: true
   protect_self: true

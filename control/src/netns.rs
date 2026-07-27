@@ -44,7 +44,6 @@
 //! - 通过 setns() 进行 daens 内操作
 //! - 使用永久 ARP/NDP 条目替代广播
 
-use crate::Config;
 use anyhow::{Context, Result};
 use rtnetlink::packet_route::link::{NetkitMode, NetkitScrub};
 use rtnetlink::packet_route::route::RouteScope;
@@ -72,10 +71,10 @@ const NS_NAME: &str = "dae-rs";
 const NETNS_RUN_DIR: &str = "/var/run/netns";
 
 /// 宿主侧接口名（位于宿主 NS）
-const HOST_IF: &str = "dae-rs-host";
+pub const HOST_IF: &str = "dae-rs-host";
 
 /// 代理侧接口名（位于 daens）
-const PEER_IF: &str = "dae-rs-peer";
+pub const PEER_IF: &str = "dae-rs-peer";
 
 /// 代理侧 IPv4 地址
 const PEER_ADDR: &str = "169.254.0.11/32";
@@ -87,12 +86,16 @@ const NEXTHOP_ADDR: &str = "169.254.0.1";
 const IPV6_LL: &str = "fe80::ecee:eeff:feee:eeee";
 
 /// 默认 MTU
-#[allow(dead_code)]
 const DEFAULT_MTU: u32 = 1500;
 
 /// 默认策略路由表 ID
-#[allow(dead_code)]
 const DEFAULT_ROUTE_TABLE: u32 = 2023;
+
+/// TPROXY_MARK（与原版 dae 一致）
+const PROXY_MARK: u32 = 0x08000000;
+
+/// TPROXY_MASK（与原版 dae 一致）
+const PROXY_MASK: u32 = 0x08000000;
 
 // ============================================================================
 // 错误类型
@@ -351,20 +354,33 @@ pub struct NetnsManager {
 }
 
 impl NetnsManager {
-    /// 从配置对象创建管理器
+    /// 创建管理器（使用硬编码值）
     ///
     /// 此时不会创建命名空间，仅保存配置参数。
     /// 调用 [`create()`](NetnsManager::create) 后才实际创建。
-    pub fn new(config: &Config) -> Self {
+    ///
+    /// # 硬编码值
+    ///
+    /// | 参数 | 值 | 说明 |
+    /// |------|------|------|
+    /// | ns_name | "dae-rs" | 命名空间名称 |
+    /// | host_if | "dae-rs-host" | 宿主侧接口名 |
+    /// | peer_if | "dae-rs-peer" | 代理侧接口名 |
+    /// | peer_addr | "169.254.0.11/32" | 代理侧地址 |
+    /// | mtu | 1500 | 接口 MTU |
+    /// | route_table | 2023 | 策略路由表 ID |
+    /// | proxy_mark | 0x08000000 | TPROXY_MARK |
+    /// | proxy_mask | 0x08000000 | TPROXY_MASK |
+    pub fn new() -> Self {
         let use_netkit = Self::probe_netkit();
         Self {
             host_if: HOST_IF.into(),
             peer_if: PEER_IF.into(),
             peer_addr: PEER_ADDR.into(),
-            mtu: config.mtu,
-            route_table: config.route_table,
-            proxy_mark: config.fwmark_proxy,
-            proxy_mask: config.fwmark_mask,
+            mtu: DEFAULT_MTU,
+            route_table: DEFAULT_ROUTE_TABLE,
+            proxy_mark: PROXY_MARK,
+            proxy_mask: PROXY_MASK,
             ns_name: NS_NAME.into(),
             host_ns_fd: None,
             proxy_ns_fd: None,
@@ -400,7 +416,7 @@ impl NetnsManager {
     /// 2. 清理残留的 daens 和 dae0/dae0peer 接口（崩溃安全）
     /// 3. 创建命名网络命名空间 `daens`
     /// 4. 打开 `/var/run/netns/daens` 保存 daens fd
-    /// 5. **在宿主 NS 中**创建 netkit pair (L3)
+    /// 5. **在宿主 NS 中**创建 netkit pair (L2)
     /// 6. 将 dae0peer 移入 daens
     /// 7. 配置 dae0peer（daens 中）：IP、路由、永久 ARP/NDP、sysctl、策略路由
     /// 8. 配置 dae0（宿主 NS 中）：IPv6 LL、MTU、up、sysctl
@@ -643,8 +659,8 @@ impl NetnsManager {
 
         // ---- Step 5: 创建 link pair（netkit 或 veth）----
         if use_netkit {
-            debug!("Creating netkit pair (L3 mode) in host NS");
-            let netkit_msg = LinkNetkit::new(host_if, peer_if, NetkitMode::L3)
+            debug!("Creating netkit pair (L2 mode) in host NS");
+            let netkit_msg = LinkNetkit::new(host_if, peer_if, NetkitMode::L2)
                 .scrub(NetkitScrub::None)
                 .peer_scrub(NetkitScrub::None)
                 .build();
@@ -656,7 +672,7 @@ impl NetnsManager {
                 .map_err(from_rtnetlink_err)
                 .context("Failed to create netkit pair in host namespace")?;
             info!(
-                "Created netkit pair (L3 mode) in host NS: {} <-> {}",
+                "Created netkit pair (L2 mode) in host NS: {} <-> {}",
                 host_if, peer_if
             );
         } else {
@@ -813,9 +829,9 @@ impl NetnsManager {
                     }
                 }
 
-                // 如果 MAC 全零（netkit L3 设备），回退到 dae0 的 MAC
-                // netkit L3 模式下无 Ethernet 头，dae0peer 与 dae0 共享同一 MAC
-                info!("Netkit device, using dae0 MAC as peer MAC");
+                // 如果 MAC 全零（异常情况），回退到 dae0 的 MAC
+                // L2 模式下 netkit 设备保留以太网帧，MAC 应非零
+                info!("Netkit device with zero MAC, using dae0 MAC as fallback");
                 get_dae0_mac()
             }
         }
@@ -930,27 +946,20 @@ impl NetnsManager {
     /// 2. 删除 netkit pair
     /// 3. 删除命名网络命名空间
     /// 4. 关闭持有 netns 的 fd
+    /// 销毁网络命名空间和 netkit pair
+    ///
+    /// Uses synchronous cleanup only — avoids `tokio::task::block_in_place`
+    /// which can panic if called during tokio runtime shutdown (Drop context).
+    /// The sync fallback uses `ip` commands which are reliable for cleanup.
     pub fn destroy(&mut self) -> Result<()> {
         if self.destroyed {
             return Ok(());
         }
         info!("Destroying network namespace and netkit pair");
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                info!("Using tokio runtime for async destroy");
-                let result = tokio::task::block_in_place(|| {
-                    handle.block_on(async { self.destroy_async().await })
-                });
-                if let Err(e) = result {
-                    warn!("Async destroy failed ({}), falling back to sync cleanup", e);
-                    self.destroy_sync_fallback();
-                }
-            }
-            Err(_) => {
-                self.destroy_sync_fallback();
-            }
-        }
+        // Always use synchronous cleanup to avoid block_in_place panics
+        // in tokio runtime shutdown context (e.g. Drop).
+        self.destroy_sync_fallback();
 
         // ---- Step 4：关闭 netns fd ----
         self.host_ns_fd.take();
@@ -1311,8 +1320,8 @@ async fn configure_dae0peer_async(
 /// 在 daens 中添加策略路由规则
 ///
 /// 添加规则: `fwmark <proxy_mark>/<proxy_mask> → table <route_table>`
-/// 注意 proxy_mark 和 proxy_mask 完全相同（mark=0x08000000, mask=0x08000000），
-/// 只检查 bit 27。必须同时设置 FRA_FWMARK 和 FRA_FWMASK。
+/// 注意 proxy_mask 覆盖 fwmark_proxy 和 fwmark_bypass 两个位（mask=0x0f000000），
+/// 必须同时设置 FRA_FWMARK 和 FRA_FWMASK。
 async fn add_policy_routing_in_daens(
     daens_handle: &rtnetlink::Handle,
     proxy_mark: u32,
@@ -1783,16 +1792,15 @@ mod tests {
 
     #[test]
     fn test_netns_manager_new() {
-        let config = Config::default();
-        let mgr = NetnsManager::new(&config);
+        let mgr = NetnsManager::new();
 
         assert_eq!(mgr.host_if, "dae-rs-host");
         assert_eq!(mgr.peer_if, "dae-rs-peer");
         assert_eq!(mgr.peer_addr, "169.254.0.11/32");
         assert_eq!(mgr.mtu, 1500);
         assert_eq!(mgr.route_table, 2023);
-        assert_eq!(mgr.proxy_mark, 0x8000000);
-        assert_eq!(mgr.proxy_mask, 0x8000000);
+        assert_eq!(mgr.proxy_mark, 0x08000000);
+        assert_eq!(mgr.proxy_mask, 0x08000000);
         assert_eq!(mgr.ns_name, "dae-rs");
         assert!(mgr.host_ns_fd.is_none());
         assert!(mgr.proxy_ns_fd.is_none());
@@ -1801,8 +1809,7 @@ mod tests {
 
     #[test]
     fn test_destroy_without_create() {
-        let config = Config::default();
-        let mut mgr = NetnsManager::new(&config);
+        let mut mgr = NetnsManager::new();
 
         // destroy() 应该在不创建的情况下安全调用
         assert!(mgr.destroy().is_ok());

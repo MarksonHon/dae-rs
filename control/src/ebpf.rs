@@ -13,6 +13,7 @@ use libbpf_rs::{Object, ObjectBuilder, TcHook, TC_EGRESS, TC_INGRESS};
 use std::ffi::{CString, OsStr};
 use std::os::unix::io::AsFd;
 use std::path::Path;
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
@@ -679,6 +680,9 @@ pub struct EbpfManager {
     flip: u32,
     /// conn_state_map 最大条目数（从 tproxy.c MAX_CONN_STATE_NUM 同步）
     conn_state_map_max_entries: u32,
+    /// 跟踪已进行 clsact qdisc 清理的接口，避免重复删除
+    /// （重复删除会销毁已挂载的 egress 程序）
+    clsact_cleaned: HashSet<String>,
 }
 
 // Safety: EbpfManager is only ever accessed through `Arc<Mutex<EbpfManager>>`.
@@ -700,6 +704,7 @@ impl EbpfManager {
             pin_path: None,
             flip: 0,
             conn_state_map_max_entries: CONN_STATE_MAX_ENTRIES,
+            clsact_cleaned: HashSet::new(),
         }
     }
 
@@ -714,6 +719,7 @@ impl EbpfManager {
             pin_path: None,
             flip: 0,
             conn_state_map_max_entries: CONN_STATE_MAX_ENTRIES,
+            clsact_cleaned: HashSet::new(),
         }
     }
 
@@ -1150,7 +1156,11 @@ impl EbpfManager {
             // 2. WAN/LAN 接口上可能有上一次 dae-rs 运行遗留的旧 TC filter，
             //    "Exclusivity flag on, cannot modify" 错误会导致新 filter 无法安装，
             //    使得 egress_entered=0，整个代理管道失效。
-            {
+            //
+            // 注意：同一接口可能被 attach_tc() 调用多次（如 attach_wan 先挂载
+            // egress 再挂载 ingress），重复删除 clsact 会销毁已挂载的程序。
+            // 通过 clsact_cleaned HashSet 确保每个接口只删除一次。
+            if !self.clsact_cleaned.contains(ifname) {
                 let output = Command::new("tc")
                     .args(["qdisc", "del", "dev", ifname, "clsact"])
                     .output()
@@ -1185,6 +1195,13 @@ impl EbpfManager {
                         .into());
                     }
                 }
+                self.clsact_cleaned.insert(ifname.to_string());
+            } else {
+                debug!(
+                    iface = %ifname,
+                    "clsact qdisc already cleaned on {}, skipping delete",
+                    ifname,
+                );
             }
 
             // Create clsact qdisc (no-op if already exists)
@@ -1875,10 +1892,22 @@ impl EbpfManager {
     ///  21 = DBG_DAE0_REDIRECT_TUPLE_OK — redirect_tuple_ok in dae0_ingress
     ///  22 = DBG_DAE0_REDIRECT_TRACK_HIT — redirect_track_hit in dae0_ingress
     ///  23 = DBG_DAE0_REDIRECT_SUCCESS — redirect succeeded in dae0_ingress
-    pub fn read_debug_counters(&mut self) -> Result<[u64; 24]> {
+    ///  24 = DBG_CHG_TYPE_FAIL       — change type failed
+    ///  25 = DBG_REDIRECT_TRACK_PUBLISH — publish_redirect_track_for_packet called
+    ///  26 = DBG_REDIRECT_TUPLE_LOAD_FAIL — load_redirect_tuple returned error
+    ///  27 = DBG_REDIRECT_TRACK_MISS — redirect_track map lookup found nothing
+    ///  28 = DBG_REDIRECT_TUPLE_FAST_FALLBACK — fast parser fell back to slow path
+    ///  29 = DBG_REDIRECT_TUPLE_SLOW_FAIL — slow parser failed to load tuple
+    ///  30 = DBG_REDIRECT_INVALID_IFINDEX — redirect_track hit but ifindex is 0
+    ///  31 = DBG_REDIRECT_TRACK_REVERSE_HIT — redirect_track reverse-key lookup hit
+    ///  32 = DBG_REDIRECT_TRACK_UPDATE_FAIL — redirect_track map update failed
+    ///  33 = DBG_ASSIGN_SELECT_TCP4 — assign_listener selected tcp4 listen key
+    ///  34 = DBG_ASSIGN_SELECT_UDP  — assign_listener selected udp listen key
+    ///  35 = DBG_ASSIGN_SELECT_TCP6 — assign_listener selected tcp6 listen key
+    pub fn read_debug_counters(&mut self) -> Result<[u64; 36]> {
         let map = self.get_map_mut("debug_counter_map")?;
-        let mut counters = [0u64; 24];
-        for i in 0u32..24 {
+        let mut counters = [0u64; 36];
+        for i in 0u32..36 {
             let key = i.to_ne_bytes();
             if let Ok(Some(val_bytes)) = map.lookup(&key, MapFlags::empty()) {
                 if val_bytes.len() >= 8 {
@@ -1918,6 +1947,13 @@ impl EbpfManager {
                     counters[16], // DBG_BPF_SK_ASSIGN_OK
                 );
                 info!(
+                    "[{}] Assign listener selection: tcp4={} udp={} tcp6={}",
+                    label,
+                    counters[33], // DBG_ASSIGN_SELECT_TCP4
+                    counters[34], // DBG_ASSIGN_SELECT_UDP
+                    counters[35], // DBG_ASSIGN_SELECT_TCP6
+                );
+                info!(
                     sk_match = counters[17],
                     sk_null = counters[18],
                     sk_mismatch = counters[19],
@@ -1929,7 +1965,20 @@ impl EbpfManager {
                     dae0_redirect_tuple_ok = counters[21],
                     dae0_redirect_track_hit = counters[22],
                     dae0_redirect_success = counters[23],
+                    chg_type_fail = counters[24],
                     "[{}] dae0_ingress return path",
+                    label,
+                );
+                info!(
+                    redirect_track_publish = counters[25],
+                    redirect_tuple_load_fail = counters[26],
+                    redirect_track_miss = counters[27],
+                    redirect_tuple_fast_fallback = counters[28],
+                    redirect_tuple_slow_fail = counters[29],
+                    redirect_invalid_ifindex = counters[30],
+                    redirect_track_reverse_hit = counters[31],
+                    redirect_track_update_fail = counters[32],
+                    "[{}] redirect_track diagnostics",
                     label,
                 );
                 // Log individual failure counters for diagnostic detail

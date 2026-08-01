@@ -451,8 +451,11 @@ impl RulesBuilder {
                     let values = &key_to_values[key.as_str()];
                     let is_last_in_function = j_match_set == key_order.len() - 1;
 
-                    let override_outbound =
-                        compute_override_outbound(is_last_in_function, is_last_function, &rule.outbound);
+                    let override_outbound = compute_override_outbound(
+                        is_last_in_function,
+                        is_last_function,
+                        &rule.outbound,
+                    );
 
                     debug!(
                         "apply: {}({}) key={} -> outbound={} (func={}/{}, part={}/{})",
@@ -560,10 +563,7 @@ fn compute_override_outbound(
 ///
 /// Handles special built-in names ("direct", "block", "LOGICAL_OR", etc.)
 /// and looks up user-defined outbounds via `outbound_id_map`.
-fn resolve_outbound_id(
-    outbound: &Outbound,
-    outbound_id_map: &HashMap<String, u8>,
-) -> Result<u8> {
+fn resolve_outbound_id(outbound: &Outbound, outbound_id_map: &HashMap<String, u8>) -> Result<u8> {
     match outbound.name.as_str() {
         "direct" => Ok(outbound::DIRECT),
         "block" => Ok(outbound::BLOCK),
@@ -1090,10 +1090,7 @@ pub struct CompiledRouting {
 ///
 /// Returns a dynamically-sized bitmap where bit N is set if `domain` matches
 /// `domain_sets[N]`. The bitmap length is `(domain_sets.len() + 31) / 32` words.
-pub fn build_domain_routing_bitmap(
-    domain: &str,
-    domain_sets: &[Vec<String>],
-) -> Vec<u32> {
+pub fn build_domain_routing_bitmap(domain: &str, domain_sets: &[Vec<String>]) -> Vec<u32> {
     let num_words = (domain_sets.len() + 31) / 32;
     let mut bitmap = vec![0u32; num_words];
     let domain_lower = domain.to_lowercase();
@@ -1183,11 +1180,17 @@ pub fn compile_rules(
     // ── Step 1: Build NormalizedProgram from config ──
     let program =
         NormalizedProgram::from_config(routing).context("Failed to normalize routing rules")?;
-    debug!("Step 1: NormalizedProgram built ({} rules)", program.rules.len());
+    debug!(
+        "Step 1: NormalizedProgram built ({} rules)",
+        program.rules.len()
+    );
 
     // ── Step 2: Build outbound ID map ──
     let outbound_id_map = build_outbound_id_map(outbounds);
-    debug!("Step 2: outbound_id_map built ({} entries)", outbound_id_map.len());
+    debug!(
+        "Step 2: outbound_id_map built ({} entries)",
+        outbound_id_map.len()
+    );
 
     // ── Step 2.5: Prepare proxy server IP CIDRs for LPM trie ──
     // Convert each proxy server IP to a /32 (IPv4) or /128 (IPv6) CIDR entry.
@@ -1204,10 +1207,11 @@ pub fn compile_rules(
         .collect();
     debug!("Step 2.5: {} proxy CIDRs prepared", proxy_cidrs.len());
 
-    // ── Step 3: First pass — collect LPM trie and domain set data ──
+    // ── Step 3: Collect domain set data (needed before building MatchSets) ──
+    // LPM trie data is collected inline during MatchSet construction via
+    // find_or_create_lpm_trie, avoiding a separate function-dispatch pass.
     let mut lpm_tries: Vec<Vec<ipnet::IpNet>> = Vec::new();
     let mut lpm_dedup: HashMap<u64, usize> = HashMap::new();
-    let mut dedup_count = 0usize;
     let mut domain_sets: Vec<Vec<String>> = Vec::new();
     let mut final_match_sets: Vec<MatchSet> = Vec::new();
 
@@ -1225,90 +1229,35 @@ pub fn compile_rules(
         None
     };
 
-    // First pass over rules: collect LPM trie and domain set data.
+    // Collect domain set data from rules (needed before building MatchSets
+    // because build_match_set_for_function references domain sets by index).
+    // LPM trie data is collected inline during the second pass via
+    // find_or_create_lpm_trie, so no separate pass is needed for that.
     for rule in &program.rules {
         for func in &rule.and_functions {
-            match func.name.as_str() {
-                "dip" | "ip" => {
-                    if let Ok(_cidrs) = parse_cidr_values(&func.raw_params) {
-                        let old_len = lpm_tries.len();
-                        let idx = find_or_create_lpm_trie(&_cidrs, &mut lpm_tries, &mut lpm_dedup);
-                        if idx < old_len {
-                            dedup_count += 1;
+            if func.name.as_str() == "domain" {
+                // Strip key: prefix from domain values (e.g. "suffix:baidu.com" → "baidu.com")
+                let values: Vec<String> = func
+                    .raw_params
+                    .iter()
+                    .map(|raw| {
+                        if let Some((_, v)) = raw.split_once(':') {
+                            v.trim().to_string()
+                        } else {
+                            raw.trim().to_string()
                         }
-                    }
+                    })
+                    .collect();
+                if !values.is_empty() {
+                    domain_sets.push(values);
                 }
-                "sip" | "source_ip" => {
-                    if let Ok(cidrs) = parse_cidr_values(&func.raw_params) {
-                        let old_len = lpm_tries.len();
-                        let idx = find_or_create_lpm_trie(&cidrs, &mut lpm_tries, &mut lpm_dedup);
-                        if idx < old_len {
-                            dedup_count += 1;
-                        }
-                    }
-                }
-                "mac" => {
-                    // MAC addresses go into LPM trie as well (use raw_params to avoid colon splitting)
-                    let mut mac_addrs: Vec<ipnet::IpNet> = Vec::new();
-                    for val in &func.raw_params {
-                        if let Ok(mac) = parse_mac_address(val) {
-                            // Encode MAC as IPv6 LPM key (like tproxy.c does)
-                            let mut addr16 = [0u8; 16];
-                            addr16[10..16].copy_from_slice(&mac);
-                            if let Ok(ipnet) = ipnet::IpNet::new(
-                                std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr16)),
-                                128,
-                            ) {
-                                mac_addrs.push(ipnet);
-                            }
-                        }
-                    }
-                    if func.not {
-                        // Add zero MAC for negative rules
-                        let mut zero = [0u8; 16];
-                        zero[10..16].copy_from_slice(&[0u8; 6]);
-                        if let Ok(ipnet) = ipnet::IpNet::new(
-                            std::net::IpAddr::V6(std::net::Ipv6Addr::from(zero)),
-                            128,
-                        ) {
-                            mac_addrs.push(ipnet);
-                        }
-                    }
-                    if !mac_addrs.is_empty() {
-                        let old_len = lpm_tries.len();
-                        let idx =
-                            find_or_create_lpm_trie(&mac_addrs, &mut lpm_tries, &mut lpm_dedup);
-                        if idx < old_len {
-                            dedup_count += 1;
-                        }
-                    }
-                }
-                "domain" => {
-                    // Strip key: prefix from domain values (e.g. "suffix:baidu.com" → "baidu.com")
-                    let values: Vec<String> = func
-                        .raw_params
-                        .iter()
-                        .map(|raw| {
-                            if let Some((_, v)) = raw.split_once(':') {
-                                v.trim().to_string()
-                            } else {
-                                raw.trim().to_string()
-                            }
-                        })
-                        .collect();
-                    if !values.is_empty() {
-                        domain_sets.push(values);
-                    }
-                }
-                _ => {}
             }
         }
     }
 
-    // Second pass: build final match sets with correct LPM/domain indices.
-    // We walk the program again, using shared helpers for outbound chaining
-    // and fallback creation, then call build_match_set_for_function which
-    // handles LPM trie and domain set index assignment.
+    // Build MatchSets: walks the program once, using shared helpers for outbound
+    // chaining and fallback creation. LPM trie data is populated inline via
+    // find_or_create_lpm_trie within build_match_set_for_function.
     let mut rule_domain_idx = 0usize;
 
     for rule in &program.rules {
@@ -1330,8 +1279,11 @@ pub fn compile_rules(
                     .unwrap_or(&[]);
                 let is_last_in_function = j_match_set == key_order.len() - 1;
 
-                let ov_outbound =
-                    compute_override_outbound(is_last_in_function, is_last_function, &rule.outbound);
+                let ov_outbound = compute_override_outbound(
+                    is_last_in_function,
+                    is_last_function,
+                    &rule.outbound,
+                );
                 let ov_outbound_id = resolve_outbound_id(&ov_outbound, &outbound_id_map)?;
 
                 let match_sets = build_match_set_for_function(
@@ -1388,27 +1340,13 @@ pub fn compile_rules(
         mark: fallback_mark,
     });
 
-    let total_lpm = lpm_tries.len() + dedup_count;
-    if total_lpm > 0 && dedup_count > 0 {
-        let reduction = (dedup_count as f64 / total_lpm as f64) * 100.0;
-        info!(
-            match_sets = final_match_sets.len(),
-            lpm_tries = lpm_tries.len(),
-            dedup_saved = dedup_count,
-            reduction = format!("{:.1}%", reduction),
-            domain_sets = domain_sets.len(),
-            fallback = %fallback_outbound,
-            "Compiled routing rules with LPM dedup",
-        );
-    } else {
-        info!(
-            match_sets = final_match_sets.len(),
-            lpm_tries = lpm_tries.len(),
-            domain_sets = domain_sets.len(),
-            fallback = %fallback_outbound,
-            "Compiled routing rules",
-        );
-    }
+    info!(
+        match_sets = final_match_sets.len(),
+        lpm_tries = lpm_tries.len(),
+        domain_sets = domain_sets.len(),
+        fallback = %fallback_outbound,
+        "Compiled routing rules",
+    );
 
     debug!(
         "compile_rules completed: {}ms ({} match_sets, {} lpm_tries, {} domain_sets, fallback={})",

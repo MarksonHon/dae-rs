@@ -7,6 +7,8 @@ DAE_RS_CONFIG="config-example/config-minimal.daefile"
 PID_FILE="/tmp/dae-rs.pid"
 NETNS_NAME="dae-rs"
 NETNS_PATH="/var/run/netns/${NETNS_NAME}"
+RUST_LOG=debug
+export RUST_LOG
 
 echo "=== dae-rs Debug Collection Script ===" > "$LOG"
 echo "Start time: $(date)" >> "$LOG"
@@ -45,19 +47,19 @@ cleanup() {
     echo "=== Socket Listening State ===" >> "$LOG"
     ss -tlnp >> "$LOG" 2>&1 || echo "Failed to show sockets" >> "$LOG"
 
-    # Now stop dae-rs
-    if [ -f "$PID_FILE" ]; then
-        kill $(cat "$PID_FILE") 2>/dev/null || true
-        rm -f "$PID_FILE"
-    fi
-    pkill -f "dae-rs" 2>/dev/null || true
-    sleep 2
-
-    # Check proxy namespace
+    # Capture proxy namespace state while dae-rs is still running
     if [ -S "$NETNS_PATH" ] || ip netns list 2>/dev/null | grep -q "$NETNS_NAME"; then
+        echo "" >> "$LOG"
+        echo "=== Proxy NS listening sockets ===" >> "$LOG"
+        ip netns exec "$NETNS_NAME" ss -tulnp >> "$LOG" 2>&1 || echo "Failed to show proxy NS sockets" >> "$LOG"
+
         echo "" >> "$LOG"
         echo "=== Proxy NS tcpdump (SYN packets) ===" >> "$LOG"
         timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i any -n 'tcp[tcpflags] & tcp-syn != 0' -c 20 >> "$LOG" 2>&1 || echo "tcpdump not available or timeout" >> "$LOG"
+
+        echo "" >> "$LOG"
+        echo "=== Proxy NS loopback tcpdump (TCP) ===" >> "$LOG"
+        timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i lo -n 'tcp' -c 20 >> "$LOG" 2>&1 || echo "lo tcpdump not available or timeout" >> "$LOG"
 
         echo "" >> "$LOG"
         echo "=== Proxy NS interfaces ===" >> "$LOG"
@@ -68,6 +70,14 @@ cleanup() {
         ip netns exec "$NETNS_NAME" ip rule list >> "$LOG" 2>&1 || echo "Failed to list rules" >> "$LOG"
         ip netns exec "$NETNS_NAME" ip route show table 2023 >> "$LOG" 2>&1 || echo "Failed to show routes" >> "$LOG"
     fi
+
+    # Now stop dae-rs
+    if [ -f "$PID_FILE" ]; then
+        kill $(cat "$PID_FILE") 2>/dev/null || true
+        rm -f "$PID_FILE"
+    fi
+    pkill -f "dae-rs" 2>/dev/null || true
+    sleep 2
 
     echo "" >> "$LOG"
     echo "=== dmesg (last 30 lines, kernel BPF messages) ===" >> "$LOG"
@@ -116,6 +126,10 @@ curl -s -o /dev/null -w "curl google.com: %{http_code}\n" --connect-timeout 5 ht
 curl -s -o /dev/null -w "curl baidu.com: %{http_code}\n" --connect-timeout 5 https://www.baidu.com >> "$LOG" 2>&1 || echo "curl baidu.com failed" >> "$LOG"
 curl -s -o /dev/null -w "curl example.com: %{http_code}\n" --connect-timeout 5 https://example.com >> "$LOG" 2>&1 || echo "curl example.com failed" >> "$LOG"
 
+# Direct IP probes (bypass DNS) to distinguish DNS-path failures from TCP datapath failures
+curl -k -s -o /dev/null -w "curl 1.1.1.1: %{http_code}\n" --connect-timeout 5 https://1.1.1.1 >> "$LOG" 2>&1 || echo "curl 1.1.1.1 failed" >> "$LOG"
+curl -k -s -o /dev/null -w "curl 8.8.8.8: %{http_code}\n" --connect-timeout 5 https://8.8.8.8 >> "$LOG" 2>&1 || echo "curl 8.8.8.8 failed" >> "$LOG"
+
 # Wait for traffic processing
 echo "Waiting 10 seconds for traffic processing..."
 sleep 10
@@ -142,6 +156,7 @@ fi
 # Generate more traffic
 curl -s -o /dev/null -w "curl github.com: %{http_code}\n" --connect-timeout 5 https://github.com >> "$LOG" 2>&1 || echo "curl github.com failed" >> "$LOG"
 curl -s -o /dev/null -w "curl cloudflare.com: %{http_code}\n" --connect-timeout 5 https://www.cloudflare.com >> "$LOG" 2>&1 || echo "curl cloudflare.com failed" >> "$LOG"
+curl -k -s -o /dev/null -w "curl 9.9.9.9: %{http_code}\n" --connect-timeout 5 https://9.9.9.9 >> "$LOG" 2>&1 || echo "curl 9.9.9.9 failed" >> "$LOG"
 
 sleep 5
 

@@ -38,6 +38,7 @@ use anyhow::{Context, Result};
 use protocols::OutboundDialer;
 use protocols::Socks5Dialer;
 use std::net::SocketAddr;
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::copy_bidirectional;
@@ -1000,6 +1001,12 @@ pub struct UdpTproxyListener {
     /// 当收到 DNS 查询时，将查询转发到此地址的 DNS handler 处理，
     /// 而不是通过 SOCKS5 代理。None 表示不使用 DNS 劫持（回退到 SOCKS5）。
     dns_forward_addr: Option<SocketAddr>,
+    /// 宿主网络命名空间 fd。
+    ///
+    /// 设置后，所有上行 UDP socket（DNS 劫持查询 socket、UDP relay 响应
+    /// socket）在宿主 NS 中创建并发出（与 kdae 对齐），源地址为宿主真实
+    /// WAN 地址而非 daens 内部地址。`None` 表示在当前命名空间中创建。
+    host_ns_fd: Option<RawFd>,
 }
 
 impl UdpTproxyListener {
@@ -1012,6 +1019,7 @@ impl UdpTproxyListener {
             socket_mark: 0x100,
             stop_signal: Arc::new(Notify::new()),
             dns_forward_addr: None,
+            host_ns_fd: None,
         }
     }
 
@@ -1024,7 +1032,17 @@ impl UdpTproxyListener {
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
             dns_forward_addr: None,
+            host_ns_fd: None,
         }
+    }
+
+    /// 设置宿主网络命名空间 fd。
+    ///
+    /// 设置后，所有上行 UDP socket（DNS 劫持查询 socket、UDP relay 响应
+    /// socket）在宿主 NS 中创建（与 kdae 对齐）。
+    pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
+        self.host_ns_fd = host_ns_fd;
+        self
     }
 
     /// 设置 DNS 转发目标地址。
@@ -1110,13 +1128,26 @@ impl UdpTproxyListener {
             }
         }
 
-        // 设置 IP_RECVORIGDSTADDR（用于获取原始目标地址）
+        // 设置 IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR（用于获取原始目标地址）
+        // 双栈 (AF_INET6, V6ONLY=0) socket 会同时收到 IPv4 和 IPv6 报文：
+        // IPv4 报文走内核 ip_cmsg_recv，需要 SOL_IP 上的 IP_RECVORIGDSTADDR；
+        // IPv6 报文需要 SOL_IPV6 上的 IPV6_RECVORIGDSTADDR。
+        // 只设置其中一个会导致相应地址族的报文解析不到原始目标地址。
         if is_ipv6 {
             unsafe {
                 libc::setsockopt(
                     fd,
                     libc::SOL_IPV6,
                     IPV6_RECVORIGDSTADDR,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    IP_RECVORIGDSTADDR,
                     &one as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
@@ -1232,6 +1263,7 @@ impl UdpTproxyListener {
         let _running = self.running.clone();
         let stop_signal = self.stop_signal.clone();
         let dns_forward_addr = self.dns_forward_addr;
+        let host_ns_fd = self.host_ns_fd;
 
         // Pool for reusing UDP ASSOCIATE sessions per destination
         let pool = Arc::new(protocols::UdpEndpointPool::new());
@@ -1393,7 +1425,10 @@ impl UdpTproxyListener {
                     // upstream DNS server address. IP_TRANSPARENT allows binding to
                     // non-local addresses, so the response sent back to the client
                     // will have the correct source address (the upstream DNS server).
-                    let query_socket = create_marked_udp_socket(&upstream).await;
+                    // When host_ns_fd is set, the socket is created in the host NS
+                    // (kdae-aligned), so the query leaves from the host's real WAN
+                    // source address and no EADDRINUSE occurs for concurrent queries.
+                    let query_socket = create_marked_udp_socket(&upstream, host_ns_fd).await;
                     let query_socket = match query_socket {
                         Some(s) => s,
                         None => {
@@ -1500,8 +1535,11 @@ impl UdpTproxyListener {
                             // Create a TProxy response socket bound to orig_dst (dest) with
                             // IP_TRANSPARENT, so the response source address matches what the
                             // client originally requested (not the proxy address).
+                            // The socket is created in the host NS when host_ns_fd is set.
                             if let Some(peer) = peer_addr {
-                                if let Some(resp_sock) = create_marked_udp_socket(&dest).await {
+                                if let Some(resp_sock) =
+                                    create_marked_udp_socket(&dest, host_ns_fd).await
+                                {
                                     if let Err(e) = resp_sock.send_to(payload, peer).await {
                                         debug!("UDP response send failed: {}", e);
                                     }
@@ -1538,78 +1576,106 @@ impl UdpTproxyListener {
 /// IP_TRANSPARENT 允许绑定到非本机地址（如上游 DNS 服务器地址），
 /// 确保响应包的源地址是上游 DNS 服务器，而非代理地址。
 /// SO_MARK=0x100 确保 eBPF 程序将流量识别为 dae-rs 自身流量并放行。
-async fn create_marked_udp_socket(target: &SocketAddr) -> Option<tokio::net::UdpSocket> {
+///
+/// 当 `host_ns_fd` 为 `Some` 时，socket 在宿主 NS 中创建（与 kdae 对齐）：
+/// - 源地址为宿主真实 WAN 地址，而非 daens 内部地址 `169.254.0.11`；
+/// - 同一上游 DNS 地址可并发复用 socket，避免 `EADDRINUSE`。
+async fn create_marked_udp_socket(
+    target: &SocketAddr,
+    host_ns_fd: Option<RawFd>,
+) -> Option<tokio::net::UdpSocket> {
     use std::os::unix::io::FromRawFd;
 
-    let domain = if target.is_ipv6() {
-        libc::AF_INET6
-    } else {
-        libc::AF_INET
-    };
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
-    if fd < 0 {
-        warn!("create_marked_udp_socket: socket() failed: {}", std::io::Error::last_os_error());
-        return None;
-    }
-
-    let one: libc::c_int = 1;
-    let mark_val: libc::c_int = 0x100;
-
-    unsafe {
-        // Set IP_TRANSPARENT / IPV6_TRANSPARENT to allow binding to non-local
-        // addresses (e.g. upstream DNS server IP). This MUST be set before bind().
-        if target.is_ipv6() {
-            libc::setsockopt(
-                fd,
-                libc::SOL_IPV6,
-                IPV6_TRANSPARENT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+    // 同步的 socket 创建逻辑（无 .await），可在宿主 NS 切换中执行。
+    let create = || -> Option<tokio::net::UdpSocket> {
+        let domain = if target.is_ipv6() {
+            libc::AF_INET6
         } else {
+            libc::AF_INET
+        };
+        let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
+        if fd < 0 {
+            warn!(
+                "create_marked_udp_socket: socket() failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+
+        let one: libc::c_int = 1;
+        let mark_val: libc::c_int = 0x100;
+
+        unsafe {
+            // Set IP_TRANSPARENT / IPV6_TRANSPARENT to allow binding to non-local
+            // addresses (e.g. upstream DNS server IP). This MUST be set before bind().
+            if target.is_ipv6() {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IPV6,
+                    IPV6_TRANSPARENT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            } else {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    IP_TRANSPARENT,
+                    &one as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+
+            // Set SO_MARK for eBPF self-exclusion
             libc::setsockopt(
                 fd,
-                libc::SOL_IP,
-                IP_TRANSPARENT,
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                &mark_val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // SO_REUSEADDR allows concurrent DNS queries to the same upstream
+            // (identical target address:port) to bind without EADDRINUSE.
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
                 &one as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
 
-        // Set SO_MARK for eBPF self-exclusion
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark_val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-
-    // Bind to the target address. With IP_TRANSPARENT, this succeeds even for
-    // non-local addresses (e.g. upstream DNS server IPs). The socket will then
-    // send responses with the target address as the source.
-    let sock_addr = socket2::SockAddr::from(*target);
-    let bind_ret = unsafe {
-        libc::bind(fd, sock_addr.as_ptr() as *const libc::sockaddr, sock_addr.len())
-    };
-    if bind_ret < 0 {
-        warn!(
-            "create_marked_udp_socket: bind({}) failed: {}",
-            target,
-            std::io::Error::last_os_error()
-        );
-        unsafe { libc::close(fd) };
-        return None;
-    }
-
-    let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-    match tokio::net::UdpSocket::from_std(std_socket) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            warn!("create_marked_udp_socket: from_std failed: {}", e);
-            None
+        // Bind to the target address. With IP_TRANSPARENT, this succeeds even for
+        // non-local addresses (e.g. upstream DNS server IPs). The socket will then
+        // send responses with the target address as the source.
+        let sock_addr = socket2::SockAddr::from(*target);
+        let bind_ret = unsafe {
+            libc::bind(fd, sock_addr.as_ptr() as *const libc::sockaddr, sock_addr.len())
+        };
+        if bind_ret < 0 {
+            warn!(
+                "create_marked_udp_socket: bind({}) failed: {}",
+                target,
+                std::io::Error::last_os_error()
+            );
+            unsafe { libc::close(fd) };
+            return None;
         }
+
+        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+        match tokio::net::UdpSocket::from_std(std_socket) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("create_marked_udp_socket: from_std failed: {}", e);
+                None
+            }
+        }
+    };
+
+    match host_ns_fd {
+        Some(fd) => crate::netns::with_host_ns_fd(fd, create).ok().flatten(),
+        None => create(),
     }
 }
 

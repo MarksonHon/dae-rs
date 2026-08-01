@@ -89,7 +89,7 @@ pub async fn run(
     // ── Phase 4: Print config summary ──
     tracing::info!("Configuration loaded:");
     tracing::info!("  TProxy port: {}", config.tproxy_port);
-    tracing::info!("  Netkit: dae-rs-host <-> dae-rs-peer (always netkit)");
+    tracing::info!("  Netkit: dae0 <-> dae0peer (always netkit)");
     tracing::info!("  Route table: {}", config.route_table);
     tracing::info!("  Proxy mark:  {:08x}", config.fwmark_proxy);
     tracing::info!("  Bypass mark: {:08x}", config.fwmark_bypass);

@@ -64,6 +64,7 @@ pub mod tproxy;
 pub mod udp_tracker;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -109,7 +110,7 @@ const DAE_EVENT_TCP_CONN_OVERFLOW: u32 = 2;
 /// | `proxy_username` | "" | SOCKS5 username (empty = no auth) |
 /// | `proxy_password` | "" | SOCKS5 password |
 /// | `proxy_dial_timeout_ms` | 5000 | SOCKS5 dial timeout (ms) |
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Config {
     /// TProxy listen port
     pub tproxy_port: u16,
@@ -666,7 +667,7 @@ impl ControlPlane {
         //   - cgroup programs → proxy NS (sock_create/release etc.)
         info!("Step 3/5: Attaching TC programs and configuring kernel");
         let step_start = std::time::Instant::now();
-        // Attach dae-rs-host_ingress in host NS
+        // Attach dae0_ingress in host NS
         let host_if = self.netns_mgr.host_if().to_string();
         let peer_if = self.netns_mgr.peer_if().to_string();
         self.ebpf().attach_dae0(&host_if).map_err(|e| {
@@ -675,7 +676,7 @@ impl ControlPlane {
         })?;
         configure_kernel_if(&host_if);
         debug!("dae0 ingress TC attached to {}", host_if);
-        // Attach dae-rs-peer_ingress in proxy NS
+        // Attach dae0peer_ingress in proxy NS
         {
             self.netns_mgr.join_proxy_ns()?;
             self.ebpf().attach_dae0peer(&peer_if).map_err(|e| {
@@ -874,6 +875,18 @@ impl ControlPlane {
             }
         }
         debug!("Step 3.5 completed: {}ms", step_start.elapsed().as_millis());
+
+        // ---- Step 3.6: Dump generated configuration as JSON for debugging ----
+        // This helps diagnose why traffic might not be hijacked — verify routing rules,
+        // outbound nodes, process exclusions, DNS config, etc. are correctly parsed.
+        match serde_json::to_string_pretty(&self.config) {
+            Ok(json_str) => {
+                tracing::debug!("Generated configuration:\n{}", json_str);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize config to JSON: {}", e);
+            }
+        }
 
         // ---- Step 3.7: Attach cgroup programs in BOTH namespaces ----
         // The eBPF programs need to track all dae-rs sockets regardless of
@@ -1135,25 +1148,54 @@ impl ControlPlane {
 
         let socket_mark = 0x100u32;
         debug!(socket_mark = format!("{:#x}", socket_mark), "Socket mark for eBPF self-exclusion");
-        let dialer_tcp = Socks5Dialer::new_with_mark(
+        let tproxy_listener_mark = 0u32;
+        debug!(
+            tproxy_listener_mark = format!("{:#x}", tproxy_listener_mark),
+            "TProxy listener socket mark for daens policy routing"
+        );
+
+        // ---- 宿主网络命名空间 fd ----
+        // TProxy 监听 socket 保留在 daens，但所有上行连接（到 SOCKS5 代理的
+        // TCP、UDP ASSOCIATE、DNS 劫持/UDP relay 的响应 socket）在宿主 NS 中
+        // 创建并发出（与 kdae 对齐），源地址为宿主真实 WAN 地址。
+        let host_ns_fd = self.netns_mgr.get_host_ns_fd();
+        info!(
+            host_ns_fd = host_ns_fd.map(|fd| fd.to_string()).unwrap_or_else(|| "none".to_string()),
+            "Upstream sockets will be created in host namespace (kdae-aligned)"
+        );
+
+        let mut dialer_tcp = Socks5Dialer::new_with_mark(
             proxy_addr,
             &self.config.proxy_username,
             &self.config.proxy_password,
             self.config.proxy_dial_timeout_ms,
             socket_mark,
         );
-        let dialer_udp = Socks5Dialer::new_with_mark(
+        dialer_tcp.set_host_ns_fd(host_ns_fd);
+        let mut dialer_udp = Socks5Dialer::new_with_mark(
             proxy_addr,
             &self.config.proxy_username,
             &self.config.proxy_password,
             self.config.proxy_dial_timeout_ms,
             socket_mark,
         );
+        dialer_udp.set_host_ns_fd(host_ns_fd);
         debug!("TCP and UDP SOCKS5 dialers created");
 
-        let tproxy_tcp = Arc::new(TproxyListener::new(listen_addr, dialer_tcp));
+        let tproxy_tcp = Arc::new(TproxyListener::new_with_mark(
+            listen_addr,
+            dialer_tcp,
+            tproxy_listener_mark,
+        ));
         let tproxy_udp = {
-            let mut udp = UdpTproxyListener::new(listen_addr, dialer_udp);
+            let mut udp = UdpTproxyListener::new_with_mark(
+                listen_addr,
+                dialer_udp,
+                tproxy_listener_mark,
+            );
+            // Upstream UDP sockets (DNS hijack query socket, relay response socket)
+            // are created in the host NS when host_ns_fd is available.
+            udp.set_host_ns_fd(host_ns_fd);
             // Configure DNS hijacking: set the DNS forward address so that
             // UDP DNS queries intercepted by eBPF are forwarded to the
             // internal DNS handler instead of going through SOCKS5.
@@ -1742,8 +1784,8 @@ impl ControlPlane {
     pub fn detach_bpf_hooks(&mut self) {
         info!("Emergency BPF hook detachment");
         let start = std::time::Instant::now();
-        // Detach dae-rs-peer hooks in proxy NS first (before host NS hooks)
-        // because dae-rs-peer interface only exists in proxy NS
+        // Detach dae0peer hooks in proxy NS first (before host NS hooks)
+        // because dae0peer interface only exists in proxy NS
         if let Ok(()) = self.netns_mgr.join_proxy_ns() {
             debug!("Detaching proxy NS hooks...");
             let _ = self.ebpf().detach_by_iface(&self.netns_mgr.peer_if());
@@ -2306,42 +2348,75 @@ pub async fn connect_with_mark(
 /// These are needed for transparent proxying to work correctly.
 /// Errors are logged but not propagated (best-effort).
 fn configure_kernel_if(iface: &str) {
+    let is_dae_iface = iface.starts_with("dae");
+
     // net.ipv4.conf.<iface>.send_redirects = 0
-    let path_send_redirects = format!("/proc/sys/net/ipv4/conf/{}/send_redirects", iface);
-    if let Err(e) = std::fs::write(&path_send_redirects, b"0\n") {
-        warn!(
-            "Failed to set send_redirects=0 on {}: {} (non-critical)",
-            iface, e
-        );
-    } else {
-        info!("Kernel: {}=0", path_send_redirects);
+    if !is_dae_iface {
+        let path_send_redirects = format!("/proc/sys/net/ipv4/conf/{}/send_redirects", iface);
+        if let Err(e) = std::fs::write(&path_send_redirects, b"0\n") {
+            warn!(
+                "Failed to set send_redirects=0 on {}: {} (non-critical)",
+                iface, e
+            );
+        } else {
+            info!("Kernel: {}=0", path_send_redirects);
+        }
     }
 
     // net.ipv4.conf.<iface>.forwarding = 1
-    let path_forwarding = format!("/proc/sys/net/ipv4/conf/{}/forwarding", iface);
-    if let Err(e) = std::fs::write(&path_forwarding, b"1\n") {
-        warn!(
-            "Failed to set forwarding=1 on {}: {} (non-critical)",
-            iface, e
-        );
-    } else {
-        info!("Kernel: {}=1", path_forwarding);
+    if !is_dae_iface {
+        let path_forwarding = format!("/proc/sys/net/ipv4/conf/{}/forwarding", iface);
+        if let Err(e) = std::fs::write(&path_forwarding, b"1\n") {
+            warn!(
+                "Failed to set forwarding=1 on {}: {} (non-critical)",
+                iface, e
+            );
+        } else {
+            info!("Kernel: {}=1", path_forwarding);
+        }
     }
 
     // net.ipv6.conf.<iface>.forwarding = 1 (if IPv6 is enabled on the interface)
-    let path_fwd6 = format!("/proc/sys/net/ipv6/conf/{}/forwarding", iface);
-    // Don't error if IPv6 is not configured on this interface
-    let _ = std::fs::write(&path_fwd6, b"1\n");
+    if !is_dae_iface {
+        let path_fwd6 = format!("/proc/sys/net/ipv6/conf/{}/forwarding", iface);
+        // Don't error if IPv6 is not configured on this interface
+        let _ = std::fs::write(&path_fwd6, b"1\n");
+    }
 
-    // net.ipv4.conf.<iface>.rp_filter = 2 (loose mode, required for TProxy)
+    // net.ipv4.conf.<iface>.rp_filter
+    // Keep dae netkit path aligned with original kdae: dae0/dae0peer use 0.
+    // Other interfaces keep loose mode (2).
     let path_rp = format!("/proc/sys/net/ipv4/conf/{}/rp_filter", iface);
-    if let Err(e) = std::fs::write(&path_rp, b"2\n") {
+    let rp_value = if iface.starts_with("dae") { b"0\n" } else { b"2\n" };
+    if let Err(e) = std::fs::write(&path_rp, rp_value) {
         warn!(
-            "Failed to set rp_filter=2 on {}: {} (may affect TProxy)",
+            "Failed to set rp_filter on {}: {} (may affect TProxy)",
             iface, e
         );
     } else {
-        info!("Kernel: {}=2", path_rp);
+        let rp_trim = std::str::from_utf8(rp_value).unwrap_or("?").trim();
+        info!("Kernel: {}={}", path_rp, rp_trim);
+    }
+
+    // net.ipv4.conf.<iface>.proxy_arp = 1
+    // The SOCKS5 dial and DNS sockets live in daens and therefore source their
+    // packets from 169.254.0.11 (the dae0peer address). That address is not
+    // reachable from the WAN/router side: the proxy's reply targets 169.254.0.11
+    // (link-local) and is ARP-resolved on the LAN, but nothing answers — the host
+    // only holds that address inside daens. proxy_arp makes this host answer ARP
+    // for addresses whose route exits a different interface (169.254.0.11 routes
+    // via dae0), so reply packets reach wlp3s0 and are forwarded back into daens.
+    // This is required for control-plane dialing to ever complete.
+    if !is_dae_iface {
+        let path_proxy_arp = format!("/proc/sys/net/ipv4/conf/{}/proxy_arp", iface);
+        if let Err(e) = std::fs::write(&path_proxy_arp, b"1\n") {
+            warn!(
+                "Failed to set proxy_arp=1 on {}: {} (dial replies may not return)",
+                iface, e
+            );
+        } else {
+            info!("Kernel: {}=1", path_proxy_arp);
+        }
     }
 }
 
@@ -2411,7 +2486,7 @@ mod tests {
         let cp = ControlPlane::new(config);
 
         assert!(!cp.running);
-        assert_eq!(cp.ebpf().iface(), "dae-rs-host");
+        assert_eq!(cp.ebpf().iface(), "dae0");
         assert!(!cp.ebpf().is_loaded());
         assert!(!cp.netns_mgr.is_created());
     }

@@ -55,7 +55,7 @@ use rtnetlink::{
 };
 use std::fs;
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::process::Command;
 use std::{net::IpAddr, path::Path};
 use tracing::{debug, error, info, warn};
@@ -71,10 +71,10 @@ const NS_NAME: &str = "dae-rs";
 const NETNS_RUN_DIR: &str = "/var/run/netns";
 
 /// 宿主侧接口名（位于宿主 NS）
-pub const HOST_IF: &str = "dae-rs-host";
+pub const HOST_IF: &str = "dae0";
 
 /// 代理侧接口名（位于 daens）
-pub const PEER_IF: &str = "dae-rs-peer";
+pub const PEER_IF: &str = "dae0peer";
 
 /// 代理侧 IPv4 地址
 const PEER_ADDR: &str = "169.254.0.11/32";
@@ -168,15 +168,12 @@ impl<'a> NetnsSwitchGuard<'a> {
             active: true,
         }
     }
-
 }
 
 impl<'a> Drop for NetnsSwitchGuard<'a> {
     fn drop(&mut self) {
         if self.active {
-            if let Err(e) =
-                nix::sched::setns(self.host_fd, nix::sched::CloneFlags::CLONE_NEWNET)
-            {
+            if let Err(e) = nix::sched::setns(self.host_fd, nix::sched::CloneFlags::CLONE_NEWNET) {
                 error!(
                     "CRITICAL: Failed to return to host netns in NetnsSwitchGuard: {}. \
                      The current thread may be in the wrong namespace!",
@@ -190,6 +187,55 @@ impl<'a> Drop for NetnsSwitchGuard<'a> {
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+/// 在宿主网络命名空间中同步执行闭包，并在执行后恢复当前命名空间。
+///
+/// # 流程
+///
+/// 1. 保存当前线程的网络命名空间 fd
+/// 2. `setns(host_ns_fd)` 切换到宿主 NS
+/// 3. 执行 `f()`
+/// 4. 无论 `f()` 是否 panic，都恢复为原始命名空间
+///
+/// # 注意
+///
+/// - 本函数是同步的，闭包内不能出现 `.await` 点。
+/// - 不能在持有当前命名空间相关资源（如正在 poll 的 tokio I/O）的
+///   异步上下文中跨 `.await` 调用（本函数内部没有 `.await`，是安全的）。
+///
+/// # 用途
+///
+/// 与 kdae 对齐：TProxy 监听 socket 保留在 daens，而所有上行连接
+/// （到 SOCKS5 代理、到上游 DNS）需要在宿主 NS 中创建并发出。
+pub fn with_host_ns_fd<F, T>(host_ns_fd: RawFd, f: F) -> Result<T>
+where
+    F: FnOnce() -> T,
+{
+    // 1. 保存当前命名空间 fd
+    let current_ns = fs::File::open("/proc/self/ns/net").context("Failed to open current netns fd")?;
+
+    // 2. 切换到宿主 NS
+    let borrowed = unsafe { BorrowedFd::borrow_raw(host_ns_fd) };
+    nix::sched::setns(&borrowed, nix::sched::CloneFlags::CLONE_NEWNET)
+        .context("Failed to switch to host netns")?;
+
+    // 3. 执行闭包（捕获 panic 以确保恢复命名空间）
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+    // 4. 恢复原始命名空间
+    if let Err(e) = nix::sched::setns(&current_ns, nix::sched::CloneFlags::CLONE_NEWNET) {
+        error!(
+            "CRITICAL: Failed to return to original netns after with_host_ns_fd: {}. \
+             The current thread may be in the wrong namespace!",
+            e
+        );
+    }
+
+    match result {
+        Ok(v) => Ok(v),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
 
 /// 读取 /sys/class/net/<ifname>/address 的 MAC 地址
 fn read_mac_from_sysfs(ifname: &str) -> Result<[u8; 6]> {
@@ -364,8 +410,8 @@ impl NetnsManager {
     /// | 参数 | 值 | 说明 |
     /// |------|------|------|
     /// | ns_name | "dae-rs" | 命名空间名称 |
-    /// | host_if | "dae-rs-host" | 宿主侧接口名 |
-    /// | peer_if | "dae-rs-peer" | 代理侧接口名 |
+    /// | host_if | "dae0" | 宿主侧接口名 |
+    /// | peer_if | "dae0peer" | 代理侧接口名 |
     /// | peer_addr | "169.254.0.11/32" | 代理侧地址 |
     /// | mtu | 1500 | 接口 MTU |
     /// | route_table | 2023 | 策略路由表 ID |
@@ -659,8 +705,10 @@ impl NetnsManager {
 
         // ---- Step 5: 创建 link pair（netkit 或 veth）----
         if use_netkit {
-            debug!("Creating netkit pair (L2 mode) in host NS");
-            let netkit_msg = LinkNetkit::new(host_if, peer_if, NetkitMode::L2)
+            debug!("Creating netkit pair (L3 mode) in host NS");
+            // L3 模式确保数据包经过 eBPF TC 程序；L2 模式会绕过 TC BPF，导致透明代理失效。
+            // probe_netkit() 已确保内核 >= 6.7，L3 模式完全兼容。
+            let netkit_msg = LinkNetkit::new(host_if, peer_if, NetkitMode::L3)
                 .scrub(NetkitScrub::None)
                 .peer_scrub(NetkitScrub::None)
                 .build();
@@ -672,7 +720,7 @@ impl NetnsManager {
                 .map_err(from_rtnetlink_err)
                 .context("Failed to create netkit pair in host namespace")?;
             info!(
-                "Created netkit pair (L2 mode) in host NS: {} <-> {}",
+                "Created netkit pair (L3 mode) in host NS: {} <-> {}",
                 host_if, peer_if
             );
         } else {
@@ -688,6 +736,11 @@ impl NetnsManager {
             info!("Created veth pair in host NS: {} <-> {}", host_if, peer_if);
         }
         *netkit_created = true;
+
+        // ---- Step 5b: netkit forwarding 策略 ----
+        // 使用 rtnetlink 创建 LinkNetkit 时，内核默认策略已是 forward。
+        // 这里不再额外执行 `ip link set ... type netkit ...`，避免命令语法差异
+        // 造成误报（如 `unknown option "on"?`）并保持该路径纯 netlink。
 
         // ---- Step 6: 将 dae0peer 移入 daens ----
         let peer_ifindex = get_ifindex_in_ns(peer_if)?;
@@ -889,6 +942,14 @@ impl NetnsManager {
         self.proxy_ns_fd.as_ref().map(|fd| fd.as_raw_fd())
     }
 
+    /// 获取宿主网络命名空间的原始 fd（若已创建）。
+    ///
+    /// 用于把 `host_ns_fd` 传递给 SOCKS5 拨号器 / UDP TProxy 监听器，
+    /// 使上行 socket 在宿主 NS 中创建（与 kdae 对齐）。
+    pub fn get_host_ns_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.host_ns_fd.as_ref().map(|fd| fd.as_raw_fd())
+    }
+
     // ================================================================
     // 命名空间切换
     // ================================================================
@@ -982,7 +1043,14 @@ impl NetnsManager {
             .output();
         // 删除到 daens 的回程路由 169.254.0.11/32 dev <host_if>
         let _ = Command::new("ip")
-            .args(["route", "del", "169.254.0.11/32", "dev", &self.host_if, "2>/dev/null"])
+            .args([
+                "route",
+                "del",
+                "169.254.0.11/32",
+                "dev",
+                &self.host_if,
+                "2>/dev/null",
+            ])
             .output();
 
         // ---- Step 1：删除宿主 NS 策略路由规则 ----
@@ -1278,11 +1346,18 @@ async fn configure_dae0peer_async(
         .map_err(from_rtnetlink_err)
         .context("Failed to add permanent NDP entry")?;
 
-    // ---- sysctl：dae0peer accept_local（需在 daens 中设置，因为 dae0peer 在 daens 中）----
+    // ---- sysctl：daens accept_local（需在 daens 中设置）----
+    // 与原版 dae (kdae) 完全对齐：daens 中只设置 accept_local 和 early_demux。
+    // 注意：不设置 ip_forward=1 和 rp_filter=0 — 原版 dae 在 daens 中不设置这些。
+    // ip_forward=1 会导致内核启用 IP 转发路径，可能干扰 TProxy socket 的回程包路由。
     {
         nix::sched::setns(proxy_ns_fd, nix::sched::CloneFlags::CLONE_NEWNET)
             .context("Failed to enter daens to set accept_local")?;
         let _guard = NetnsSwitchGuard::new(host_ns_fd);
+        write_sysctl("net.ipv4.conf.all.accept_local", "1")
+            .context("Failed to set accept_local on all in daens")?;
+        write_sysctl("net.ipv4.conf.lo.accept_local", "1")
+            .context("Failed to set accept_local on lo in daens")?;
         write_sysctl(&format!("net.ipv4.conf.{}.accept_local", mgr.peer_if), "1")
             .context("Failed to set accept_local on dae0peer")?;
         drop(_guard);
@@ -1340,7 +1415,11 @@ async fn add_policy_routing_in_daens(
     // IPv4 策略路由: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
     let mut v4_req = daens_handle.rule().add();
     v4_req = v4_req.fw_mark(proxy_mark);
-    v4_req.message_mut().attributes.push(RuleAttribute::FwMask(proxy_mask));
+    v4_req.message_mut().header.action = RuleAction::ToTable;
+    v4_req
+        .message_mut()
+        .attributes
+        .push(RuleAttribute::FwMask(proxy_mask));
     v4_req = v4_req.table_id(route_table);
     v4_req
         .v4()
@@ -1352,7 +1431,11 @@ async fn add_policy_routing_in_daens(
     // IPv6 策略路由: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
     let mut v6_req = daens_handle.rule().add();
     v6_req = v6_req.fw_mark(proxy_mark);
-    v6_req.message_mut().attributes.push(RuleAttribute::FwMask(proxy_mask));
+    v6_req.message_mut().header.action = RuleAction::ToTable;
+    v6_req
+        .message_mut()
+        .attributes
+        .push(RuleAttribute::FwMask(proxy_mask));
     v6_req = v6_req.table_id(route_table);
     v6_req
         .v6()
@@ -1482,7 +1565,9 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
     // 169.254.0.1:5353，宿主 NS 中的 DNS handler 接收并处理。
     // 如果地址已存在则忽略（处理崩溃后残留的情况）。
     let host_lo_ifindex = get_ifindex_in_ns("lo")?;
-    let internal_ip: std::net::Ipv4Addr = "169.254.0.1".parse().context("Failed to parse 169.254.0.1")?;
+    let internal_ip: std::net::Ipv4Addr = "169.254.0.1"
+        .parse()
+        .context("Failed to parse 169.254.0.1")?;
     if let Err(e) = host_handle
         .address()
         .add(host_lo_ifindex, std::net::IpAddr::V4(internal_ip), 32)
@@ -1493,8 +1578,7 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
         if err_str.contains("File exists") {
             info!("169.254.0.1/32 already exists on lo, reusing");
         } else {
-            return Err(from_rtnetlink_err(e))
-                .context("Failed to add 169.254.0.1/32 to lo");
+            return Err(from_rtnetlink_err(e)).context("Failed to add 169.254.0.1/32 to lo");
         }
     } else {
         info!("Added 169.254.0.1/32 to lo for cross-namespace DNS forwarding");
@@ -1512,13 +1596,19 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
     if let Err(e) = host_handle.route().add(add_route_msg).execute().await {
         let err_str = e.to_string();
         if err_str.contains("File exists") {
-            info!("Route 169.254.0.11/32 dev {} already exists, reusing", mgr.host_if);
+            info!(
+                "Route 169.254.0.11/32 dev {} already exists, reusing",
+                mgr.host_if
+            );
         } else {
             return Err(from_rtnetlink_err(e))
                 .context("Failed to add 169.254.0.11/32 route to dae0");
         }
     } else {
-        info!("Added route 169.254.0.11/32 dev {} for DNS response back to daens", mgr.host_if);
+        info!(
+            "Added route 169.254.0.11/32 dev {} for DNS response back to daens",
+            mgr.host_if
+        );
     }
 
     // ---- sysctl 参数 ----
@@ -1527,6 +1617,7 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
     write_sysctl(&format!("net.ipv4.conf.{}.arp_filter", mgr.host_if), "0")?;
     write_sysctl("net.ipv4.conf.all.arp_filter", "0")?;
     write_sysctl(&format!("net.ipv4.conf.{}.accept_local", mgr.host_if), "1")?;
+    write_sysctl(&format!("net.ipv4.conf.{}.forwarding", mgr.host_if), "1")?;
     write_sysctl(&format!("net.ipv6.conf.{}.disable_ipv6", mgr.host_if), "0")?;
     write_sysctl(&format!("net.ipv6.conf.{}.forwarding", mgr.host_if), "1")?;
 
@@ -1587,7 +1678,11 @@ async fn add_host_policy_routing_async(
     // IPv4: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
     let mut v4_req = host_handle.rule().add();
     v4_req = v4_req.fw_mark(proxy_mark);
-    v4_req.message_mut().attributes.push(RuleAttribute::FwMask(proxy_mask));
+    v4_req.message_mut().header.action = RuleAction::ToTable;
+    v4_req
+        .message_mut()
+        .attributes
+        .push(RuleAttribute::FwMask(proxy_mask));
     v4_req = v4_req.table_id(route_table);
     v4_req
         .v4()
@@ -1621,7 +1716,11 @@ async fn add_host_policy_routing_async(
     // IPv6: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
     let mut v6_req = host_handle.rule().add();
     v6_req = v6_req.fw_mark(proxy_mark);
-    v6_req.message_mut().attributes.push(RuleAttribute::FwMask(proxy_mask));
+    v6_req.message_mut().header.action = RuleAction::ToTable;
+    v6_req
+        .message_mut()
+        .attributes
+        .push(RuleAttribute::FwMask(proxy_mask));
     v6_req = v6_req.table_id(route_table);
     v6_req
         .v6()
@@ -1670,12 +1769,8 @@ async fn remove_host_policy_routing_async(
         let mut rule_v4 = RuleMessage::default();
         rule_v4.header.family = AddressFamily::Inet;
         rule_v4.header.action = RuleAction::ToTable;
-        rule_v4
-            .attributes
-            .push(RuleAttribute::FwMark(proxy_mark));
-        rule_v4
-            .attributes
-            .push(RuleAttribute::FwMask(proxy_mask));
+        rule_v4.attributes.push(RuleAttribute::FwMark(proxy_mark));
+        rule_v4.attributes.push(RuleAttribute::FwMask(proxy_mask));
         if route_table > 255 {
             rule_v4.attributes.push(RuleAttribute::Table(route_table));
         } else {
@@ -1691,12 +1786,8 @@ async fn remove_host_policy_routing_async(
         let mut rule_v6 = RuleMessage::default();
         rule_v6.header.family = AddressFamily::Inet6;
         rule_v6.header.action = RuleAction::ToTable;
-        rule_v6
-            .attributes
-            .push(RuleAttribute::FwMark(proxy_mark));
-        rule_v6
-            .attributes
-            .push(RuleAttribute::FwMask(proxy_mask));
+        rule_v6.attributes.push(RuleAttribute::FwMark(proxy_mark));
+        rule_v6.attributes.push(RuleAttribute::FwMask(proxy_mask));
         if route_table > 255 {
             rule_v6.attributes.push(RuleAttribute::Table(route_table));
         } else {
@@ -1794,8 +1885,8 @@ mod tests {
     fn test_netns_manager_new() {
         let mgr = NetnsManager::new();
 
-        assert_eq!(mgr.host_if, "dae-rs-host");
-        assert_eq!(mgr.peer_if, "dae-rs-peer");
+        assert_eq!(mgr.host_if, "dae0");
+        assert_eq!(mgr.peer_if, "dae0peer");
         assert_eq!(mgr.peer_addr, "169.254.0.11/32");
         assert_eq!(mgr.mtu, 1500);
         assert_eq!(mgr.route_table, 2023);

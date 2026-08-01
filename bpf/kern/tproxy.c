@@ -488,16 +488,28 @@ enum bpf_stats_key {
 //  17: skb->sk matches the assigned listener socket
 //  18: skb->sk is NULL after bpf_sk_assign() returned 0
 //  19: skb->sk points to a different socket (mismatch)
-// dae0_ingress reply path counters (20-23):
+// dae0_ingress reply path counters (20-27):
 //  20: tproxy_dae0_ingress was called (entry point)
 //  21: load_redirect_tuple succeeded
 //  22: redirect_track map lookup hit
 //  23: bpf_redirect() success (reply path complete)
+//  24: bpf_skb_change_type() failed in dae0peer_ingress
+//  25: redirect_track published (publish_redirect_track_for_packet called)
+//  26: redirect_tuple load failed (load_redirect_tuple returned error)
+//  27: redirect_track lookup miss (map lookup found nothing)
+//  28: redirect_tuple fast path fallback to slow path
+//  29: redirect_tuple slow path load failed
+//  30: redirect_track hit but ifindex is invalid (0)
+//  31: redirect_track reverse-key lookup hit
+//  32: redirect_track map update failed
+//  33: assign_listener selected TCP/IPv4 listener key
+//  34: assign_listener selected UDP listener key
+//  35: assign_listener selected TCP/IPv6 listener key
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u64);
-	__uint(max_entries, 24);
+	__uint(max_entries, 36);
 } debug_counter_map SEC(".maps");
 
 enum debug_counter_key {
@@ -530,6 +542,20 @@ enum debug_counter_key {
 	DBG_DAE0_REDIRECT_TUPLE_OK = 21,
 	DBG_DAE0_REDIRECT_TRACK_HIT = 22,
 	DBG_DAE0_REDIRECT_SUCCESS = 23,
+	// bpf_skb_change_type failure in dae0peer_ingress
+	DBG_CHG_TYPE_FAIL = 24,
+	// redirect_track diagnostic counters
+	DBG_REDIRECT_TRACK_PUBLISH = 25,
+	DBG_REDIRECT_TUPLE_LOAD_FAIL = 26,
+	DBG_REDIRECT_TRACK_MISS = 27,
+	DBG_REDIRECT_TUPLE_FAST_FALLBACK = 28,
+	DBG_REDIRECT_TUPLE_SLOW_FAIL = 29,
+	DBG_REDIRECT_INVALID_IFINDEX = 30,
+	DBG_REDIRECT_TRACK_REVERSE_HIT = 31,
+	DBG_REDIRECT_TRACK_UPDATE_FAIL = 32,
+	DBG_ASSIGN_SELECT_TCP4 = 33,
+	DBG_ASSIGN_SELECT_UDP = 34,
+	DBG_ASSIGN_SELECT_TCP6 = 35,
 };
 
 // Helper to increment a debug counter atomically.
@@ -539,6 +565,64 @@ enum debug_counter_key {
 	__u64 *_dbg_cnt = bpf_map_lookup_elem(&debug_counter_map, &_dbg_key); \
 	if (_dbg_cnt) __sync_fetch_and_add(_dbg_cnt, 1); \
 } while (0)
+
+static __always_inline void normalize_redirect_ip(union ip6 *ip)
+{
+	/* Normalize IPv4/IPv4-compatible forms to a single IPv4-mapped encoding
+	 * (::ffff:a.b.c.d). This keeps redirect_track keys stable across paths.
+	 */
+	if (ip->u6_addr32[0] == 0 && ip->u6_addr32[1] == 0 &&
+	    (ip->u6_addr32[2] == 0 || ip->u6_addr32[2] == bpf_htonl(0x0000ffff)) &&
+	    ip->u6_addr32[3] != 0) {
+		ip->u6_addr32[2] = bpf_htonl(0x0000ffff);
+	}
+}
+
+static __always_inline void normalize_redirect_tuple(struct redirect_tuple *t)
+{
+	normalize_redirect_ip(&t->sip);
+	normalize_redirect_ip(&t->dip);
+}
+
+static __always_inline __u32 detect_tcp_listener_key(struct __sk_buff *skb)
+{
+	void *data, *data_end;
+	__u8 ver_nibble = 0;
+
+	if (bpf_skb_pull_data(skb, ETH_HLEN + 1) < 0)
+		goto fallback;
+
+	data = (void *)(long)skb->data;
+	data_end = (void *)(long)skb->data_end;
+
+	/* Prefer L3-first parse for netkit L3 path. */
+	if ((void *)(data + 1) <= data_end) {
+		ver_nibble = (*((__u8 *)data)) >> 4;
+		if (ver_nibble == 4)
+			return 0;
+		if (ver_nibble == 6)
+			return 2;
+	}
+
+	/* Fallback to L2 parse when an Ethernet header is actually present. */
+	if ((void *)(data + ETH_HLEN + 1) <= data_end) {
+		struct ethhdr *eth = data;
+		__u8 *l3 = data + ETH_HLEN;
+
+		if ((eth->h_proto == bpf_htons(ETH_P_IP) ||
+		     eth->h_proto == bpf_htons(ETH_P_IPV6)) &&
+		    eth->h_proto == skb->protocol) {
+			ver_nibble = (*l3) >> 4;
+			if (ver_nibble == 4)
+				return 0;
+			if (ver_nibble == 6)
+				return 2;
+		}
+	}
+
+fallback:
+	return skb->protocol == bpf_htons(ETH_P_IPV6) ? 2 : 0;
+}
 
 // Events delivered to userspace via ring buffer.
 enum dae_event_type {
@@ -1683,9 +1767,16 @@ static __always_inline __attribute__((unused)) int assign_listener(struct __sk_b
 	increment_counter(skb, DBG_ASSIGN_CALLED);
 	struct bpf_sock *sk;
 	const __u32 *key = &one_key;
+	__u32 select_counter = DBG_ASSIGN_SELECT_UDP;
 
-	if (l4proto == IPPROTO_TCP)
-		key = skb->protocol == bpf_htons(ETH_P_IPV6) ? &two_key : &zero_key;
+	if (l4proto == IPPROTO_TCP) {
+		__u32 tcp_key = detect_tcp_listener_key(skb);
+		key = tcp_key == 2 ? &two_key : &zero_key;
+		select_counter = tcp_key == 2 ? DBG_ASSIGN_SELECT_TCP6
+					      : DBG_ASSIGN_SELECT_TCP4;
+	}
+
+	increment_counter(skb, select_counter);
 
 	sk = bpf_map_lookup_elem(&listen_socket_map, key);
 
@@ -1843,18 +1934,35 @@ publish_redirect_track_for_packet(struct __sk_buff *skb, __u32 link_h_len,
 				  const struct tuples *tuples,
 				  const struct ethhdr *ethh, __u8 from_wan)
 {
+	increment_counter(skb, DBG_REDIRECT_TRACK_PUBLISH);
 	struct redirect_tuple redirect_tuple = {};
+	struct redirect_tuple reverse_tuple = {};
 	struct redirect_entry redirect_entry = {};
 	long map_ret;
 
 	fill_redirect_tuple_from_forward_packet(skb, tuples, &redirect_tuple);
+	normalize_redirect_tuple(&redirect_tuple);
 	fill_redirect_entry_from_forward_packet(skb->ifindex, link_h_len, ethh,
 						from_wan, &redirect_entry);
 
 	map_ret = bpf_map_update_elem(&redirect_track, &redirect_tuple,
 				      &redirect_entry, BPF_ANY);
 	if (map_ret) {
+		increment_counter(skb, DBG_REDIRECT_TRACK_UPDATE_FAIL);
 		bpf_printk("redirect_track update failed: %d", (int)map_ret);
+		return (int)map_ret;
+	}
+
+	/* Also publish reversed key so dae0_ingress can match regardless of
+	 * tuple direction assumptions.
+	 */
+	reverse_tuple.sip = redirect_tuple.dip;
+	reverse_tuple.dip = redirect_tuple.sip;
+	map_ret = bpf_map_update_elem(&redirect_track, &reverse_tuple,
+				      &redirect_entry, BPF_ANY);
+	if (map_ret) {
+		increment_counter(skb, DBG_REDIRECT_TRACK_UPDATE_FAIL);
+		bpf_printk("redirect_track reverse update failed: %d", (int)map_ret);
 		return (int)map_ret;
 	}
 	return 0;
@@ -3184,26 +3292,42 @@ SEC("tc/dae0peer_ingress")
 int tproxy_dae0peer_ingress(struct __sk_buff *skb) {
 	increment_counter(skb, DBG_DAE0PEER_ENTERED);
 
-	/* Only packets redirected from wan_egress or lan_ingress have this cb mark.
+	/* skb->cb[0] == TPROXY_MARK identifies packets redirected from
+	 * wan_egress or lan_ingress. Every other packet arriving on dae0peer is
+	 * return traffic of control-plane connections that originate in daens
+	 * (SOCKS5 dial handshake/data replies, UDP/DNS responses to the marked
+	 * sockets). Those MUST reach the daens network stack, otherwise no
+	 * upstream connection can ever complete.
 	 */
-	if (skb->cb[0] != TPROXY_MARK)
-		return TC_ACT_SHOT;
+	bool is_redirect = (skb->cb[0] == TPROXY_MARK);
 
 	/* ip rule add fwmark 0x8000000/0x8000000 table 2023
 	 * ip route add local default dev lo table 2023
+	 *
+	 * The fwmark forces local delivery inside daens: control-plane reply
+	 * packets with a non-local destination (e.g. a DNS response bound for an
+	 * IP_TRANSPARENT socket bound to an upstream address) are handed to the
+	 * matching local socket instead of being routed back out the netkit.
 	 */
 	skb->mark = TPROXY_MARK;
-	bpf_skb_change_type(skb, PACKET_HOST);
+	int chg_ret = bpf_skb_change_type(skb, PACKET_HOST);
+	if (chg_ret) {
+		increment_counter(skb, DBG_CHG_TYPE_FAIL);
+		bpf_printk("dae0peer: bpf_skb_change_type FAILED ret=%d", chg_ret);
+		return TC_ACT_SHOT;
+	}
 
 	/* listener_l4proto is stored in skb->cb[1] only when the control-plane
 	 * handoff needs an explicit listener assignment (UDP or TCP SYN, including
 	 * first fragments that still expose those headers). Established TCP can
-	 * return to the stack without bpf_sk_assign.
+	 * return to the stack without bpf_sk_assign. Control-plane replies must
+	 * NOT be assigned to a listener — their sockets already exist in daens.
 	 */
-	__u8 l4proto = skb->cb[1];
-
-	if (l4proto != 0)
-		assign_listener(skb, l4proto);
+	if (is_redirect) {
+		__u8 l4proto = skb->cb[1];
+		if (l4proto != 0)
+			assign_listener(skb, l4proto);
+	}
 	return TC_ACT_OK;
 }
 
@@ -3225,24 +3349,60 @@ load_redirect_tuple_fast(struct __sk_buff *skb,
 
 	data = (void *)(long)skb->data;
 	data_end = (void *)(long)skb->data_end;
-	struct ethhdr *eth = data;
 
-	if ((void *)(eth + 1) > data_end)
-		return LOAD_REDIRECT_TUPLE_FALLBACK;
-	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-		struct iphdr *iph = data + ETH_HLEN;
+	/* Treat packet as L2 only when parsed Ethernet protocol matches skb->protocol.
+	 * This avoids mis-parsing netkit L3 packets (data starts at IP header) as if
+	 * they had an Ethernet header.
+	 */
+	if ((void *)(data + ETH_HLEN) <= data_end) {
+		struct ethhdr *eth = data;
+
+		if ((eth->h_proto == bpf_htons(ETH_P_IP) ||
+		     eth->h_proto == bpf_htons(ETH_P_IPV6)) &&
+		    eth->h_proto == skb->protocol) {
+			if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+				struct iphdr *iph = data + ETH_HLEN;
+
+				if ((void *)(iph + 1) > data_end)
+					return LOAD_REDIRECT_TUPLE_FALLBACK;
+				// Use IPv4-mapped IPv6 format with ffff marker to match insert side
+				redirect_tuple->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+				redirect_tuple->sip.u6_addr32[3] = iph->daddr;
+				redirect_tuple->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+				redirect_tuple->dip.u6_addr32[3] = iph->saddr;
+				return 0;
+			}
+
+			if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+				struct ipv6hdr *ipv6h = data + ETH_HLEN;
+
+				if ((void *)(ipv6h + 1) > data_end)
+					return LOAD_REDIRECT_TUPLE_FALLBACK;
+				__builtin_memcpy(&redirect_tuple->sip, &ipv6h->daddr,
+						 sizeof(redirect_tuple->sip));
+				__builtin_memcpy(&redirect_tuple->dip, &ipv6h->saddr,
+						 sizeof(redirect_tuple->dip));
+				return 0;
+			}
+		}
+	}
+
+	/* netkit L3 mode may deliver packets without an Ethernet header.
+	 * In that case, parse from L3 at offset 0 using skb->protocol.
+	 */
+	if (skb->protocol == bpf_htons(ETH_P_IP)) {
+		struct iphdr *iph = data;
 
 		if ((void *)(iph + 1) > data_end)
 			return LOAD_REDIRECT_TUPLE_FALLBACK;
-		// Use IPv4-mapped IPv6 format with ffff marker to match insert side
 		redirect_tuple->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
 		redirect_tuple->sip.u6_addr32[3] = iph->daddr;
 		redirect_tuple->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
 		redirect_tuple->dip.u6_addr32[3] = iph->saddr;
 		return 0;
 	}
-	if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
-		struct ipv6hdr *ipv6h = data + ETH_HLEN;
+	if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ipv6h = data;
 
 		if ((void *)(ipv6h + 1) > data_end)
 			return LOAD_REDIRECT_TUPLE_FALLBACK;
@@ -3260,6 +3420,22 @@ load_redirect_tuple_slow(struct __sk_buff *skb,
 			 struct redirect_tuple *redirect_tuple)
 {
 	int ret;
+	__be16 l2_proto = 0;
+	bool has_l2 = false;
+	__u32 l3_off = 0;
+
+	/* Detect whether skb data includes a real Ethernet header.
+	 * In netkit L3 mode, packets may start directly at IP header.
+	 */
+	ret = bpf_skb_load_bytes(skb, offsetof(struct ethhdr, h_proto),
+				 &l2_proto, sizeof(l2_proto));
+	if (!ret &&
+	    (l2_proto == bpf_htons(ETH_P_IP) ||
+	     l2_proto == bpf_htons(ETH_P_IPV6)) &&
+	    l2_proto == skb->protocol) {
+		has_l2 = true;
+	}
+	l3_off = has_l2 ? ETH_HLEN : 0;
 
 	if (skb->protocol == bpf_htons(ETH_P_IP)) {
 		// Set ffff marker first for IPv4-mapped IPv6 format
@@ -3269,13 +3445,13 @@ load_redirect_tuple_slow(struct __sk_buff *skb,
 		redirect_tuple->dip.u6_addr32[2] = ffff_marker;
 
 		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct iphdr, daddr),
+					 l3_off + offsetof(struct iphdr, daddr),
 					 &redirect_tuple->sip.u6_addr32[3],
 					 sizeof(redirect_tuple->sip.u6_addr32[3]));
 		if (ret)
 			return ret;
 		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct iphdr, saddr),
+					 l3_off + offsetof(struct iphdr, saddr),
 					 &redirect_tuple->dip.u6_addr32[3],
 					 sizeof(redirect_tuple->dip.u6_addr32[3]));
 		if (ret)
@@ -3284,13 +3460,13 @@ load_redirect_tuple_slow(struct __sk_buff *skb,
 	}
 	if (skb->protocol == bpf_htons(ETH_P_IPV6)) {
 		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct ipv6hdr, daddr),
+					 l3_off + offsetof(struct ipv6hdr, daddr),
 					 &redirect_tuple->sip,
 					 sizeof(redirect_tuple->sip));
 		if (ret)
 			return ret;
 		ret = bpf_skb_load_bytes(skb,
-					 ETH_HLEN + offsetof(struct ipv6hdr, saddr),
+					 l3_off + offsetof(struct ipv6hdr, saddr),
 					 &redirect_tuple->dip,
 					 sizeof(redirect_tuple->dip));
 		if (ret)
@@ -3306,8 +3482,13 @@ load_redirect_tuple(struct __sk_buff *skb,
 {
 	int ret = load_redirect_tuple_fast(skb, redirect_tuple);
 
-	if (ret == LOAD_REDIRECT_TUPLE_FALLBACK)
-		return load_redirect_tuple_slow(skb, redirect_tuple);
+	if (ret == LOAD_REDIRECT_TUPLE_FALLBACK) {
+		increment_counter(skb, DBG_REDIRECT_TUPLE_FAST_FALLBACK);
+		ret = load_redirect_tuple_slow(skb, redirect_tuple);
+		if (ret)
+			increment_counter(skb, DBG_REDIRECT_TUPLE_SLOW_FAIL);
+		return ret;
+	}
 	return ret;
 }
 
@@ -3320,16 +3501,60 @@ int tproxy_dae0_ingress(struct __sk_buff *skb)
 	int ret;
 
 	ret = load_redirect_tuple(skb, &redirect_tuple);
-	if (ret)
+	if (ret) {
+		increment_counter(skb, DBG_REDIRECT_TUPLE_LOAD_FAIL);
 		return TC_ACT_OK;
+	}
+	normalize_redirect_tuple(&redirect_tuple);
+
 	increment_counter(skb, DBG_DAE0_REDIRECT_TUPLE_OK);
 
 	struct redirect_entry *redirect_entry =
 		bpf_map_lookup_elem(&redirect_track, &redirect_tuple);
 
-	if (!redirect_entry)
-		return TC_ACT_OK;
+	if (!redirect_entry) {
+		/* Fallback: try reverse key. Some paths may publish tuple in
+		 * src->dst order while reply packets are decoded as dst->src.
+		 */
+		struct redirect_tuple reversed = {};
+		reversed.sip = redirect_tuple.dip;
+		reversed.dip = redirect_tuple.sip;
+		redirect_entry = bpf_map_lookup_elem(&redirect_track, &reversed);
+		if (!redirect_entry) {
+			/* IPv4 compatibility fallback: try key without IPv4-mapped
+			 * ffff marker in case publish-side tuple used raw v4 encoding.
+			 */
+			struct redirect_tuple v4_raw = redirect_tuple;
+			struct redirect_tuple v4_raw_reversed = {};
+			bool maybe_v4_mapped =
+				(v4_raw.sip.u6_addr32[0] == 0) &&
+				(v4_raw.sip.u6_addr32[1] == 0) &&
+				(v4_raw.dip.u6_addr32[0] == 0) &&
+				(v4_raw.dip.u6_addr32[1] == 0);
+
+			if (maybe_v4_mapped) {
+				v4_raw.sip.u6_addr32[2] = 0;
+				v4_raw.dip.u6_addr32[2] = 0;
+				redirect_entry = bpf_map_lookup_elem(&redirect_track, &v4_raw);
+				if (!redirect_entry) {
+					v4_raw_reversed.sip = v4_raw.dip;
+					v4_raw_reversed.dip = v4_raw.sip;
+					redirect_entry = bpf_map_lookup_elem(&redirect_track,
+									 &v4_raw_reversed);
+				}
+			}
+			if (!redirect_entry) {
+				increment_counter(skb, DBG_REDIRECT_TRACK_MISS);
+				return TC_ACT_OK;
+			}
+		}
+		increment_counter(skb, DBG_REDIRECT_TRACK_REVERSE_HIT);
+	}
 	increment_counter(skb, DBG_DAE0_REDIRECT_TRACK_HIT);
+	if (!redirect_entry->ifindex) {
+		increment_counter(skb, DBG_REDIRECT_INVALID_IFINDEX);
+		return TC_ACT_OK;
+	}
 
 	redirect_entry->last_seen_ns = bpf_ktime_get_ns();
 

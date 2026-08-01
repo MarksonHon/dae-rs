@@ -19,6 +19,17 @@ find_map_id() {
     bpftool map show 2>/dev/null | grep "$pattern" | awk '{print $1}' | tr -d ':'
 }
 
+# Helper: collect DNS-related dae-rs log lines
+collect_dns_log() {
+    echo "" >> "$LOG"
+    echo "=== dae-rs DNS-related log lines ===" >> "$LOG"
+    if [ -f /tmp/dae-rs.log ]; then
+        grep -i -E "dns|hijack|create_marked_udp_socket|EADDRINUSE|send_to internal DNS" /tmp/dae-rs.log | tail -n 200 >> "$LOG" 2>&1 || echo "No DNS-related log lines found" >> "$LOG"
+    else
+        echo "/tmp/dae-rs.log not found" >> "$LOG"
+    fi
+}
+
 # Cleanup function - called on exit to ensure dae-rs is stopped and diagnostics are collected
 cleanup() {
     echo "" >> "$LOG"
@@ -54,6 +65,10 @@ cleanup() {
         ip netns exec "$NETNS_NAME" ss -tulnp >> "$LOG" 2>&1 || echo "Failed to show proxy NS sockets" >> "$LOG"
 
         echo "" >> "$LOG"
+        echo "=== Proxy NS DNS (UDP 53) tcpdump ===" >> "$LOG"
+        timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i any -n 'udp port 53' -c 30 >> "$LOG" 2>&1 || echo "proxy NS DNS tcpdump not available or timeout" >> "$LOG"
+
+        echo "" >> "$LOG"
         echo "=== Proxy NS tcpdump (SYN packets) ===" >> "$LOG"
         timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i any -n 'tcp[tcpflags] & tcp-syn != 0' -c 20 >> "$LOG" 2>&1 || echo "tcpdump not available or timeout" >> "$LOG"
 
@@ -70,6 +85,9 @@ cleanup() {
         ip netns exec "$NETNS_NAME" ip rule list >> "$LOG" 2>&1 || echo "Failed to list rules" >> "$LOG"
         ip netns exec "$NETNS_NAME" ip route show table 2023 >> "$LOG" 2>&1 || echo "Failed to show routes" >> "$LOG"
     fi
+
+    # Collect DNS logs before stopping dae-rs
+    collect_dns_log
 
     # Now stop dae-rs
     if [ -f "$PID_FILE" ]; then
@@ -91,6 +109,15 @@ cleanup() {
 
 trap cleanup EXIT
 
+# Collect system DNS configuration before starting dae-rs
+echo "" >> "$LOG"
+echo "=== Pre-start System DNS Configuration ===" >> "$LOG"
+echo "--- /etc/resolv.conf ---" >> "$LOG"
+cat /etc/resolv.conf >> "$LOG" 2>&1 || echo "Failed to read /etc/resolv.conf" >> "$LOG"
+echo "" >> "$LOG"
+echo "--- resolvectl status ---" >> "$LOG"
+resolvectl status >> "$LOG" 2>&1 || echo "resolvectl not available" >> "$LOG"
+
 # Start dae-rs
 echo "Starting dae-rs..."
 $DAE_RS_BIN run -c "$DAE_RS_CONFIG" > /tmp/dae-rs.log 2>&1 &
@@ -100,6 +127,11 @@ echo "dae-rs started with PID $(cat $PID_FILE)"
 # Wait for startup
 echo "Waiting 5 seconds for dae-rs to start..."
 sleep 5
+
+# Check if internal DNS handler is listening on 169.254.0.1
+echo "" >> "$LOG"
+echo "=== Internal DNS handler listening state (Host NS 169.254.0.1) ===" >> "$LOG"
+ss -tulnp | grep -E "169\.254\.0\.1" >> "$LOG" 2>&1 || echo "No 169.254.0.1 listener found" >> "$LOG"
 
 # Pre-traffic snapshot
 echo "" >> "$LOG"
@@ -120,6 +152,55 @@ else
     echo "listen_socket_map not found" >> "$LOG"
 fi
 
+# DNS resolution tests (before TCP traffic, to isolate DNS path)
+echo "" >> "$LOG"
+echo "=== DNS resolution tests (pre-traffic) ===" >> "$LOG"
+if command -v dig >/dev/null 2>&1; then
+    dig +short +time=3 +tries=1 @1.1.1.1 google.com >> "$LOG" 2>&1 || echo "dig @1.1.1.1 google.com failed" >> "$LOG"
+    dig +short +time=3 +tries=1 @8.8.8.8 cloudflare.com >> "$LOG" 2>&1 || echo "dig @8.8.8.8 cloudflare.com failed" >> "$LOG"
+    dig +short +time=3 +tries=1 google.com >> "$LOG" 2>&1 || echo "dig google.com (system) failed" >> "$LOG"
+else
+    nslookup -timeout=3 google.com 1.1.1.1 >> "$LOG" 2>&1 || echo "nslookup google.com @1.1.1.1 failed" >> "$LOG"
+    nslookup -timeout=3 cloudflare.com 8.8.8.8 >> "$LOG" 2>&1 || echo "nslookup cloudflare.com @8.8.8.8 failed" >> "$LOG"
+    nslookup -timeout=3 google.com >> "$LOG" 2>&1 || echo "nslookup google.com (system) failed" >> "$LOG"
+fi
+
+# Host NS DNS (UDP 53) tcpdump snapshot during resolution
+echo "" >> "$LOG"
+echo "=== Host NS DNS (UDP 53) tcpdump during resolution ===" >> "$LOG"
+(
+    timeout 5 tcpdump -i any -n 'udp port 53' -c 40 >> "$LOG" 2>&1 || echo "Host NS DNS tcpdump not available or timeout" >> "$LOG"
+) &
+TCPDUMP_PID=$!
+sleep 1
+# Trigger a few more DNS queries while tcpdump is running
+if command -v dig >/dev/null 2>&1; then
+    dig +short +time=3 +tries=1 baidu.com >/dev/null 2>&1 || true
+    dig +short +time=3 +tries=1 example.com >/dev/null 2>&1 || true
+else
+    nslookup -timeout=3 baidu.com >/dev/null 2>&1 || true
+    nslookup -timeout=3 example.com >/dev/null 2>&1 || true
+fi
+wait $TCPDUMP_PID 2>/dev/null || true
+
+# Concurrent DNS query stress test to expose EADDRINUSE
+echo "" >> "$LOG"
+echo "=== Concurrent DNS query stress test ===" >> "$LOG"
+if command -v dig >/dev/null 2>&1; then
+    for i in $(seq 1 20); do
+        dig +short +time=3 +tries=1 "test${i}.example.com" >/dev/null 2>&1 &
+    done
+    wait
+    echo "20 concurrent dig queries launched" >> "$LOG"
+else
+    for i in $(seq 1 20); do
+        nslookup -timeout=3 "test${i}.example.com" >/dev/null 2>&1 &
+    done
+    wait
+    echo "20 concurrent nslookup queries launched" >> "$LOG"
+fi
+collect_dns_log
+
 # Generate test traffic
 echo "Generating test traffic..."
 curl -s -o /dev/null -w "curl google.com: %{http_code}\n" --connect-timeout 5 https://www.google.com >> "$LOG" 2>&1 || echo "curl google.com failed" >> "$LOG"
@@ -133,6 +214,18 @@ curl -k -s -o /dev/null -w "curl 8.8.8.8: %{http_code}\n" --connect-timeout 5 ht
 # Wait for traffic processing
 echo "Waiting 10 seconds for traffic processing..."
 sleep 10
+
+# Post-traffic DNS resolution tests
+echo "" >> "$LOG"
+echo "=== DNS resolution tests (post-traffic) ===" >> "$LOG"
+if command -v dig >/dev/null 2>&1; then
+    dig +short +time=3 +tries=1 @1.1.1.1 github.com >> "$LOG" 2>&1 || echo "dig @1.1.1.1 github.com failed" >> "$LOG"
+    dig +short +time=3 +tries=1 github.com >> "$LOG" 2>&1 || echo "dig github.com (system) failed" >> "$LOG"
+else
+    nslookup -timeout=3 github.com 1.1.1.1 >> "$LOG" 2>&1 || echo "nslookup github.com @1.1.1.1 failed" >> "$LOG"
+    nslookup -timeout=3 github.com >> "$LOG" 2>&1 || echo "nslookup github.com (system) failed" >> "$LOG"
+fi
+collect_dns_log
 
 # Post-traffic snapshot
 echo "" >> "$LOG"

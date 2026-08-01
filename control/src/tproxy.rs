@@ -1404,67 +1404,70 @@ impl UdpTproxyListener {
                 );
             }
 
-            // ---- DNS hijacking: forward DNS queries directly to upstream DNS server ----
-            // When DNS hijacking is enabled, forward DNS queries directly to the upstream
-            // DNS server (the original destination) instead of going through SOCKS5 proxy.
-            // The socket uses IP_TRANSPARENT + SO_MARK=0x100 and is bound to the upstream
-            // DNS server address, so the response appears to come from the correct source
-            // address (the upstream DNS server, not the proxy).
-            //
-            // Data flow:
-            //   Client -> eBPF intercept -> TProxy -> upstream DNS server
-            //                                                       |
-            //   Client <- eBPF/routing  <- TProxy <- upstream DNS server (response)
+            // ---- DNS hijacking: forward DNS queries to the internal DNS handler ----
+            // Only intercept UDP packets to port 53. The internal DNS handler
+            // listens on 169.254.0.1:<port> (IPv4) in the host NS. We use a
+            // separate IPv4 socket to talk to the handler, then create a
+            // second IP_TRANSPARENT socket bound to the original destination
+            // (the DNS server the client queried) so the response reaches the
+            // client with the expected source address.
             if is_dns && dns_forward_addr.is_some() {
-                let upstream = dest;
+                let handler_addr = dns_forward_addr.unwrap();
                 let peer = peer_addr;
+                let dest = dest;
                 let pkt = pkt_buf.clone();
 
                 tokio::spawn(async move {
-                    // Create a marked UDP socket with IP_TRANSPARENT, bound to the
-                    // upstream DNS server address. IP_TRANSPARENT allows binding to
-                    // non-local addresses, so the response sent back to the client
-                    // will have the correct source address (the upstream DNS server).
-                    // When host_ns_fd is set, the socket is created in the host NS
-                    // (kdae-aligned), so the query leaves from the host's real WAN
-                    // source address and no EADDRINUSE occurs for concurrent queries.
-                    let query_socket = create_marked_udp_socket(&upstream, host_ns_fd).await;
-                    let query_socket = match query_socket {
+                    // The TProxy UDP listener is dual-stack (AF_INET6), so an
+                    // IPv4 client appears as IPv4-mapped IPv6 (::ffff:...).
+                    // Canonicalize to a real IPv4/IPv6 SocketAddr so the
+                    // response socket family matches.
+                    let peer = peer.map(canonicalize_socket_addr);
+
+                    // 1. Send the query to the internal DNS handler. The handler
+                    //    is IPv4-only, so use an IPv4 socket bound to any port.
+                    let query_bind: SocketAddr = "0.0.0.0:0".parse().expect("valid IPv4 any addr");
+                    let query_socket = match create_marked_udp_socket(&query_bind, host_ns_fd).await {
                         Some(s) => s,
                         None => {
-                            warn!("DNS hijack: failed to create marked socket for upstream {}", upstream);
+                            warn!("DNS hijack: failed to create query socket for handler {}", handler_addr);
                             return;
                         }
                     };
 
-                    // Forward the DNS query directly to the upstream DNS server
-                    if let Err(e) = query_socket.send_to(&pkt, upstream).await {
-                        debug!("DNS hijack: send_to upstream {} failed: {}", upstream, e);
+                    if let Err(e) = query_socket.send_to(&pkt, handler_addr).await {
+                        debug!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
                         return;
                     }
 
-                    // Wait for DNS response with timeout
+                    // Wait for the handler's DNS response.
                     let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
                     let recv_fut = query_socket.recv_from(&mut recv_buf);
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), recv_fut).await {
-                        Ok(Ok((len, _))) => {
-                            recv_buf.truncate(len);
-                            // Send response back to original client.
-                            // Since the socket is bound to the upstream DNS server
-                            // address (with IP_TRANSPARENT), the source address of
-                            // this response will be the upstream DNS server, which
-                            // is what the client expects.
-                            if let Some(peer) = peer {
-                                if let Err(e) = query_socket.send_to(&recv_buf, peer).await {
-                                    debug!("DNS hijack: response send_to client {} failed: {}", peer, e);
-                                }
-                            }
-                        }
+                    let len = match tokio::time::timeout(std::time::Duration::from_secs(5), recv_fut).await {
+                        Ok(Ok((len, _))) => len,
                         Ok(Err(e)) => {
-                            debug!("DNS hijack: recv error: {}", e);
+                            debug!("DNS hijack: recv from handler error: {}", e);
+                            return;
                         }
                         Err(_) => {
-                            debug!("DNS hijack: timeout waiting for response from upstream {}", upstream);
+                            debug!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
+                            return;
+                        }
+                    };
+                    recv_buf.truncate(len);
+
+                    // 2. Send the response back to the client from the original
+                    //    destination address (the DNS server it queried).
+                    if let Some(peer) = peer {
+                        let resp_socket = match create_marked_udp_socket(&dest, host_ns_fd).await {
+                            Some(s) => s,
+                            None => {
+                                debug!("DNS hijack: failed to create response socket for {}", dest);
+                                return;
+                            }
+                        };
+                        if let Err(e) = resp_socket.send_to(&recv_buf, peer).await {
+                            debug!("DNS hijack: response send_to client {} failed: {}", peer, e);
                         }
                     }
                 });
@@ -1571,6 +1574,25 @@ impl UdpTproxyListener {
     }
 }
 
+/// Convert an IPv4-mapped IPv6 socket address back to a pure IPv4 address.
+///
+/// The TProxy UDP listener is bound as dual-stack (AF_INET6 with IPV6_V6ONLY=0),
+/// so IPv4 clients are reported as `::ffff:<ipv4>` peer addresses. When creating
+/// response sockets we need the real address family, otherwise `send_to` on an
+/// IPv4 socket with an IPv4-mapped IPv6 target returns `EAFNOSUPPORT`.
+fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                SocketAddr::from((v4, v6.port()))
+            } else {
+                SocketAddr::V6(v6)
+            }
+        }
+        other => other,
+    }
+}
+
 /// 创建一个带有 IP_TRANSPARENT 和 SO_MARK=0x100 的 UDP socket，并绑定到目标地址。
 /// 用于 DNS 劫持：TProxy 将 DNS 查询转发到上游 DNS 服务器时使用此 socket。
 /// IP_TRANSPARENT 允许绑定到非本机地址（如上游 DNS 服务器地址），
@@ -1641,6 +1663,16 @@ async fn create_marked_udp_socket(
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_REUSEADDR,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+
+            // SO_REUSEPORT further reduces EADDRINUSE for transparent UDP sockets
+            // by allowing multiple sockets to share the same local address/port.
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
                 &one as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );

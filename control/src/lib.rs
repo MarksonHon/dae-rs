@@ -329,7 +329,9 @@ pub struct ControlPlane {
     /// Daeparam to pass to the eBPF program before loading.
     pub ebpf_param: Option<crate::ebpf::Daeparam>,
     /// Domain routing tracker for DNS-driven domain_routing_map updates.
-    pub domain_routing: Option<crate::domain_routing::DomainRoutingTracker>,
+    /// Shared handle: the DNS listener writes resolved domains into the current
+    /// tracker, and the janitor removes entries on TTL expiry.
+    pub domain_routing: Option<crate::domain_routing::DomainRoutingHandle>,
     /// DNS manager (handles DNS query routing, upstream forwarding, caching)
     pub dns_manager: Option<crate::dns::DnsManager>,
     /// UDP connection state tracker (for UDP flow cleanup in janitor)
@@ -860,13 +862,17 @@ impl ControlPlane {
                 // Set up domain routing tracker
                 if !compiled.domain_sets.is_empty() {
                     let n_sets = compiled.domain_sets.len();
-                    self.domain_routing = Some(crate::domain_routing::DomainRoutingTracker::new(
-                        std::sync::Arc::new(compiled.domain_sets),
-                        init_slot,
+                    let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::domain_routing::DomainRoutingTracker::new(
+                            std::sync::Arc::new(compiled.domain_sets),
+                            init_slot,
+                        ),
                     ));
+                    self.domain_routing =
+                        Some(std::sync::Arc::new(std::sync::Mutex::new(Some(tracker))));
                     info!(
                         "Domain routing tracker initialized with {} domain sets",
-                        self.domain_routing.as_ref().unwrap().len(),
+                        n_sets
                     );
                     debug!(n_sets, "Domain routing tracker created");
                 }
@@ -971,8 +977,19 @@ impl ControlPlane {
             info!("Step 4.5/5: Starting DNS manager");
             debug!(dns_bind = %dns_cfg.bind, dns_cache_max_size = dns_cfg.cache.max_size, "DNS config details");
             let mut dns_mgr = crate::dns::DnsManager::new(dns_cfg.clone());
+            // Wire DNS resolutions into the domain routing tracker so the eBPF
+            // domain_routing_map is populated for domain-based routing rules.
+            let domain_routing = self.domain_routing.clone();
+            let ebpf_mgr = self.ebpf_mgr.clone();
+            let on_resolve: Option<crate::dns::handler::DnsResolveCallback> = match domain_routing {
+                Some(_) => Some(Arc::new(move |domain: &str, ip: std::net::IpAddr, ttl: u32| {
+                    let _ = Self::add_dns_result_to_tracker(&domain_routing, &ebpf_mgr, domain, ip, ttl);
+                })),
+                None => None,
+            };
+            dns_mgr.set_on_resolve(on_resolve);
             let upstream_start = std::time::Instant::now();
-            if let Err(e) = dns_mgr.init_upstreams() {
+            if let Err(e) = dns_mgr.init_upstreams().await {
                 warn!("DNS upstream initialization failed (non-fatal): {}", e);
             } else {
                 debug!(
@@ -1034,6 +1051,7 @@ impl ControlPlane {
         self.janitor_handle = Some(Self::spawn_conn_state_janitor(
             self.ebpf_mgr.clone(),
             self.udp_tracker.clone(),
+            self.domain_routing.clone(),
         ));
         debug!("Conn_state janitor spawned");
 
@@ -1390,10 +1408,12 @@ impl ControlPlane {
     /// - Also cleans up expired entries from the eBPF map
     ///
     /// If `udp_tracker` is provided, expired UDP flows from the tracker are
-    /// also deleted from conn_state_map.
+    /// also deleted from conn_state_map. If `domain_routing` is provided,
+    /// expired domain_routing_map entries are deleted (DNS TTL expiry).
     pub fn spawn_conn_state_janitor(
         ebpf_mgr: Arc<Mutex<crate::ebpf::EbpfManager>>,
         udp_tracker: Option<Arc<Mutex<crate::udp_tracker::UdpConnStateTracker>>>,
+        domain_routing: Option<crate::domain_routing::DomainRoutingHandle>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("ConnState janitor started with pressure detection");
@@ -1449,6 +1469,28 @@ impl ControlPlane {
                         "Janitor: deleted {} expired entries from UDP tracker",
                         expired_udp_keys.len()
                     );
+                }
+
+                // ---- Step 1c: Clean up expired domain_routing_map entries (DNS TTL) ----
+                // Lock order: the outer handle is locked briefly to clone the inner
+                // Arc, then released before locking the tracker (which is allowed to
+                // be held together with the ebpf lock).
+                if let Some(ref handle) = domain_routing {
+                    if let Ok(h) = handle.lock() {
+                        if let Some(tracker) = h.as_ref().cloned() {
+                            drop(h);
+                            if let Ok(mut t) = tracker.lock() {
+                                if let Ok(n) = t.cleanup_expired(&mut mgr) {
+                                    if n > 0 {
+                                        debug!(
+                                            "Janitor: cleaned {} expired domain routing entries",
+                                            n
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // ---- Step 2: Scan conn_state_map for expired entries ----
@@ -1765,18 +1807,32 @@ impl ControlPlane {
     /// Only detaches TC and cgroup hooks; does NOT clean up other resources.
     /// This is safe to call multiple times.
     /// Add a DNS resolution result to the domain routing tracker.
-    /// The `ebpf_mgr` and `domain_routing` are separate fields, passed individually
+    /// The `domain_routing` and `ebpf_mgr` are separate fields, passed individually
     /// to avoid borrow checker conflicts.
+    ///
+    /// Lock order (see [`crate::domain_routing::DomainRoutingHandle`]):
+    /// the outer handle is locked briefly to clone the inner `Arc`, then released
+    /// before acquiring the ebpf lock, then the inner tracker is locked.
     pub fn add_dns_result_to_tracker(
-        domain_routing: &mut Option<crate::domain_routing::DomainRoutingTracker>,
+        domain_routing: &Option<crate::domain_routing::DomainRoutingHandle>,
         ebpf_mgr: &Arc<Mutex<crate::ebpf::EbpfManager>>,
         domain: &str,
         ip: std::net::IpAddr,
         ttl_secs: u32,
     ) -> Result<()> {
-        if let Some(ref mut tracker) = domain_routing {
-            let mut ebpf_guard = ebpf_mgr.lock().expect("ebpf lock");
-            tracker.add_dns_result(domain, ip, ttl_secs, &mut *ebpf_guard)?;
+        let Some(handle) = domain_routing else {
+            return Ok(());
+        };
+        let tracker = match handle.lock() {
+            Ok(g) => g.as_ref().cloned(),
+            Err(_) => return Ok(()),
+        };
+        let Some(tracker) = tracker else {
+            return Ok(());
+        };
+        let mut ebpf_guard = ebpf_mgr.lock().expect("ebpf lock");
+        if let Ok(mut tracker_guard) = tracker.lock() {
+            tracker_guard.add_dns_result(domain, ip, ttl_secs, &mut *ebpf_guard)?;
         }
         Ok(())
     }
@@ -2148,14 +2204,23 @@ impl ControlPlane {
 
         // 4a. Re-initialize domain routing tracker with the new epoch slot
         if !compiled.domain_sets.is_empty() {
-            self.domain_routing = Some(crate::domain_routing::DomainRoutingTracker::new(
-                std::sync::Arc::new(compiled.domain_sets),
-                next_slot,
-            ));
-            info!(
-                "Hot-reload: domain routing tracker updated ({} sets)",
-                self.domain_routing.as_ref().unwrap().len(),
-            );
+            if let Some(handle) = self.domain_routing.as_ref() {
+                let new_tracker = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::domain_routing::DomainRoutingTracker::new(
+                        std::sync::Arc::new(compiled.domain_sets),
+                        next_slot,
+                    ),
+                ));
+                match handle.lock() {
+                    Ok(mut guard) => {
+                        *guard = Some(new_tracker);
+                        info!("Hot-reload: domain routing tracker updated (epoch slot {})", next_slot);
+                    }
+                    Err(e) => {
+                        warn!("Hot-reload: domain routing tracker lock poisoned: {}", e);
+                    }
+                }
+            }
         }
 
         let elapsed_ms = start.elapsed().as_millis();

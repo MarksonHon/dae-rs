@@ -19,6 +19,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
+/// Shared handle to the current domain routing tracker.
+///
+/// The outer `Mutex` guards replacement of the tracker during hot reload; the
+/// inner `Arc<Mutex<_>>` guards the tracker's own state, which is touched from
+/// both the DNS listener task (on every accepted resolution) and the janitor
+/// (for TTL expiry). Lock order convention:
+///
+/// 1. Lock the outer handle briefly to clone the inner `Arc`, then release it.
+/// 2. Lock `EbpfManager`, then lock the inner tracker.
+///
+/// The outer handle must NEVER be held while holding the ebpf lock, otherwise
+/// hot-reload (which holds the outer handle) and DNS/janitor paths could
+/// deadlock (AB-BA).
+pub type DomainRoutingHandle =
+    Arc<std::sync::Mutex<Option<Arc<std::sync::Mutex<DomainRoutingTracker>>>>>;
+
 /// A single domain→IP mapping with expiry.
 #[allow(dead_code)]
 struct DomainIpMapping {

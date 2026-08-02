@@ -4,7 +4,10 @@ global {
 }
 
 interface {
-  wan_interface: eth0
+  # auto: follow the interface(s) carrying the default route (IPv4+IPv6)
+  wan_interface: auto
+  # glob patterns are supported: wan_interface: eth* enp?*
+  # regex patterns are supported: wan_interface: regex('^enp[0-9]+$')
   # lan_interface: eth1 docker0
   # bind_interface: auto
 }

@@ -4,16 +4,16 @@ pub mod router;
 pub mod handler;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::DnsConfig;
+use crate::dns::handler::{DnsListener, DnsResolveCallback};
 use crate::dns::upstream::DnsUpstreamPool;
 use crate::dns::cache::DnsCache;
 use crate::dns::router::DnsRouter;
-use crate::dns::handler::DnsListener;
 
 /// DNS Manager — main orchestrator for DNS operations
 pub struct DnsManager {
@@ -29,6 +29,9 @@ pub struct DnsManager {
     listener: Option<DnsListener>,
     /// Whether the manager is running
     running: bool,
+    /// Callback invoked on each accepted DNS resolution (domain, ip, ttl).
+    /// Used to feed the domain_routing_map eBPF map for domain-based routing.
+    on_resolve: Option<DnsResolveCallback>,
 }
 
 impl DnsManager {
@@ -43,26 +46,61 @@ impl DnsManager {
             router,
             listener: None,
             running: false,
+            on_resolve: None,
         }
     }
 
-    /// Initialize upstream pools for all DNS groups
-    pub fn init_upstreams(&mut self) -> anyhow::Result<()> {
-        // Create pools for starting_dns upstreams
-        for entry in &self.config.starting_dns.upstream {
-            let pool = DnsUpstreamPool::new(&entry.address)?;
-            self.upstream_pools
-                .insert(format!("__starting__{}", entry.label), Arc::new(pool));
-        }
+    /// Set the callback invoked on each accepted DNS resolution.
+    /// Used to feed domain routing into the eBPF domain_routing_map.
+    pub fn set_on_resolve(&mut self, on_resolve: Option<DnsResolveCallback>) {
+        self.on_resolve = on_resolve;
+    }
 
-        // Create pools for each DNS group's upstreams
-        for group in &self.config.groups {
-            for entry in &group.upstream {
-                let pool = DnsUpstreamPool::new(&entry.address)?;
-                self.upstream_pools
-                    .insert(format!("{}__{}", group.name, entry.label), Arc::new(pool));
+    /// Initialize upstream pools for all DNS groups.
+    ///
+    /// Upstream entries whose address is a hostname (e.g. `udp://dns.google:53`)
+    /// are resolved via the `starting_dns` (bootstrap) pools. A single failing
+    /// upstream is skipped with a warning instead of aborting the whole init —
+    /// otherwise one bad entry would make every DNS query return SERVFAIL.
+    pub async fn init_upstreams(&mut self) -> anyhow::Result<()> {
+        // Bootstrap pools first. They MUST be IP addresses: resolving a hostname
+        // bootstrap would create a chicken-and-egg problem (nothing to resolve it with).
+        let mut bootstrap_pools: HashMap<String, Arc<DnsUpstreamPool>> = HashMap::new();
+        for entry in &self.config.starting_dns.upstream {
+            match DnsUpstreamPool::new(&entry.address) {
+                Ok(pool) => {
+                    bootstrap_pools.insert(format!("__starting__{}", entry.label), Arc::new(pool));
+                }
+                Err(e) => {
+                    warn!(
+                        "Skipping starting_dns upstream '{}' ({}): {}",
+                        entry.label, entry.address, e
+                    );
+                }
             }
         }
+
+        // Hostname → resolved IP cache so repeated hostnames only resolve once.
+        let mut resolved: HashMap<String, IpAddr> = HashMap::new();
+
+        for group in &self.config.groups {
+            for entry in &group.upstream {
+                let key = format!("{}__{}", group.name, entry.label);
+                match build_upstream_pool(&entry.address, &bootstrap_pools, &mut resolved).await {
+                    Some(pool) => {
+                        self.upstream_pools.insert(key, Arc::new(pool));
+                    }
+                    None => {
+                        warn!(
+                            "Skipping DNS upstream '{}' ({}): failed to parse or resolve",
+                            entry.label, entry.address
+                        );
+                    }
+                }
+            }
+        }
+
+        self.upstream_pools.extend(bootstrap_pools);
 
         info!(
             "DNS upstream pools initialized: {} total",
@@ -92,7 +130,14 @@ impl DnsManager {
         let cache = self.cache.clone();
         let router = self.router.clone();
 
-        let mut listener = DnsListener::new(bind_addr, config, upstream_pools, cache, router);
+        let mut listener = DnsListener::new(
+            bind_addr,
+            config,
+            upstream_pools,
+            cache,
+            router,
+            self.on_resolve.clone(),
+        );
         listener.start().await?;
         self.listener = Some(listener);
         self.running = true;
@@ -114,4 +159,71 @@ impl DnsManager {
     pub fn is_running(&self) -> bool {
         self.running
     }
+}
+
+/// Build an upstream pool for an upstream URL.
+///
+/// IP-literal addresses are used directly. Hostnames are resolved through the
+/// bootstrap (`starting_dns`) pools; returns `None` if resolution fails so the
+/// caller can skip the entry instead of aborting.
+async fn build_upstream_pool(
+    url: &str,
+    bootstrap_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
+    resolved: &mut HashMap<String, IpAddr>,
+) -> Option<DnsUpstreamPool> {
+    use crate::dns::upstream::{parse_dns_url_parts, DnsUpstreamPool};
+    use std::net::{IpAddr, SocketAddr};
+
+    let parts = parse_dns_url_parts(url).ok()?;
+
+    // IP literal → use directly
+    if let Ok(ip) = parts.host.parse::<IpAddr>() {
+        return Some(DnsUpstreamPool::new_with_addr(
+            parts.transport,
+            SocketAddr::new(ip, parts.port),
+        ));
+    }
+
+    // Hostname → resolve once via bootstrap, then reuse the cached IP
+    let ip = if let Some(ip) = resolved.get(&parts.host) {
+        *ip
+    } else {
+        let ip = resolve_via_bootstrap(&parts.host, bootstrap_pools).await?;
+        resolved.insert(parts.host.clone(), ip);
+        ip
+    };
+
+    Some(DnsUpstreamPool::new_with_addr(
+        parts.transport,
+        SocketAddr::new(ip, parts.port),
+    ))
+}
+
+/// Resolve `hostname` to an IP using the first available bootstrap pool.
+///
+/// Queries A records first, then AAAA. The bootstrap sockets carry SO_MARK=0x100,
+/// so the queries bypass the eBPF proxy pipeline (no hijack loop).
+async fn resolve_via_bootstrap(
+    hostname: &str,
+    bootstrap_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
+) -> Option<IpAddr> {
+    use crate::dns::upstream::{build_dns_query, parse_answers_for_addr};
+
+    let pool = bootstrap_pools.values().next()?;
+
+    let a_query = build_dns_query(hostname, 1);
+    if let Ok(resp) = pool.query(&a_query).await {
+        if let Some(ip) = parse_answers_for_addr(&resp).first() {
+            return Some(*ip);
+        }
+    }
+
+    let aaaa_query = build_dns_query(hostname, 28);
+    if let Ok(resp) = pool.query(&aaaa_query).await {
+        if let Some(ip) = parse_answers_for_addr(&resp).first() {
+            return Some(*ip);
+        }
+    }
+
+    None
 }

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::RwLock;
@@ -30,6 +30,10 @@ use crate::dns::cache::DnsCache;
 use crate::dns::router::{DnsResponseAction, DnsRouter};
 use crate::dns::upstream::DnsUpstreamPool;
 
+/// Callback invoked on each accepted DNS resolution (domain, ip, ttl).
+/// Used to feed the domain_routing_map eBPF map for domain-based routing.
+pub type DnsResolveCallback = Arc<dyn Fn(&str, IpAddr, u32) + Send + Sync>;
+
 /// DNS Listener — handles incoming DNS queries (UDP + TCP)
 pub struct DnsListener {
     /// Bind address
@@ -48,6 +52,9 @@ pub struct DnsListener {
     tcp_handle: Option<tokio::task::JoinHandle<()>>,
     /// Shutdown signal sender
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Callback invoked on each accepted DNS resolution (domain, ip, ttl).
+    /// Feeds the domain_routing_map eBPF map for domain-based routing.
+    on_resolve: Option<DnsResolveCallback>,
 }
 
 impl DnsListener {
@@ -57,6 +64,7 @@ impl DnsListener {
         upstream_pools: Arc<HashMap<String, Arc<DnsUpstreamPool>>>,
         cache: Arc<RwLock<DnsCache>>,
         router: DnsRouter,
+        on_resolve: Option<DnsResolveCallback>,
     ) -> Self {
         Self {
             bind_addr,
@@ -67,6 +75,7 @@ impl DnsListener {
             udp_handle: None,
             tcp_handle: None,
             shutdown_tx: None,
+            on_resolve,
         }
     }
 
@@ -85,6 +94,7 @@ impl DnsListener {
         let upstream_pools = self.upstream_pools.clone();
         let cache = self.cache.clone();
         let router = Arc::new(self.router.clone());
+        let on_resolve = self.on_resolve.clone();
 
         debug!(bind = %bind, "DNS listener starting");
 
@@ -97,8 +107,9 @@ impl DnsListener {
         let u_pools = upstream_pools.clone();
         let u_cache = cache.clone();
         let u_router = router.clone();
+        let u_on_resolve = on_resolve.clone();
         let udp_handle = tokio::spawn(async move {
-            run_udp_listener(udp_socket, u_config, u_pools, u_cache, u_router).await;
+            run_udp_listener(udp_socket, u_config, u_pools, u_cache, u_router, u_on_resolve).await;
         });
         self.udp_handle = Some(udp_handle);
 
@@ -107,7 +118,7 @@ impl DnsListener {
             anyhow::anyhow!("failed to bind DNS TCP listener on {}: {}", bind, e)
         })?;
         let tcp_handle = tokio::spawn(async move {
-            run_tcp_listener(tcp_listener, config, upstream_pools, cache, router).await;
+            run_tcp_listener(tcp_listener, config, upstream_pools, cache, router, on_resolve).await;
         });
         self.tcp_handle = Some(tcp_handle);
 
@@ -133,8 +144,10 @@ impl DnsListener {
                 let i_pools = self.upstream_pools.clone();
                 let i_cache = self.cache.clone();
                 let i_router = Arc::new(self.router.clone());
+                let i_on_resolve = self.on_resolve.clone();
                 tokio::spawn(async move {
-                    run_udp_listener(internal_socket, i_config, i_pools, i_cache, i_router).await;
+                    run_udp_listener(internal_socket, i_config, i_pools, i_cache, i_router, i_on_resolve)
+                        .await;
                 });
                 info!(
                     "DNS internal listener started on {} for cross-namespace forwarding",
@@ -183,6 +196,7 @@ async fn run_udp_listener(
     upstream_pools: Arc<HashMap<String, Arc<DnsUpstreamPool>>>,
     cache: Arc<RwLock<DnsCache>>,
     router: Arc<DnsRouter>,
+    on_resolve: Option<DnsResolveCallback>,
 ) {
     let mut buf = vec![0u8; 4096];
     loop {
@@ -199,6 +213,7 @@ async fn run_udp_listener(
         let upstream_pools = upstream_pools.clone();
         let cache = cache.clone();
         let router = router.clone();
+        let on_resolve = on_resolve.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_dns_query(
@@ -208,6 +223,7 @@ async fn run_udp_listener(
                 &upstream_pools,
                 &cache,
                 &router,
+                &on_resolve,
             )
             .await
             {
@@ -224,6 +240,7 @@ async fn run_tcp_listener(
     upstream_pools: Arc<HashMap<String, Arc<DnsUpstreamPool>>>,
     cache: Arc<RwLock<DnsCache>>,
     router: Arc<DnsRouter>,
+    on_resolve: Option<DnsResolveCallback>,
 ) {
     loop {
         let result = listener.accept().await;
@@ -238,6 +255,7 @@ async fn run_tcp_listener(
         let upstream_pools = upstream_pools.clone();
         let cache = cache.clone();
         let router = router.clone();
+        let on_resolve = on_resolve.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -263,7 +281,7 @@ async fn run_tcp_listener(
             }
 
             if let Ok((response, _upstream_addr)) =
-                handle_dns_internal(&request, &config, &upstream_pools, &cache, &router).await
+                handle_dns_internal(&request, &config, &upstream_pools, &cache, &router, &on_resolve).await
             {
                 // Write response with length prefix
                 let resp_len = (response.len() as u16).to_be_bytes();
@@ -295,9 +313,10 @@ async fn handle_dns_query(
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
     cache: &Arc<RwLock<DnsCache>>,
     router: &Arc<DnsRouter>,
+    on_resolve: &Option<DnsResolveCallback>,
 ) -> anyhow::Result<()> {
     let (response, upstream_addr) =
-        handle_dns_internal(request, config, upstream_pools, cache, router).await?;
+        handle_dns_internal(request, config, upstream_pools, cache, router, on_resolve).await?;
 
     // Determine the bind address for the response socket:
     // - Upstream query result: bind to the upstream DNS server address with IP_TRANSPARENT
@@ -335,6 +354,7 @@ async fn handle_dns_internal(
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
     cache: &Arc<RwLock<DnsCache>>,
     #[allow(unused)] router: &Arc<DnsRouter>,
+    on_resolve: &Option<DnsResolveCallback>,
 ) -> anyhow::Result<(Vec<u8>, Option<SocketAddr>)> {
     // Parse query name and type
     let (qname, qtype) = parse_dns_question(request);
@@ -387,6 +407,9 @@ async fn handle_dns_internal(
             let ttl = extract_min_ttl(&response);
             let mut cache_guard = cache.write().await;
             cache_guard.insert(cache_key, response.clone(), ttl);
+            // Feed accepted resolutions into the domain routing tracker so the
+            // eBPF domain_routing_map is populated for domain-based routing.
+            notify_resolve(on_resolve, &qname, &response);
             Ok((response, Some(upstream_addr)))
         }
         DnsResponseAction::Reject => Ok((build_empty_response(request), Some(upstream_addr))),
@@ -398,16 +421,93 @@ async fn handle_dns_internal(
                 let ttl = extract_min_ttl(&response);
                 let mut cache_guard = cache.write().await;
                 cache_guard.insert(cache_key, response.clone(), ttl);
+                notify_resolve(on_resolve, &qname, &response);
                 Ok((response, Some(new_upstream_addr)))
             } else {
                 // Fallback: accept original response
                 let ttl = extract_min_ttl(&response);
                 let mut cache_guard = cache.write().await;
                 cache_guard.insert(cache_key, response.clone(), ttl);
+                notify_resolve(on_resolve, &qname, &response);
                 Ok((response, Some(upstream_addr)))
             }
         }
     }
+}
+
+/// Notify the domain routing callback for every A/AAAA record in an accepted response.
+fn notify_resolve(
+    on_resolve: &Option<DnsResolveCallback>,
+    qname: &str,
+    response: &[u8],
+) {
+    let Some(cb) = on_resolve.as_ref() else {
+        return;
+    };
+    // Extract per-record TTLs alongside the IPs so the domain_routing_map entry
+    // expires in sync with the DNS cache.
+    for (ip, ttl) in extract_answer_addrs(response) {
+        cb(qname, ip, ttl);
+    }
+}
+
+/// Extract A/AAAA records from a DNS response: (IP, TTL) pairs.
+fn extract_answer_addrs(response: &[u8]) -> Vec<(IpAddr, u32)> {
+    use crate::dns::upstream::skip_question_section;
+
+    if response.len() < 12 {
+        return Vec::new();
+    }
+    let ancount = u16::from_be_bytes([response[6], response[7]]);
+    if ancount == 0 {
+        return Vec::new();
+    }
+
+    let mut pos = skip_question_section(response, 12);
+    let mut out = Vec::new();
+
+    for _ in 0..ancount {
+        if pos >= response.len() {
+            break;
+        }
+        pos = crate::dns::upstream::skip_name(response, pos);
+        if pos + 10 > response.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
+        let ttl = u32::from_be_bytes([
+            response[pos + 4],
+            response[pos + 5],
+            response[pos + 6],
+            response[pos + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        let rdata_start = pos + 10;
+        let rdata_end = rdata_start + rdlength;
+        if rdata_end > response.len() {
+            break;
+        }
+        let rdata = &response[rdata_start..rdata_end];
+        match rtype {
+            1 if rdata.len() == 4 => {
+                out.push((
+                    IpAddr::V4(std::net::Ipv4Addr::new(
+                        rdata[0], rdata[1], rdata[2], rdata[3],
+                    )),
+                    ttl,
+                ));
+            }
+            28 if rdata.len() == 16 => {
+                let mut oct = [0u8; 16];
+                oct.copy_from_slice(rdata);
+                out.push((IpAddr::V6(std::net::Ipv6Addr::from(oct)), ttl));
+            }
+            _ => {}
+        }
+        pos = rdata_end;
+    }
+
+    out
 }
 
 /// Check DNS response routing
@@ -774,6 +874,18 @@ async fn create_marked_udp_socket_for_dns(orig_dst: SocketAddr, mark: u32) -> Op
             fd,
             libc::SOL_SOCKET,
             libc::SO_REUSEADDR,
+            &one as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
+        // SO_REUSEPORT allows concurrent responses to the same upstream
+        // (identical bind address:port) without EADDRINUSE. Without it, two
+        // concurrent queries to the same upstream would make the second bind
+        // fail and drop its response.
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
             &one as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );

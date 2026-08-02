@@ -526,10 +526,17 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct InterfaceConfig {
-    /// WAN interface names (space-separated in daefile)
+    /// WAN interface names (space-separated in daefile).
+    ///
+    /// Each entry may be:
+    ///   - `auto` — follow the interface(s) carrying the default route,
+    ///   - `regex('<pattern>')` — a regular expression,
+    ///   - otherwise a glob pattern (`*` / `?`), e.g. `eth*`, `enp?*`.
     #[serde(default)]
     pub wan_interface: Vec<String>,
-    /// LAN interface names (space-separated in daefile)
+    /// LAN interface names (space-separated in daefile).
+    ///
+    /// Same pattern syntax as `wan_interface` (glob / `regex(...)`).
     #[serde(default)]
     pub lan_interface: Vec<String>,
     /// Bind interface (auto-detect if set to "auto")

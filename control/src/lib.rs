@@ -2242,7 +2242,7 @@ impl Drop for ControlPlane {
         }
         // Each sub-module's Drop implementation handles its own cleanup.
         // Also clean up any leftover temp JSON config files (best-effort).
-        cleanup_temp_json(3600);
+        cleanup_temp_json(0);
     }
 }
 
@@ -2300,7 +2300,8 @@ pub fn write_temp_json(config: &config::DaefileConfig) -> Result<std::path::Path
     Ok(path)
 }
 
-/// Clean up temp JSON files older than the specified retention period
+/// Clean up temp JSON files. If `max_age_secs` is 0, delete all JSON files.
+/// Otherwise, delete files older than the specified retention period.
 pub fn cleanup_temp_json(max_age_secs: u64) {
     let dir = std::path::Path::new(TEMP_JSON_DIR);
     if !dir.exists() {
@@ -2311,14 +2312,23 @@ pub fn cleanup_temp_json(max_age_secs: u64) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(metadata) = std::fs::metadata(&path) {
+                let should_delete = if max_age_secs == 0 {
+                    true
+                } else if let Ok(metadata) = std::fs::metadata(&path) {
                     if let Ok(modified) = metadata.modified() {
                         if let Ok(duration) = now.duration_since(modified) {
-                            if duration.as_secs() > max_age_secs {
-                                let _ = std::fs::remove_file(&path);
-                            }
+                            duration.as_secs() > max_age_secs
+                        } else {
+                            false
                         }
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+                if should_delete {
+                    let _ = std::fs::remove_file(&path);
                 }
             }
         }

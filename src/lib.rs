@@ -288,10 +288,10 @@ pub async fn run(
     tracing::info!("Control plane stopped");
 
     // ── Phase 12: Cleanup temp JSON files ──
-    tracing::info!("Phase 12/12: Cleaning up old temp JSON files...");
+    tracing::info!("Phase 12/12: Cleaning up all temp JSON files...");
     {
         let cleanup_start = std::time::Instant::now();
-        control::cleanup_temp_json(3600); // Clean files older than 1 hour
+        control::cleanup_temp_json(0); // Clean all temp JSON files
         debug!(
             elapsed_ms = cleanup_start.elapsed().as_millis(),
             "Temp JSON cleanup completed"

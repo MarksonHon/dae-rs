@@ -44,6 +44,7 @@ outbounds         # proxy nodes and groups
 routing           # which traffic goes direct / proxy / block
 api               # optional REST API
 dns               # DNS hijacking / routing / cache
+rule_set          # rule sets (GeoIP/GeoSite/text lists) download & scheduling
 ```
 
 Example skeleton:
@@ -65,6 +66,8 @@ routing { ... }
 api { ... }
 
 dns { ... }
+
+rule_set { ... }
 ```
 
 ## 4. Section Details
@@ -231,12 +234,12 @@ Supported match functions (implemented in `control/src/routing/matcher.rs`):
 |----------|---------|
 | `dport(80,443)` / `port(80-90)` | Destination port / port range. |
 | `sport(...)` / `source_port(...)` | Source port / port range. |
-| `dip(10.0.0.0/8)` / `ip(...)` | Destination CIDR; `geoip:private` expands to RFC1918 + loopback. |
-| `sip(...)` / `source_ip(...)` | Source CIDR. |
+| `dip(10.0.0.0/8)` / `ip(...)` / `target_ip(...)` | Destination CIDR; `geoip:<code>` / `set:<name>` reference rule sets. |
+| `sip(...)` / `source_ip(...)` | Source CIDR; `geoip:<code>` / `set:<name>` reference rule sets. |
 | `mac(xx:xx:xx:xx:xx:xx)` | Source MAC. |
 | `l4proto(tcp,udp)` | L4 protocol. |
 | `ipversion(4,6)` | IP version. |
-| `domain(suffix:example.com, keyword:..., full:..., regex:...)` | Domain rules; bare values default to suffix match. |
+| `domain(suffix:example.com, keyword:..., full:..., regex:...)` / `target_domain(...)` | Domain rules; `geosite:<code>` / `set:<name>` reference rule sets, other bare values default to suffix match. |
 | `process_name(...)` / `pname(...)` | Process comm name (16 bytes max). |
 | `dscp(...)` | DSCP value. |
 | `qtype(...)` | DNS query type (placeholder for full matching). |
@@ -244,6 +247,24 @@ Supported match functions (implemented in `control/src/routing/matcher.rs`):
 
 Expressions may be combined with `&&` (e.g. `dport(443) && l4proto(tcp)`), and
 functions can be negated with `!` (e.g. `!domain(suffix:google.com)`).
+
+#### Rule-set reference syntax
+
+Inside `routing` you can reference rule sets declared in the `rule_set` section
+(§4.8; full design in
+[`docs/design/rule_set_en.md`](../design/rule_set_en.md)):
+
+| Syntax | Meaning |
+|--------|---------|
+| `source_ip(set:chinaip)` | Source IP matches the `ip_list` entry `chinaip`. |
+| `source_ip(geoip:cn)` / `target_ip(geoip:cn)` | Source/destination IP matches GeoIP dat `CN` (`geoip:private` matches private networks, data-driven). |
+| `target_ip(set:chinaip)` | Destination IP matches the text IP list `chinaip`. |
+| `target_domain(geosite:cn)` | Destination domain matches GeoSite dat category `cn`. |
+| `target_domain(set:chinadomain)` | Destination domain matches the `domain_list` entry `chinadomain`. |
+
+`set:` must reference a defined entry in `rule_set` (a `geoip`/`geosite`
+reference is usable once a matching type entry is configured); unknown
+references fail validation (E2102).
 
 ### 4.6 `api`
 
@@ -267,12 +288,70 @@ See [`docs/design/dns_en.md`](../design/dns_en.md) for the full design. Summary:
 | `starting_dns` | Bootstrap resolver used before the proxy is available. Contains `ip_version_prefer` (`4` or `6`) and a `upstream` list (must be IP literals to avoid a chicken-and-egg problem). |
 | `bind` | Local DNS listener address (default `127.0.0.1:5353`). |
 | `cache` | Cache settings: `enabled`, `max_size`, `max_ttl`, `min_ttl`, `optimistic_cache`, `optimistic_cache_ttl`. |
-| `groups` | DNS groups, each with `proxy` (`direct` or `proxy(<group>)`), `upstream` entries (label + URL like `udp://1.1.1.1:53`, `tcp+udp://dns.google:53`), `request_routing` and `response_routing`. |
-| `routing` | Top-level DNS routing: `qname(geosite:cn) -> china_dns`, etc., plus `fallback`. |
+| `groups` | DNS groups, each with `proxy` (`direct` or `proxy(<group>)`), `upstream` entries (label + URL like `udp://1.1.1.1:53`, `tcp+udp://dns.google:53`), `request_routing` and `response_routing`. Response routing supports `ip(geoip:<code>)` / `ip(set:<name>)` / `qname(geosite:<code>)` / `qname(set:<name>)` conditions combined with `&&` and `!`. |
+| `routing` | Top-level DNS query routing: `qname(geosite:cn) -> china_dns`, `qname(set:chinadomain) -> china_dns`, etc., plus `fallback`. |
 
 URL schemes parsed: `udp://`, `tcp://`, `tcp+udp://`, `https://` / `doh://`,
 `tls://` / `dot://`. DoH and DoT are parsed but **not yet functional**; using
 them returns an error.
+
+### 4.8 `rule_set`
+
+The `rule_set` section declares GeoIP / GeoSite (v2ray `.dat`) and text
+domain / IP list data sources referenced by `routing` / `dns`, together with
+download and scheduled-update settings. Full design and syntax in
+[`docs/design/rule_set_en.md`](../design/rule_set_en.md).
+
+```
+rule_set {
+  geoip_main {
+    type: geoip
+    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
+    name: geoip_main
+    update: time: 21:47
+    update_on_start: true
+  }
+
+  geosite_main {
+    type: geosite
+    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
+    name: geosite_main
+    update: period: 3h2m
+  }
+
+  chinadomain {
+    type: domain_list
+    url: 'https://example.com/rules/chinadomain.txt'   # placeholder URL, replaceable
+    name: chinadomain
+    update: time: 04:30
+  }
+
+  chinaip {
+    type: ip_list
+    url: 'https://example.com/rules/chinaip.txt'       # placeholder URL, replaceable
+    name: chinaip
+    update: period: 1d
+    proxy: proxy_primary
+  }
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `type` | yes | `geoip` (dat), `geosite` (dat), `domain_list` (text domains), `ip_list` (text IPs). |
+| `url` | yes | Download URL (`http://` / `https://`); may carry a `#sha256=<64-hex>` fragment for mandatory verification. |
+| `name` | no (default = block name) | **Unique** label/name (`[a-zA-Z0-9_-]`, ≤63), used for `set:<name>` references and file naming. |
+| `update` | yes | Schedule expression; `time: HH:MM` (daily at a fixed time) and `period: 3h2m` (periodic; `d`/`h`/`m` units, seconds forbidden) are **mutually exclusive**. |
+| `update_on_start` | no | Force one unconditional update at startup (default `false`). |
+| `proxy` | no | Download proxy group; defaults to the first proxy group. |
+
+- **Uniqueness**: every entry's `name` (including the block-name default) is
+  globally unique; a duplicate raises E2101.
+- Data files live in `/var/dae-rs/` (`<name>.dat` for dat, `<name>.txt` for
+  text). dae-rs downloads, verifies, atomically replaces and recovers them;
+  missing data is downloaded through the first proxy group (or the entry's
+  explicit `proxy`).
+- Reference syntax: see §4.5 "Rule-set reference syntax" and §4.7 (DNS side).
 
 ## 5. Configuration Validation
 
@@ -291,6 +370,7 @@ stable error codes:
 | `E1701` – `E1704` | Select/auto group misconfiguration. |
 | `E1901` – `E1903` | API listen format / token / TLS issues. |
 | `E2001` – `E2007` | DNS group / routing / starting_dns issues. |
+| `E2101` – `E2106` | Rule sets: duplicate name / unknown reference / missing data / invalid schedule (incl. seconds) / invalid URL / capacity exceeded. |
 
 Warnings (`W1801`, `W1901`, `W1902`, `W2001`, `W2002`) are emitted for
 non-fatal issues such as missing policies or missing DNS response routing.
@@ -311,6 +391,8 @@ non-fatal issues such as missing policies or missing DNS response routing.
   (the first node in the config); outbound groups select nodes and feed the
   connectivity map, but node-to-node switching is a work in progress.
 - DNS DoH / DoT transports are parsed but not yet implemented.
-- GeoIP/GeoSite data is not bundled; `geoip:private` is expanded in
-  userspace, while `geosite:` sets used in DNS routing are matched by simple
-  suffix comparison in the DNS router.
+- GeoIP/GeoSite data is not bundled with the binary; it is downloaded via the
+  URLs configured in `rule_set` into `/var/dae-rs/` and parsed by dae-rs.
+  `geoip:<code>` / `geosite:<code>` / `set:<name>` are wired into both the data
+  path and DNS routing. A missing dataset referenced at compile time raises
+  E2103.

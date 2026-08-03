@@ -13,6 +13,7 @@ use crate::dns::handler::{DnsListener, DnsResolveCallback};
 use crate::dns::upstream::DnsUpstreamPool;
 use crate::dns::cache::DnsCache;
 use crate::dns::router::DnsRouter;
+use crate::ruleset::cache::RuleSetCache;
 
 /// DNS Manager — main orchestrator for DNS operations
 pub struct DnsManager {
@@ -31,14 +32,22 @@ pub struct DnsManager {
     /// Callback invoked on each accepted DNS resolution (domain, ip, ttl).
     /// Used to feed the domain_routing_map eBPF map for domain-based routing.
     on_resolve: Option<DnsResolveCallback>,
+    /// Ruleset in-memory cache (for DNS routing / response Routing evaluation).
+    rule_set_cache: RuleSetCache,
 }
 
 impl DnsManager {
-    pub fn new(config: DnsConfig) -> Self {
-        let router = DnsRouter::new(&config);
+    /// Construct DNS manager.
+    ///
+    /// * `config` — DNS configuration;
+    /// * `rule_set_cache` — ruleset in-memory cache.
+    ///
+    /// Returns error when DNS Routing compilation fails (unknown/invalid match expression).
+    pub fn new(config: DnsConfig, rule_set_cache: RuleSetCache) -> anyhow::Result<Self> {
+        let router = DnsRouter::new(&config, rule_set_cache.clone())?;
         let cache = Arc::new(std::sync::RwLock::new(DnsCache::new(&config.cache)));
 
-        Self {
+        Ok(Self {
             config,
             upstream_pools: HashMap::new(),
             cache,
@@ -46,7 +55,8 @@ impl DnsManager {
             listener: None,
             running: false,
             on_resolve: None,
-        }
+            rule_set_cache,
+        })
     }
 
     /// Set the callback invoked on each accepted DNS resolution.
@@ -136,6 +146,7 @@ impl DnsManager {
             cache,
             router,
             self.on_resolve.clone(),
+            self.rule_set_cache.clone(),
         );
         listener.start().await?;
         self.listener = Some(listener);

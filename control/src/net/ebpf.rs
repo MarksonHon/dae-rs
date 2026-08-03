@@ -53,7 +53,7 @@ pub const ROUTING_EPOCH_SLOT_NUM: u32 = 2;
 /// Encoded value for "unknown" epoch slot (not slot 0 or 1).
 pub const ROUTING_EPOCH_SLOT_UNKNOWN: u8 = 0;
 
-/// eBPF 文件系统 pinning 路径
+/// eBPF filesystem pinning path
 pub const BPFFS_PATH: &str = "/sys/fs/bpf/dae";
 
 // ---- Map capacity constants (must match tproxy.c) ----
@@ -112,8 +112,8 @@ impl Default for Daeparam {
             use_redirect_peer: 0,
             has_bpf_get_current_task: 0,
             datapath_generation: 0,
-            // 原版 dae 使用 0x100 作为内部 socket 标记
-            // 用于 bpf_sock_is_dae_socket() 和 pid_is_control_plane() 中的 mark 检查
+            // original dae uses 0x100 as internal socket mark
+            // used for mark check in bpf_sock_is_dae_socket() and pid_is_control_plane()
             dae_socket_mark: shared::DAE_SOCKET_MARK,
         }
     }
@@ -435,9 +435,9 @@ pub struct Daeevent {
 // Helpers
 // ============================================================================
 
-/// 确保 bpffs 已挂载到 /sys/fs/bpf。
-/// 如果未挂载则尝试挂载。
-/// bpffs mount 相关的静态 CString（避免重复创建）
+/// Ensure bpffs is mounted at /sys/fs/bpf.
+/// If not mounted, attempt to mount.
+/// Static CString related to bpffs mount (avoid repeated creation)
 static BPFFS_SOURCE: LazyLock<CString> = LazyLock::new(|| CString::new("bpffs").unwrap());
 static BPFFS_TARGET: LazyLock<CString> =
     LazyLock::new(|| CString::new("/sys/fs/bpf").unwrap());
@@ -448,7 +448,7 @@ fn ensure_bpffs_mounted() -> std::io::Result<()> {
     if !bpffs_path.exists() {
         std::fs::create_dir_all(bpffs_path)?;
     }
-    // 检查是否已挂载（精确匹配挂载点，避免误匹配 /sys/fs/bpf_extra 等路径）
+    // Check if mounted (exact mount point match, avoid false match on /sys/fs/bpf_extra etc.)
     let mounts = std::fs::read_to_string("/proc/mounts")?;
     let already_mounted = mounts.lines().any(|line| {
         line.split_whitespace().nth(1) == Some("/sys/fs/bpf")
@@ -456,7 +456,7 @@ fn ensure_bpffs_mounted() -> std::io::Result<()> {
     if already_mounted {
         return Ok(());
     }
-    // 挂载 bpffs（使用缓存的 CString）
+    // Mount bpffs (using cached CString)
     let ret = unsafe {
         libc::mount(
             BPFFS_SOURCE.as_ptr(),
@@ -599,7 +599,7 @@ fn kernel_version() -> Option<(u32, u32)> {
         return None;
     }
     let major: u32 = parts[0].parse().ok()?;
-    // 只取数字部分解析 minor 版本（避免 "8-generic" 等后缀干扰）
+    // Parse only the numeric part of minor version (avoid suffix like "8-generic" interference)
     let minor_str: String = parts[1].chars().take_while(|c| c.is_ascii_digit()).collect();
     let minor: u32 = minor_str.parse().ok()?;
     Some((major, minor))
@@ -674,14 +674,14 @@ pub struct EbpfManager {
     iface: String,
     bpf_path: String,
     param: Option<Daeparam>,
-    /// eBPF map pinning 路径，如果设置则在 load 后自动 pin maps
+    /// eBPF map pinning path; if set, maps are automatically pinned after load
     pin_path: Option<String>,
-    /// Flip 位，用于 TC handle 翻转（热重载时切换 filter）
+    /// Flip bit, used for TC handle flip (switching filter on hot reload)
     flip: u32,
-    /// conn_state_map 最大条目数（从 tproxy.c MAX_CONN_STATE_NUM 同步）
+    /// conn_state_map max entries (synced from tproxy.c MAX_CONN_STATE_NUM)
     conn_state_map_max_entries: u32,
-    /// 跟踪已进行 clsact qdisc 清理的接口，避免重复删除
-    /// （重复删除会销毁已挂载的 egress 程序）
+    /// Track interfaces that have had clsact qdisc cleaned up, avoid duplicate removal
+    /// (duplicate removal destroys the mounted egress program)
     clsact_cleaned: HashSet<String>,
 }
 
@@ -723,12 +723,12 @@ impl EbpfManager {
         }
     }
 
-    /// 获取当前 flip 位
+    /// Get the current flip bit
     pub fn flip(&self) -> u32 {
         self.flip
     }
 
-    /// 设置 flip 位（热重载时用于 TC handle 翻转）
+    /// Set the flip bit (used for TC handle flip on hot reload)
     pub fn set_flip(&mut self, flip: u32) {
         self.flip = flip;
         info!("Flip set to {}", flip);
@@ -738,25 +738,25 @@ impl EbpfManager {
         self.param = Some(*param);
     }
 
-    /// 设置 eBPF map pinning 路径。
-    /// 设置后，调用 load() 或 load_from_bytes() 时会自动将 maps pin 到该路径。
+    /// Set the eBPF map pinning path.
+    /// After setting, calling load() or load_from_bytes() will automatically pin maps to this path.
     pub fn set_pin_path(&mut self, path: String) {
         self.pin_path = Some(path);
     }
 
-    /// 设置 conn_state_map 的最大条目数。
-    /// 必须在 load() 前调用才生效。
+    /// Set the maximum number of entries for conn_state_map.
+    /// Must be called before load() to take effect.
     pub fn set_conn_state_max_entries(&mut self, n: u32) {
         self.conn_state_map_max_entries = n;
         info!("conn_state_map max_entries set to {}", n);
     }
 
-    /// 在 OpenObject 阶段调整 eBPF maps 的参数（load 前）。
-    /// 包括：
-    /// - fast_sock: 设置 max_entries=1 禁用 sockhash 路径
-    /// - conn_state_map: 设置可配置的 max_entries
+    /// Adjust eBPF map parameters during the OpenObject phase (before load).
+    /// Includes:
+    /// - fast_sock: set max_entries=1 to disable sockhash path
+    /// - conn_state_map: set configurable max_entries
     fn adjust_maps_pre_load(&self, open_obj: &mut libbpf_rs::OpenObject) {
-        // fast_sock: 设置 max_entries=1 以禁用 sockhash 路径
+        // fast_sock: set max_entries=1 to disable sockhash path
         if let Some(mut map) = open_obj
             .maps_mut()
             .find(|m| m.name().to_str().unwrap_or("") == "fast_sock")
@@ -770,7 +770,7 @@ impl EbpfManager {
             debug!("fast_sock map not found in eBPF object (may be removed)");
         }
 
-        // conn_state_map: 使用可配置的 max_entries
+        // conn_state_map: use configurable max_entries
         if let Some(mut map) = open_obj
             .maps_mut()
             .find(|m| m.name().to_str().unwrap_or("") == "conn_state_map")
@@ -842,8 +842,8 @@ impl EbpfManager {
             "Loading eBPF from byte slice via libbpf-rs"
         );
 
-        // 清理 pin 目录中的旧 pin：避免 libbpf 在 load 时尝试复用残留的
-        // 内部 map pin（如 <hash>.rodata）而报 -EPERM / "error reusing pinned map"。
+        // Clean old pins in pin directory: avoid libbpf trying to reuse residual
+        // internal map pin (e.g. <hash>.rodata) causing -EPERM / "error reusing pinned map".
         if let Some(ref bpffs_path) = self.pin_path.clone() {
             let dir = std::path::Path::new(bpffs_path);
             if dir.exists() {
@@ -870,14 +870,14 @@ impl EbpfManager {
         // after bpf_object__load(), so post-load writes get EPERM.
         self.update_param_pre_load(&mut open_obj)?;
 
-        // C 侧部分 map 声明了 LIBBPF_PIN_BY_NAME（如 conn_state_map），
-        // 在 load 前统一覆盖 pin 路径到目标目录，避免 load 后
-        // bpf_map__pin() 报 "already has pin path ... different from ..."。
+        // Some maps on the C side declare LIBBPF_PIN_BY_NAME (e.g. conn_state_map),
+        // uniformly override pin path to target directory before load, avoiding after-load
+        // bpf_map__pin() reporting "already has pin path ... different from ...".
         if let Some(ref bpffs_path) = self.pin_path.clone() {
             let dir = std::path::Path::new(bpffs_path);
             for mut map in open_obj.maps_mut() {
                 let name = map.name().to_string_lossy().to_string();
-                // 跳过内部 map（<hash>.rodata/.bss/.data/.kconfig 等，均含 '.'）
+                // Skip internal maps (<hash>.rodata/.bss/.data/.kconfig etc., all contain '.')
                 if name.is_empty() || name.contains('.') {
                     continue;
                 }
@@ -1033,30 +1033,30 @@ impl EbpfManager {
     // eBPF Map Pinning
     // ============================================================================
 
-    /// 将所有 eBPF maps pin 到 bpffs 指定路径。
-    /// 每个 map 在 bpffs 路径下以其名称创建文件。
+    /// Pin all eBPF maps to the specified bpffs path.
+    /// Each map creates a file under the bpffs path with its name.
     ///
-    /// 自动跳过内部 map（如 .rodata、.bss、.data 等）。
+    /// Automatically skip internal maps (e.g. .rodata, .bss, .data, etc.).
     pub fn pin_maps(&mut self, bpffs_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        // 确保 bpffs 已挂载
+        // Ensure bpffs is mounted
         ensure_bpffs_mounted()?;
 
-        // 创建 dae 专属目录
+        // Create dae-specific directory
         let dir = std::path::Path::new(bpffs_path);
         if !dir.exists() {
             std::fs::create_dir_all(dir)?;
         }
 
-        // 获取 eBPF 对象（可变引用，因为 Map::pin() 需要 &mut self）
+        // Get eBPF object (mutable reference, because Map::pin() requires &mut self)
         let obj = self.obj.as_mut().ok_or("eBPF object not loaded")?;
 
-        // 收集所有需要 pin 的 map 名称（先收集，再清理旧 pin，最后 pin）
-        // 这样避免在遍历 maps_mut() 时同时做清理操作。
+        // Collect all map names that need pinning (collect first, clean old pins, then pin)
+        // This avoids performing cleanup while iterating maps_mut().
         let map_names: Vec<String> = obj
             .maps()
             .filter_map(|m| {
                 let name = m.name().to_string_lossy().to_string();
-                // 跳过内部 map（<hash>.rodata/.bss/.data/.kconfig 等，均含 '.'）
+                // Skip internal maps (<hash>.rodata/.bss/.data/.kconfig etc., all contain '.')
                 if name.is_empty() || name.contains('.') {
                     None
                 } else {
@@ -1065,9 +1065,9 @@ impl EbpfManager {
             })
             .collect();
 
-        // 清理旧 pin：移除 /sys/fs/bpf/ 根目录下的旧 dae map 文件
-        // 上一次 dae-rs 运行可能在 /sys/fs/bpf/<map_name> 留下了旧 pin，
-        // 而 libbpf 要求 map 只能 pin 到一个路径，否则 pin 会失败。
+        // Clean old pins: remove old dae map files under /sys/fs/bpf/ root
+        // A previous dae-rs run may have left old pins at /sys/fs/bpf/<map_name>,
+        // and libbpf requires each map to be pinned to only one path, otherwise pinning fails.
         let bpffs_root = std::path::Path::new("/sys/fs/bpf");
         if bpffs_root.exists() {
             for name in &map_names {
@@ -1079,15 +1079,15 @@ impl EbpfManager {
             }
         }
 
-        // 遍历所有 maps 并 pin
+        // Iterate all maps and pin
         for mut map in obj.maps_mut() {
             let map_name = map.name().to_string_lossy().to_string();
-            // 跳过内部 map（<hash>.rodata/.bss/.data 等，均含 '.'）
+            // Skip internal maps (<hash>.rodata/.bss/.data etc., all contain '.')
             if map_name.is_empty() || map_name.contains('.') {
                 continue;
             }
             let pin_path = dir.join(&map_name);
-            // 如果已存在，先移除再重新 pin
+            // If exists, remove first then re-pin
             if pin_path.exists() {
                 std::fs::remove_file(&pin_path)?;
             }
@@ -1098,14 +1098,14 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// 从 bpffs 卸载所有 dae 的 pinned maps。
+    /// Unpin all dae pinned maps from bpffs.
     pub fn unpin_maps(&self, bpffs_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let dir = std::path::Path::new(bpffs_path);
         if !dir.exists() {
             return Ok(());
         }
 
-        // 遍历目录删除所有 pinned map 文件
+        // Iterate directory to delete all pinned map files
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -1118,39 +1118,39 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// 检查 bpffs 中是否存在 dae 的 pinned maps。
+    /// Check if dae pinned maps exist in bpffs.
     pub fn pinned_maps_exist(bpffs_path: &str) -> bool {
         let dir = std::path::Path::new(bpffs_path);
         if !dir.exists() {
             return false;
         }
-        // 检查是否有至少一个 map 文件
+        // Check if there is at least one map file
         dir.read_dir()
             .map(|mut entries| entries.any(|e| e.is_ok()))
             .unwrap_or(false)
     }
 
     // ========================================================================
-    // 通用 TC attach — 将指定程序列表挂载到目标接口
+    // Common TC attach — mount specified program list to target interface
     // ========================================================================
 
-    /// 从程序名推导 TC attach point（ingress/egress）
+    /// Derive TC attach point (ingress/egress) from program name
     fn prog_attach_point(prog_name: &str) -> u32 {
         if prog_name.contains("egress") {
             TC_EGRESS
         } else {
-            // 默认 ingress（包含 "ingress" 或不确定时）
+            // Default ingress (if name contains "ingress" or uncertain)
             TC_INGRESS
         }
     }
 
-    /// 通用 TC attach：将指定的程序列表挂载到目标接口
+    /// Common TC attach: mount specified program list to target interface
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// * `ifname` — 目标接口名称
-    /// * `progs` — 程序列表，每项为 (程序名, 优先级)
-    /// * `handle` — 可选 handle（调用方已将 flip 位合并到 handle 中）
+    /// * `ifname` — target interface name
+    /// * `progs` — program list, each item is (program name, priority)
+    /// * `handle` — optional handle (caller has already merged flip bit into handle)
     pub fn attach_tc(
         &mut self,
         ifname: &str,
@@ -1184,17 +1184,17 @@ impl EbpfManager {
                 hook.handle(h);
             }
 
-            // 对所有接口（包括 WAN、LAN、netkit 设备），先删除已存在的 clsact qdisc，
-            // 再重新创建。原因：
-            // 1. netkit 设备上的 clsact 如果已存在，hook.create() 是 no-op，
-            //    导致之前设置的 priority 不生效。
-            // 2. WAN/LAN 接口上可能有上一次 dae-rs 运行遗留的旧 TC filter，
-            //    "Exclusivity flag on, cannot modify" 错误会导致新 filter 无法安装，
-            //    使得 egress_entered=0，整个代理管道失效。
+            // For all interfaces (including WAN, LAN, netkit devices), first remove existing clsact qdisc,
+            // then recreate. Reason:
+            // 1. On netkit devices, if clsact already exists, hook.create() is a no-op,
+            //    causing previously set priority to not take effect.
+            // 2. WAN/LAN interfaces may have old TC filters left from a previous dae-rs run,
+            //    "Exclusivity flag on, cannot modify" error prevents new filter from being installed,
+            //    causing egress_entered=0 and the entire proxy pipeline to fail.
             //
-            // 注意：同一接口可能被 attach_tc() 调用多次（如 attach_wan 先挂载
-            // egress 再挂载 ingress），重复删除 clsact 会销毁已挂载的程序。
-            // 通过 clsact_cleaned HashSet 确保每个接口只删除一次。
+            // Note: the same interface may be called by attach_tc() multiple times (e.g. attach_wan first mounts
+            // egress then ingress), duplicate clsact removal destroys mounted programs.
+            // Ensure each interface is only cleaned once via clsact_cleaned HashSet.
             if !self.clsact_cleaned.contains(ifname) {
                 let output = Command::new("tc")
                     .args(["qdisc", "del", "dev", ifname, "clsact"])
@@ -1271,15 +1271,15 @@ impl EbpfManager {
     }
 
     // ========================================================================
-    // 按接口分组 TC attach
+    // Group TC attach by interface
     // ========================================================================
 
-    /// 根据接口链路头长度选择 attach L2 或 L3 版本的 eBPF 程序
+    /// Select L2 or L3 version of eBPF program to attach based on interface link header length
     ///
-    /// 读取 `/sys/class/net/<ifname>/type` 判断接口类型。
-    /// 与原始 dae Go 行为对齐：dae 使用 netlink EncapType 判断，
-    /// 如果是 "none"/"ipip"/"ppp"/"tun" 则为 L3，否则为 L2。
-    /// 这里通过 ARPHRD 类型做等价映射。
+    /// Read `/sys/class/net/<ifname>/type` to determine interface type.
+    /// Aligned with original dae Go behavior: dae uses netlink EncapType to determine,
+    /// if "none"/"ipip"/"ppp"/"tun" then L3, otherwise L2.
+    /// Here ARPHRD type is used for equivalent mapping.
     fn get_link_header_len(ifname: &str) -> Result<u32> {
         let path = format!("/sys/class/net/{}/type", ifname);
         let content = std::fs::read_to_string(&path)
@@ -1289,15 +1289,15 @@ impl EbpfManager {
             .parse()
             .with_context(|| format!("Invalid interface type value for {}", ifname))?;
 
-        // 与 dae Go 的 EncapType 判断对齐：
+        // Aligned with dae Go's EncapType determination:
         // dae Go: EncapType in ["none", "ipip", "ppp", "tun"] → L3 (0), else → L2 (14)
-        // ARPHRD 常量映射:
+        // ARPHRD constant mapping:
         //   ARPHRD_PPP = 512 (0x200)       → "ppp"
         //   ARPHRD_TUNNEL = 768 (0x300)    → "tun"/"ipip"
         //   ARPHRD_TUNNEL6 = 769 (0x301)   → "tun"
         //   ARPHRD_SIT = 776 (0x308)       → "ipip"
         //   ARPHRD_IPIP = 778 (0x30A)      → "ipip"
-        //   ARPHRD_NONE = 65534            → "none" (tun 设备)
+        //   ARPHRD_NONE = 65534            → "none" (tun device)
         match if_type {
             512 |    // ARPHRD_PPP
             768 |    // ARPHRD_TUNNEL
@@ -1310,11 +1310,11 @@ impl EbpfManager {
         }
     }
 
-    /// WAN 接口：根据链路头长度选择 L2 或 L3 版本
+    /// WAN interface: select L2 or L3 version based on link header length
     ///
-    /// 与原始 dae Go 行为对齐：
-    /// - Egress 方向优先级 2，handle sub = 4
-    /// - Ingress 方向优先级 1，handle sub = 2
+    /// Aligned with original dae Go behavior:
+    /// - Egress direction priority 2, handle sub = 4
+    /// - Ingress direction priority 1, handle sub = 2
     pub fn attach_wan(&mut self, ifname: &str) -> Result<()> {
         let link_h_len = Self::get_link_header_len(ifname)?;
         let handle_major = 0x2023u32;
@@ -1324,7 +1324,7 @@ impl EbpfManager {
             ifname, link_h_len, flip
         );
 
-        // Egress (优先级 2, handle sub=4)
+        // Egress (priority 2, handle sub=4)
         self.attach_tc(
             ifname,
             &[if link_h_len > 0 {
@@ -1335,7 +1335,7 @@ impl EbpfManager {
             Some((handle_major << 16) | ((4 & !1u32) | flip)),
         )?;
 
-        // Ingress (优先级 1, handle sub=2)
+        // Ingress (priority 1, handle sub=2)
         self.attach_tc(
             ifname,
             &[if link_h_len > 0 {
@@ -1349,13 +1349,13 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// LAN 接口：根据链路头长度选择 L2 或 L3 版本
+    /// LAN interface: select L2 or L3 version based on link header length
     ///
-    /// 与原始 dae Go 行为对齐：
-    /// - Ingress 方向优先级 2，handle sub = 4
-    /// - Egress 方向优先级 1，handle sub = 2
+    /// Aligned with original dae Go behavior:
+    /// - Ingress direction priority 2, handle sub = 4
+    /// - Egress direction priority 1, handle sub = 2
     ///
-    /// 注意：与 WAN 相反，LAN 的 Egress 优先级更高。
+    /// Note: unlike WAN, LAN's Egress has higher priority.
     pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
         let link_h_len = Self::get_link_header_len(ifname)?;
         let handle_major = 0x2023u32;
@@ -1365,7 +1365,7 @@ impl EbpfManager {
             ifname, link_h_len, flip
         );
 
-        // Ingress (优先级 2, handle sub=4)
+        // Ingress (priority 2, handle sub=4)
         self.attach_tc(
             ifname,
             &[if link_h_len > 0 {
@@ -1376,7 +1376,7 @@ impl EbpfManager {
             Some((handle_major << 16) | ((4 & !1u32) | flip)),
         )?;
 
-        // Egress (优先级 1, handle sub=2)
+        // Egress (priority 1, handle sub=2)
         self.attach_tc(
             ifname,
             &[if link_h_len > 0 {
@@ -1390,9 +1390,9 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// dae0（宿主 NS）：挂载 tproxy_dae0_ingress
+    /// dae0 (host NS): attach tproxy_dae0_ingress
     ///
-    /// 优先级 0，handle major=0x2022，handle sub=2
+    /// Priority 0, handle major=0x2022, handle sub=2
     pub fn attach_dae0(&mut self, ifname: &str) -> Result<()> {
         let handle_major = 0x2022u32;
         let flip = self.flip;
@@ -1404,9 +1404,9 @@ impl EbpfManager {
         )
     }
 
-    /// dae0peer（代理 NS）：挂载 tproxy_dae0peer_ingress
+    /// dae0peer (proxy NS): attach tproxy_dae0peer_ingress
     ///
-    /// 优先级 0，handle major=0x2022，handle sub=2
+    /// Priority 0, handle major=0x2022, handle sub=2
     pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
         let handle_major = 0x2022u32;
         let flip = self.flip;
@@ -1422,12 +1422,12 @@ impl EbpfManager {
     }
 
     // ========================================================================
-    // cgroup 程序 attach
+    // cgroup program attach
     // ========================================================================
 
-    /// 在代理 NS 中 attach cgroup 程序
+    /// Attach cgroup programs in proxy NS
     ///
-    /// tproxy.c 中有 6 个 cgroup 程序需要 attach：
+    /// tproxy.c has 6 cgroup programs that need to be attached:
     /// - tproxy_wan_cg_sock_create (cgroup/sock_create)
     /// - tproxy_wan_cg_sock_release (cgroup/sock_release)
     /// - tproxy_wan_cg_connect4 (cgroup/connect4)
@@ -1435,13 +1435,13 @@ impl EbpfManager {
     /// - tproxy_wan_cg_sendmsg4 (cgroup/sendmsg4)
     /// - tproxy_wan_cg_sendmsg6 (cgroup/sendmsg6)
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// * `cgroup_fd` — cgroup 文件描述符（通常为 /sys/fs/cgroup 的 fd）
+    /// * `cgroup_fd` — cgroup file descriptor (typically fd of /sys/fs/cgroup)
     ///
-    /// # 错误回滚
+    /// # Errors rollback
     ///
-    /// 如果部分程序 attach 失败，已成功 attach 的程序会被自动 detach 清理。
+    /// If some program attach fails, successfully attached programs are automatically detached and cleaned up.
     pub fn attach_cgroup(&mut self, cgroup_fd: std::os::unix::io::RawFd) -> Result<()> {
         let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
 
@@ -1472,7 +1472,7 @@ impl EbpfManager {
                         info!("cgroup program '{}' attached", name);
                     }
                     Err(e) => {
-                        // 失败时回滚所有已 attach 的 link
+                        // On failure, roll back all attached links
                         warn!(
                             "Failed to attach cgroup program '{}': {}, rolling back {} attached link(s)",
                             name,
@@ -1498,7 +1498,7 @@ impl EbpfManager {
             Ok(())
         })();
 
-        // 如果成功，将 links 转移到 self.cgroup_links
+        // If successful, move links to self.cgroup_links
         if result.is_ok() {
             self.cgroup_links
                 .extend(attached.into_iter().map(|(_, link)| link));
@@ -1512,10 +1512,10 @@ impl EbpfManager {
     }
 
     // ========================================================================
-    // 分离 & 卸载
+    // Detach & unload
     // ========================================================================
 
-    /// 分离所有 TC 程序和 cgroup 程序
+    /// Detach all TC programs and cgroup programs
     pub fn detach_all(&mut self) -> Result<()> {
         let start = std::time::Instant::now();
         // Detach TC hooks
@@ -1594,7 +1594,7 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// 卸载 eBPF 程序（先分离所有 hook，再释放对象）
+    /// Unload eBPF program (detach all hooks first, then release objects)
     pub fn unload(&mut self) -> Result<()> {
         let start = std::time::Instant::now();
         info!("Unloading eBPF program");
@@ -2098,32 +2098,32 @@ impl EbpfManager {
     // Status Queries
     // ============================================================================
 
-    /// eBPF 程序是否已加载
+    /// Whether eBPF program is loaded
     pub fn is_loaded(&self) -> bool {
         self.obj.is_some()
     }
 
-    /// 是否有任何 TC 程序已 attach
+    /// Whether any TC program is attached
     pub fn is_attached(&self) -> bool {
         !self.tc_hooks.is_empty()
     }
 
-    /// 默认接口名（兼容旧代码）
+    /// Default interface name (for backward compatibility)
     pub fn iface(&self) -> &str {
         &self.iface
     }
 
-    /// TC hook 总数
+    /// Total TC hooks
     pub fn tc_link_count(&self) -> usize {
         self.tc_hooks.len()
     }
 
-    /// cgroup link 总数
+    /// Total cgroup links
     pub fn cgroup_link_count(&self) -> usize {
         self.cgroup_links.len()
     }
 
-    /// 所有 link 总数（TC + cgroup）
+    /// Total links (TC + cgroup)
     pub fn link_count(&self) -> usize {
         self.tc_hooks.len() + self.cgroup_links.len()
     }
@@ -2314,12 +2314,12 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// 清空 domain_routing_map 中指定 epoch slot 的所有条目。
+    /// Clear all entries in domain_routing_map for the specified epoch slot.
     ///
-    /// 遍历所有 key（`RoutingEpochIp` = slot + addr，20 字节）并逐个删除
-    /// 属于指定 slot 的条目。
-    /// 在热重载（reload_config）时调用，以清除旧的路由规则映射。
-    /// 返回删除的条目数。
+    /// Iterate all keys (`RoutingEpochIp` = slot + addr, 20 bytes) and delete each
+    /// entry belonging to the specified slot.
+    /// Called during hot reload (reload_config) to clear old Routing rule mappings.
+    /// Returns the number of deleted entries.
     pub fn clear_domain_routing_slot(&mut self, epoch_slot: u32) -> Result<u32> {
         use std::os::fd::AsRawFd;
 
@@ -2790,12 +2790,12 @@ impl EbpfManager {
     // Janitor: routing_handoff_map Cleanup
     // ============================================================================
 
-    /// 清理 routing_handoff_map 中的条目。
+    /// Clean up entries in routing_handoff_map.
     ///
-    /// routing_handoff_map 是一个短生命周期的交接 map，用于从 eBPF 到用户态的
-    /// 路由决策传递。条目应该在用户态读取后尽快清理。这个方法直接清空所有条目。
+    /// routing_handoff_map is a short-lived handoff map for passing Routing decisions from eBPF to userspace
+    /// Routing decision delivery. Entries should be cleaned up as soon as possible after being read by userspace. This method directly clears all entries.
     ///
-    /// 返回删除的条目数。
+    /// Returns the number of deleted entries.
     pub fn janitor_scan_routing_handoff(&mut self) -> Result<u32> {
         use std::os::fd::AsRawFd;
 

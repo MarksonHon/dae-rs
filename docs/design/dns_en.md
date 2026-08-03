@@ -87,8 +87,10 @@ A connection pool for a single upstream DNS server.
 
 Matches a query to a group and an upstream, and checks responses.
 
-- Top-level rules support `qname(...)` (suffix match), `qtype(...)` (A/AAAA/…),
-  and `any`; each rule may be negated with `!`.
+- Top-level rules support `qname(...)`, `qtype(...)` (A/AAAA/…), and `any`;
+  each rule may be negated with `!`. Rule-set references such as
+  `qname(geosite:cn)` / `qname(set:chinadomain)` are matched against the
+  GeoSite category / `domain_list` entry (see §3.6).
 - If no rule matches, uses `config.routing.fallback`; if that is empty, the first
   configured group; if there are no groups, a "null" empty result.
 - Within a group, the upstream is chosen from `request_routing.fallback`
@@ -137,6 +139,24 @@ A response cache keyed by `(qname, qtype, class)`.
 - Expired entries are revalidated/refreshed; with optimistic caching enabled,
   expired entries may still be served while being refreshed.
 
+### 3.6 Rule-set evaluation in DNS routing
+
+- **DNS query routing** ([`router.rs`](control/src/dns/router.rs)):
+  `qname(geosite:cn)` / `qname(set:chinadomain)` compile into rule-set
+  references (`DnsMatchType::GeoSite` / `DnsMatchType::Set`); at runtime the
+  query name is matched against the domain patterns in userspace (directly
+  against the in-memory cache, no eBPF involvement). Plain patterns like
+  `qname(suffix:...)` keep using the existing suffix logic.
+- **DNS response routing** ([`handler.rs`](control/src/dns/handler.rs)):
+  - `ip(geoip:cn)` / `ip(set:chinaip)` — parse all A/AAAA addresses in the
+    response (reusing `extract_answer_addrs()`); the condition is true when any
+    address hits the GeoIP / IP list;
+  - `ip(CIDR)` — direct CIDR match;
+  - `qname(geosite:cn)` / `qname(set:chinadomain)` — domain-pattern match on the
+    query name.
+  - Conditions support `&&` (AND) and `!` (NOT), e.g.
+    `ip(geoip:private) && !qname(geosite:cn)`.
+
 ## 4. Bootstrap / starting_dns
 
 `starting_dns` is the "trust anchor" resolver used before anything else works:
@@ -170,10 +190,13 @@ This mirrors the original dae `control/domain_routing_tracker.go`.
 ## 6. Current Limitations
 
 - DoH / DoT transports are parsed but not functional.
-- `geosite:` sets in DNS routing are evaluated as simple suffix matches (no
-  bundled GeoIP/GeoSite datasets).
 - In-group `request_routing.rules` are parsed but the upstream choice currently
   uses the fallback (the rule list is not yet fully evaluated).
 - `upstream(...)` response conditions currently match everything.
 - The DNS listener tasks run infinite receive loops and are stopped by
   `abort()` (safe because tokio tasks are cancel-safe at await points).
+
+> Rule-set evaluation is implemented: DNS query routing `qname(geosite:/set:)`
+> and DNS response routing `ip(geoip:/set:)` / `qname(...)` / `&&` / `!` are all
+> wired to rule-set data (§3.6), no longer simple suffix comparison. A missing
+> dataset referenced at compile time raises E2103.

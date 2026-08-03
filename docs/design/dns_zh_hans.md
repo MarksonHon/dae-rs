@@ -81,8 +81,9 @@ control/src/dns/
 
 把查询匹配到分组与上游，并检查响应。
 
-- 顶层规则支持 `qname(...)`（后缀匹配）、`qtype(...)`（A/AAAA/…）、`any`；
-  每条规则可用 `!` 取反。
+- 顶层规则支持 `qname(...)`、`qtype(...)`（A/AAAA/…）、`any`；每条规则可用
+  `!` 取反。`qname(geosite:cn)` / `qname(set:chinadomain)` 等规则集引用按
+  GeoSite 分类 / `domain_list` 条目匹配（见 §3.6）。
 - 无规则命中时用 `config.routing.fallback`；若为空则用第一个配置的分组；
   若无分组则返回 "null" 空结果。
 - 组内上游的选择来自 `request_routing.fallback`（组内 `request_routing.rules`
@@ -124,6 +125,20 @@ control/src/dns/
   `optimistic_cache_ttl`（3600 秒）。
 - 过期条目会重新校验/刷新；开启乐观缓存后，过期条目在刷新期间仍可被返回。
 
+### 3.6 DNS 路由中的规则集求值
+
+- **DNS 查询路由**（[`router.rs`](control/src/dns/router.rs)）：`qname(geosite:cn)`
+  / `qname(set:chinadomain)` 编译为规则集引用（`DnsMatchType::GeoSite` /
+  `DnsMatchType::Set`），运行时对查询名做域名模式匹配（用户空间直接匹配内存
+  缓存，不依赖 eBPF）。`qname(suffix:...)` 等普通模式继续走既有后缀逻辑。
+- **DNS 响应路由**（[`handler.rs`](control/src/dns/handler.rs)）：
+  - `ip(geoip:cn)` / `ip(set:chinaip)` — 解析响应中所有 A/AAAA 地址
+    （复用 `extract_answer_addrs()`），任一地址命中 GeoIP / IP 列表 → 条件真；
+  - `ip(CIDR)` — 直接 CIDR 匹配；
+  - `qname(geosite:cn)` / `qname(set:chinadomain)` — 对查询名做域名模式匹配。
+  - 条件支持 `&&`（AND）与 `!`（NOT）组合，如
+    `ip(geoip:private) && !qname(geosite:cn)`。
+
 ## 4. 引导解析 / starting_dns
 
 `starting_dns` 是"信任锚"解析器，在一切就绪前使用：
@@ -151,9 +166,12 @@ DNS 解析结果会写入 eBPF `domain_routing_map`，使 `domain(...)` 路由�
 ## 6. 当前限制
 
 - DoH / DoT 传输仅解析、不可用。
-- DNS 路由中的 `geosite:` 集按简单后缀比较求值（未内置 GeoIP/GeoSite 数据）。
 - 组内 `request_routing.rules` 会被解析，但当前上游选择直接使用 fallback
   （规则列表尚未完整求值）。
 - `upstream(...)` 响应条件当前匹配一切。
 - DNS 监听任务运行无限收发循环，用 `abort()` 停止（安全：tokio 任务在
   await 点可取消）。
+
+> 规则集求值已实现：DNS 查询路由的 `qname(geosite:/set:)` 与 DNS 响应路由的
+> `ip(geoip:/set:)` / `qname(...)` / `&&` / `!` 均接入规则集数据（§3.6），
+> 不再按简单后缀比较。数据缺失时相关规则编译报错（E2103）。

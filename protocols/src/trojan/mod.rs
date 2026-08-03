@@ -1,7 +1,7 @@
-//! Trojan 协议拨号器
+//! Trojan 协议Dialer
 //!
-//! 实现 Trojan 出站代理协议，基于 TLS 传输，伪装成 HTTPS 流量。
-//! 参考: https://github.com/trojan-gfw/trojan/blob/master/docs/protocol.md
+//! Implements Trojan outbound proxy protocol, based on TLS transport, disguising as HTTPS traffic.
+//! Reference: https://github.com/trojan-gfw/trojan/blob/master/docs/protocol.md
 
 use async_trait::async_trait;
 use sha2::{Sha224, Digest};
@@ -17,7 +17,7 @@ use rustls::{ClientConfig, RootCertStore};
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// Trojan 拨号器错误
+/// Trojan Dialer错误
 #[derive(Debug, thiserror::Error)]
 pub enum TrojanError {
     #[error("Trojan dial timeout: {0}")]
@@ -34,26 +34,26 @@ pub enum TrojanError {
     Other(String),
 }
 
-/// Trojan 拨号器
+/// Trojan Dialer
 pub struct TrojanDialer {
-    /// 上游 Trojan 服务器地址
+    /// Upstream Trojan server address
     pub proxy_addr: SocketAddr,
-    /// 拨号超时时间
+    /// Dial timeout duration
     pub dial_timeout: Duration,
-    /// 认证密码
+    /// Authentication password
     pub password: String,
     /// TLS SNI
     pub sni: String,
-    /// 证书 SHA256 指纹（用于证书固定）
+    /// Certificate SHA256 fingerprint (for certificate pinning)
     pub ca_sha256: Option<String>,
-    /// fwmark 用于 eBPF 自排除
+    /// fwmark for eBPF self-exclusion
     pub self_mark: u32,
-    /// 宿主网络命名空间 fd
+    /// Host network namespace fd
     pub host_ns_fd: Option<RawFd>,
 }
 
 impl TrojanDialer {
-    /// 创建新的 Trojan 拨号器
+    /// 创建新的 Trojan Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         password: impl Into<String>,
@@ -71,7 +71,7 @@ impl TrojanDialer {
         }
     }
 
-    /// 创建带 self-mark 的拨号器
+    /// Create dialer with self-mark
     pub fn new_with_mark(
         proxy_addr: SocketAddr,
         password: impl Into<String>,
@@ -90,13 +90,13 @@ impl TrojanDialer {
         }
     }
 
-    /// 设置证书 SHA256 指纹
+    /// Set certificate SHA256 fingerprint
     pub fn set_ca_sha256(&mut self, ca_sha256: Option<String>) -> &mut Self {
         self.ca_sha256 = ca_sha256;
         self
     }
 
-    /// 设置宿主网络命名空间 fd
+    /// Set host network namespace fd
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
@@ -160,7 +160,7 @@ impl TrojanDialer {
         Ok(tls_stream)
     }
 
-    /// 计算 Trojan 认证哈希（SHA224(password) 的 hex）
+    /// Calculate Trojan authentication hash (hex of SHA224(password))
     fn auth_hash(&self) -> String {
         let mut hasher = Sha224::new();
         hasher.update(self.password.as_bytes());
@@ -168,7 +168,7 @@ impl TrojanDialer {
         hex::encode(hash)
     }
 
-    /// 构建 Trojan 请求头：CRLF + HASH + CRLF + CMD + CRLF + ADDR + CRLF
+    /// Build Trojan request header: CRLF + HASH + CRLF + CMD + CRLF + ADDR + CRLF
     fn build_header(&self, cmd: u8, host: &str, port: u16) -> Result<Vec<u8>, TrojanError> {
         // Trojan protocol header:
         // CRLF(2) + HASH(56) + CRLF(2) + CMD(1) + CRLF(2) + ATYP(1) + ADDR + PORT(2) + CRLF(2)
@@ -196,7 +196,7 @@ impl TrojanDialer {
     }
 }
 
-/// 拆分 `host:port` 目标字符串（支持 [ipv6]:port）
+/// Split `host:port` target string (supports [ipv6]:port)
 fn split_target(target: &str) -> Result<(&str, u16), TrojanError> {
     let (mut host, port) = target
         .rsplit_once(':')
@@ -210,7 +210,7 @@ fn split_target(target: &str) -> Result<(&str, u16), TrojanError> {
     Ok((host, port))
 }
 
-/// 编码 Trojan 地址：ATYP + ADDR + PORT（1=IPv4, 3=域名, 4=IPv6）
+/// 编码 Trojan 地址：ATYP + ADDR + PORT（1=IPv4, 3=Domain name, 4=IPv6）
 fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, TrojanError> {
     let mut addr = Vec::with_capacity(1 + 16 + 2);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
@@ -229,7 +229,7 @@ fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, TrojanError> {
     Ok(addr)
 }
 
-/// 解码 Trojan 地址，返回 `(SocketAddr, 消耗字节数)`
+/// Decode Trojan address, return `(SocketAddr, bytes consumed)`
 fn decode_addr(data: &[u8]) -> Result<(SocketAddr, usize), TrojanError> {
     if data.is_empty() {
         return Err(TrojanError::ProtocolError("empty address".into()));
@@ -291,18 +291,18 @@ impl OutboundDialer for TrojanDialer {
         Ok(ProxyConn::new_boxed(Box::new(tls_stream)))
     }
 
-    /// 建立 Trojan UDP 中继会话。
+    /// Establish Trojan UDP relay session.
     ///
-    /// 1. 建立 TLS 控制连接并发送 UDP ASSOCIATE（CMD=0x03）命令；
-    /// 2. UDP 数据报直发代理服务器，格式 `[ATYP][ADDR][PORT][LEN(2)][PAYLOAD]`。
+    /// 1. Establish TLS control connection and send UDP ASSOCIATE (CMD=0x03) command;
+    /// 2. UDP datagram sent directly to proxy server, format `[ATYP][ADDR][PORT][LEN(2)][PAYLOAD]`.
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
-        // 控制连接：TLS + UDP ASSOCIATE 命令（地址 0.0.0.0:0）
+        // Control connection: TLS + UDP ASSOCIATE command (address 0.0.0.0:0)
         let tcp = self.connect_with_mark().await?;
         let mut control = self.tls_handshake(tcp).await?;
         let header = self.build_header(0x03, "0.0.0.0", 0)?;
         control.write_all(&header).await?;
 
-        // UDP socket（宿主 NS，连接代理服务器）
+        // UDP socket (host NS, connecting to proxy server)
         let socket = crate::hostns::create_udp(
             self.proxy_addr,
             &crate::hostns::DirectSocket {
@@ -329,12 +329,12 @@ impl OutboundDialer for TrojanDialer {
     }
 }
 
-/// Trojan UDP 中继会话（控制连接保活 + UDP 数据报转发）。
+/// Trojan UDP relay session (control connection keepalive + UDP datagram forwarding).
 pub struct TrojanUdpSession {
-    /// TLS 控制连接（保持存活以维持服务端的 UDP 放行）
+    /// TLS control connection (kept alive to maintain server's UDP allowance)
     #[allow(dead_code)]
     control: tokio_rustls::client::TlsStream<TcpStream>,
-    /// UDP 数据 socket（宿主 NS，连接代理服务器）
+    /// UDP data socket (host NS, connecting to proxy server)
     socket: tokio::net::UdpSocket,
 }
 

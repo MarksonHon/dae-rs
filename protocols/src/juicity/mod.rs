@@ -1,13 +1,13 @@
-//! Juicity 协议拨号器（基于 QUIC）
+//! Juicity 协议Dialer（基于 QUIC）
 //!
-//! 实现 Juicity 出站代理协议：
-//! - QUIC 传输（quinn + rustls，ALPN `h3`，TLS 1.3）
+//! Implements Juicity outbound proxy protocol:
+//! - QUIC transport (quinn + rustls, ALPN `h3`, TLS 1.3)
 //! - `Authenticate`：UUID + RFC 5705 Keying Material Exporter token
-//! - TCP 承载在 QUIC stream 上，代理头 = [network][addr_type][address][port]
-//! - 每个 QUIC connection 最多承载 30 个流，之后新建连接
+//! - TCP carried on QUIC stream, proxy header = [network][addr_type][address][port]
+//! - Each QUIC connection carries at most 30 streams, then new connection
 //!
-//! 参考: https://github.com/juicity/juicity/blob/main/docs/spec.md
-//! （地址类型按 daeuniverse/outbound 实现：IPv4=1, Domain=3, IPv6=4）
+//! Reference: https://github.com/juicity/juicity/blob/main/docs/spec.md
+//! (address types per daeuniverse/outbound implementation: IPv4=1, Domain=3, IPv6=4)
 
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -27,23 +27,23 @@ use tokio::time::timeout;
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// Juicity 协议版本
+/// Juicity protocol version
 const JUICITY_VERSION: u8 = 0x00;
-/// 命令类型（认证）
+/// Command type（认证）
 const CMD_AUTHENTICATE: u8 = 0x00;
 /// ALPN
 const JUICITY_ALPN: &[u8] = b"h3";
-/// 每个 QUIC connection 的最大流数（服务端 maxOpenIncomingStreams >= 30）
+/// Maximum streams per QUIC connection (server maxOpenIncomingStreams >= 30)
 const MAX_STREAMS_PER_CONN: u32 = 30;
-/// 网络类型
+/// Network type
 const NETWORK_TCP: u8 = 1;
 const NETWORK_UDP: u8 = 3;
-/// 地址类型（daeuniverse/outbound 实现）
+/// Address type (daeuniverse/outbound implementation)
 const ADDR_IPV4: u8 = 1;
 const ADDR_DOMAIN: u8 = 3;
 const ADDR_IPV6: u8 = 4;
 
-/// Juicity 拨号器错误
+/// Juicity Dialer错误
 #[derive(Debug, thiserror::Error)]
 pub enum JuicityError {
     #[error("Juicity dial timeout: {0}")]
@@ -62,31 +62,31 @@ pub enum JuicityError {
     Other(String),
 }
 
-/// Juicity 拨号器
+/// Juicity Dialer
 pub struct JuicityDialer {
-    /// 上游 Juicity 服务器地址
+    /// Upstream Juicity server address
     pub proxy_addr: SocketAddr,
-    /// 拨号超时时间
+    /// Dial timeout duration
     pub dial_timeout: Duration,
-    /// 用户 UUID
+    /// User UUID
     pub uuid: String,
-    /// 认证密码
+    /// Authentication password
     pub password: String,
-    /// 拥塞控制算法
+    /// Congestion control algorithm
     pub congestion_control: String,
     /// TLS SNI
     pub sni: String,
-    /// 证书 SHA256 指纹
+    /// Certificate SHA256 fingerprint
     pub ca_sha256: Option<String>,
-    /// fwmark 用于 eBPF 自排除
+    /// fwmark for eBPF self-exclusion
     pub self_mark: u32,
-    /// 宿主网络命名空间 fd
+    /// Host network namespace fd
     pub host_ns_fd: Option<RawFd>,
-    /// 懒创建的 QUIC 连接列表（每个连接最多 MAX_STREAMS_PER_CONN 个流）
+    /// Lazily created QUIC connection list (each connection carries at most MAX_STREAMS_PER_CONN streams)
     state: Mutex<Vec<JuicityConnState>>,
 }
 
-/// 一个可用的 QUIC 连接状态
+/// A usable QUIC connection state
 struct JuicityConnState {
     #[allow(dead_code)]
     endpoint: QuinnEndpoint,
@@ -96,7 +96,7 @@ struct JuicityConnState {
 }
 
 impl JuicityDialer {
-    /// 创建新的 Juicity 拨号器
+    /// 创建新的 Juicity Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         uuid: impl Into<String>,
@@ -117,40 +117,40 @@ impl JuicityDialer {
         }
     }
 
-    /// 设置拥塞控制算法
+    /// Set Congestion control algorithm
     pub fn set_congestion_control(&mut self, cc: impl Into<String>) -> &mut Self {
         self.congestion_control = cc.into();
         self
     }
 
-    /// 设置 SNI
+    /// Set SNI
     pub fn set_sni(&mut self, sni: impl Into<String>) -> &mut Self {
         self.sni = sni.into();
         self
     }
 
-    /// 设置证书 SHA256 指纹
+    /// Set certificate SHA256 fingerprint
     pub fn set_ca_sha256(&mut self, ca_sha256: Option<String>) -> &mut Self {
         self.ca_sha256 = ca_sha256;
         self
     }
 
-    /// 设置 fwmark 用于 eBPF 自排除（0 表示不设置）
+    /// Set fwmark for eBPF self-exclusion (0 means not set)
     pub fn set_self_mark(&mut self, self_mark: u32) -> &mut Self {
         self.self_mark = self_mark;
         self
     }
 
-    /// 设置宿主网络命名空间 fd
+    /// Set host network namespace fd
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
     }
 
-    /// 获取一个可用的连接：优先复用未满的现有连接，否则新建
+    /// Get an available connection: prefer reusing existing connections that aren't full, otherwise create new
     async fn get_connection(&self) -> Result<quinn::Connection, JuicityError> {
         let mut guard = self.state.lock().await;
-        // 复用：连接存活且流数未满
+        // Reuse: connection alive and stream count not full
         for state in guard.iter() {
             if state.conn.close_reason().is_none()
                 && state.stream_count.load(Ordering::Relaxed) < MAX_STREAMS_PER_CONN
@@ -159,7 +159,7 @@ impl JuicityDialer {
             }
         }
 
-        // 新建连接
+        // Create new connection
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut crypto = ClientConfig::builder()
@@ -230,7 +230,7 @@ impl JuicityDialer {
         Ok(conn)
     }
 
-    /// 发送 Authenticate 命令（UUID + RFC 5705 exporter token）
+    /// Send Authenticate command (UUID + RFC 5705 exporter token)
     async fn authenticate(&self, conn: &quinn::Connection) -> Result<(), JuicityError> {
         let uuid = parse_uuid(&self.uuid)?;
 
@@ -257,20 +257,20 @@ impl JuicityDialer {
     }
 }
 
-/// 编码 Juicity 代理头：[network][addr_type][address][port]
+/// Encode Juicity proxy header: [network][addr_type][address][port]
 fn encode_proxy_header(target: &str) -> Result<Vec<u8>, JuicityError> {
     let (host, port) = split_target(target)?;
     encode_header(NETWORK_TCP, host, port)
 }
 
-/// 编码 Juicity 数据报头：[network][addr_type][address][port][len(2)]
+/// Encode Juicity datagram header: [network][addr_type][address][port][len(2)]
 fn encode_packet_header(network: u8, host: &str, port: u16, payload_len: usize) -> Vec<u8> {
     let mut header = encode_header(network, host, port).expect("valid addr");
     header.extend_from_slice(&(payload_len as u16).to_be_bytes());
     header
 }
 
-/// 编码 Juicity 头（network + 地址 + 端口）
+/// Encode Juicity header (network + address + port)
 fn encode_header(network: u8, host: &str, port: u16) -> Result<Vec<u8>, JuicityError> {
     let mut header = Vec::with_capacity(2 + 16 + 2);
     header.push(network);
@@ -290,7 +290,7 @@ fn encode_header(network: u8, host: &str, port: u16) -> Result<Vec<u8>, JuicityE
     Ok(header)
 }
 
-/// 拆分 `host:port` 目标字符串（支持 [ipv6]:port）
+/// Split `host:port` target string (supports [ipv6]:port)
 fn split_target(target: &str) -> Result<(&str, u16), JuicityError> {
     let (mut host, port) = target
         .rsplit_once(':')
@@ -317,7 +317,7 @@ fn parse_uuid(uuid: &str) -> Result<[u8; 16], JuicityError> {
     Ok(out)
 }
 
-/// QUIC 双向流双工适配（tokio AsyncRead/AsyncWrite）
+/// QUIC bidirectional stream duplex adapter (tokio AsyncRead/AsyncWrite)
 pub struct QuicStreamDuplex {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -366,10 +366,10 @@ impl AsyncWrite for QuicStreamDuplex {
 #[async_trait]
 impl OutboundDialer for JuicityDialer {
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
-        // 1. 获取（或新建）QUIC 连接
+        // 1. Get (or create) QUIC connection
         let conn = self.get_connection().await?;
 
-        // 2. 首次使用该连接时发送 Authenticate
+        // 2. Send Authenticate when first using the connection
         {
             let mut guard = self.state.lock().await;
             for state in guard.iter_mut() {
@@ -385,7 +385,7 @@ impl OutboundDialer for JuicityDialer {
             }
         }
 
-        // 3. 打开双向流，发送代理头，之后直接承载数据
+        // 3. Open bidirectional stream, send proxy header, then carry data directly
         let (send, recv) = conn
             .open_bi()
             .await
@@ -408,13 +408,13 @@ impl OutboundDialer for JuicityDialer {
         Ok(ProxyConn::new_boxed(Box::new(QuicStreamDuplex::new(send, recv))))
     }
 
-    /// 建立 Juicity UDP 中继会话（UDP over Stream）。
+    /// Establish Juicity UDP relay session (UDP over Stream).
     ///
-    /// 会话独占一条双向流：每个数据报 = `[network=3][addr][port][len(2)][payload]`。
+    /// Session occupies one bidirectional stream: each datagram = `[network=3][addr][port][len(2)][payload]`.
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
         let conn = self.get_connection().await?;
 
-        // 首次使用该连接时发送 Authenticate
+        // Send Authenticate when first using the connection
         {
             let mut guard = self.state.lock().await;
             for state in guard.iter_mut() {
@@ -460,7 +460,7 @@ impl OutboundDialer for JuicityDialer {
     }
 }
 
-/// Juicity UDP 中继会话（UDP over Stream，全锥形）。
+/// Juicity UDP relay session (UDP over Stream, full cone).
 pub struct JuicityUdpSession {
     send: tokio::sync::Mutex<quinn::SendStream>,
     recv: tokio::sync::Mutex<quinn::RecvStream>,

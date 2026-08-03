@@ -1,9 +1,9 @@
-//! dae-rs 构建脚本
+//! dae-rs build script
 //!
-//! 编译 C eBPF 代码（tproxy.c）为 BPF 字节码文件（ebpf.o），
-//! 然后将其复制到 OUT_DIR 以供主程序通过 include_bytes! 嵌入。
+//! Compile C eBPF code (tproxy.c) to BPF bytecode file (ebpf.o),
+//! then copy it to OUT_DIR for the main program to embed via include_bytes!.
 //!
-//! 需要：clang (≥14), llvm-strip, Git 子模块已初始化
+//! Requires: clang (≥14), llvm-strip, Git submodule initialized
 
 use std::env;
 use std::path::PathBuf;
@@ -13,31 +13,31 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // eBPF 源码路径
+    // eBPF source code path
     let kern_dir = manifest_dir.join("bpf/kern");
     let headers_dir = kern_dir.join("headers");
     let tproxy_c = kern_dir.join("tproxy.c");
     let output_obj = out_dir.join("ebpf.o");
 
-    // 告诉 cargo 在这些文件变更时重新运行
+    // Tell cargo to re-run when these files change
     println!("cargo:rerun-if-changed=bpf/kern/tproxy.c");
     println!("cargo:rerun-if-changed=bpf/kern/ebpf_sync_defs.h");
     println!("cargo:rerun-if-changed=bpf/kern/headers");
 
-    // 检查 tproxy.c 是否存在（子模块必须已初始化）
+    // Check if tproxy.c exists (submodule must be initialized)
     assert!(
         tproxy_c.exists(),
         "tproxy.c not found at {}. Run `git submodule update --init` first.",
         tproxy_c.display()
     );
 
-    // 从环境变量或默认值获取工具路径
+    // Get tool paths from environment variables or defaults
     let clang = env::var("CLANG").unwrap_or_else(|_| "clang".to_string());
     let llvm_strip = env::var("LLVM_STRIP").unwrap_or_else(|_| "llvm-strip".to_string());
     let max_match_set_len =
         env::var("MAX_MATCH_SET_LEN").unwrap_or_else(|_| "1024".to_string());
 
-    // 编译 tproxy.c → ebpf.o
+    // Compile tproxy.c → ebpf.o
     let cflags = [
         "-O2",
         "-Wall",
@@ -72,7 +72,7 @@ fn main() {
         "clang eBPF compilation failed. Check clang installation."
     );
 
-    // Strip debug info（保留 BTF 信息以支持 CO-RE）
+    // Strip debug info (keep BTF info for CO-RE support)
     let strip_status = Command::new(&llvm_strip)
         .args(["-g", output_obj.to_str().unwrap()])
         .status();

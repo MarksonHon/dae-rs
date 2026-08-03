@@ -1,12 +1,12 @@
-//! VMess 协议拨号器
+//! VMess 协议Dialer
 //!
-//! 实现 VMess AEAD 出站协议（与 v2ray-core 4.0+ 兼容）：
-//! - AEAD 认证（MD5 派生 CmdKey + HMAC-SHA256 KDF）
-//! - 请求头/响应头 AES-128-GCM 密封
-//! - 请求体 AES-128-GCM / ChaCha20-Poly1305 / 无加密分块流
-//! - 传输层：TCP / WebSocket（WSS）
+//! Implements VMess AEAD outbound protocol (compatible with v2ray-core 4.0+):
+//! - AEAD authentication (MD5 derived CmdKey + HMAC-SHA256 KDF)
+//! - Request/response header AES-128-GCM sealed
+//! - Request body AES-128-GCM / ChaCha20-Poly1305 / unencrypted chunked stream
+//! - Transport layer: TCP / WebSocket (WSS)
 //!
-//! 参考: https://www.v2fly.org/en_US/developer/protocols/vmess.html
+//! Reference: https://www.v2fly.org/en_US/developer/protocols/vmess.html
 
 use async_trait::async_trait;
 use std::io;
@@ -27,12 +27,12 @@ use rustls::{ClientConfig, RootCertStore};
 
 use crate::{OutboundDialer, ProxyConn};
 
-// ── VMess 常量（与 v2ray-core 一致）──
+// ── VMess constants (consistent with v2ray-core)──
 
 const VERSION: u8 = 1;
-/// AEAD CmdKey 派生盐
+/// AEAD CmdKey derivation salt
 const AEAD_CMD_KEY_SALT: &[u8] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
-/// KDF 基础盐
+/// KDF base salt
 const KDF_BASE_SALT: &[u8] = b"VMess AEAD KDF";
 const KDF_AUTH_ID_ENC: &[u8] = b"AES Auth ID Encryption";
 const KDF_RESP_LEN_KEY: &[u8] = b"AEAD Resp Header Len Key";
@@ -44,7 +44,7 @@ const KDF_HEADER_LEN_IV: &[u8] = b"VMess Header AEAD Nonce_Length";
 const KDF_HEADER_PAYLOAD_KEY: &[u8] = b"VMess Header AEAD Key";
 const KDF_HEADER_PAYLOAD_IV: &[u8] = b"VMess Header AEAD Nonce";
 
-/// Request option: chunk stream + chunk masking（TCP 默认）
+/// Request option: chunk stream + chunk masking (TCP default)
 const OPT_CHUNK_STREAM: u8 = 0x01;
 const OPT_CHUNK_MASKING: u8 = 0x04;
 /// Command: TCP
@@ -54,12 +54,12 @@ const CMD_UDP: u8 = 0x02;
 const SEC_NONE: u8 = 0;
 const SEC_AES128_GCM: u8 = 2;
 const SEC_CHACHA20_POLY1305: u8 = 3;
-/// 请求体分块最大负载
+/// Request body chunk maximum payload
 const BODY_CHUNK_SIZE: usize = 16384;
-/// AEAD tag 长度
+/// AEAD tag length
 const AEAD_TAG: usize = 16;
 
-/// VMess 拨号器错误
+/// VMess Dialer错误
 #[derive(Debug, thiserror::Error)]
 pub enum VMessError {
     #[error("VMess dial timeout: {0}")]
@@ -82,7 +82,7 @@ pub enum VMessError {
     Other(String),
 }
 
-/// VMess 传输方式
+/// VMess transport method
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VMessNetwork {
     Tcp,
@@ -104,7 +104,7 @@ impl FromStr for VMessNetwork {
     }
 }
 
-/// v2rayN base64 JSON 节点格式
+/// v2rayN base64 JSON node format
 #[derive(Debug, serde::Deserialize)]
 struct VMessNodeConfig {
     add: String,
@@ -124,42 +124,42 @@ struct VMessNodeConfig {
     sni: String,
 }
 
-/// VMess 拨号器
+/// VMess Dialer
 pub struct VMessDialer {
-    /// 上游 VMess 服务器地址
+    /// Upstream VMess server address
     pub proxy_addr: SocketAddr,
-    /// 拨号超时时间
+    /// Dial timeout duration
     pub dial_timeout: Duration,
-    /// 用户 UUID
+    /// User UUID
     pub uuid: String,
-    /// 加密方式（auto / aes-128-gcm / chacha20-poly1305 / none）
+    /// Encryption method (auto / aes-128-gcm / chacha20-poly1305 / none)
     pub security: String,
-    /// alter_id（AEAD 模式下忽略，保留兼容）
+    /// alter_id (ignored in AEAD mode, kept for compatibility)
     pub alter_id: u32,
-    /// 传输方式
+    /// Transport method
     pub network: VMessNetwork,
-    /// WebSocket 路径
+    /// WebSocket path
     pub ws_path: Option<String>,
-    /// WebSocket 请求头
+    /// WebSocket request headers
     pub ws_headers: Option<std::collections::HashMap<String, String>>,
-    /// HTTP/2 路径
+    /// HTTP/2 path
     pub h2_path: Option<String>,
-    /// HTTP/2 主机
+    /// HTTP/2 host
     pub h2_host: Option<String>,
-    /// gRPC 服务名
+    /// gRPC service name
     pub grpc_service_name: Option<String>,
     /// TLS SNI
     pub sni: String,
-    /// 证书 SHA256 指纹
+    /// Certificate SHA256 fingerprint
     pub ca_sha256: Option<String>,
-    /// fwmark 用于 eBPF 自排除
+    /// fwmark for eBPF self-exclusion
     pub self_mark: u32,
-    /// 宿主网络命名空间 fd
+    /// Host network namespace fd
     pub host_ns_fd: Option<RawFd>,
 }
 
 impl VMessDialer {
-    /// 从 v2rayN base64 JSON 格式创建拨号器
+    /// 从 v2rayN base64 JSON 格式创建Dialer
     pub fn new_from_base64_json(base64_str: &str, dial_timeout_ms: u64) -> Result<Self, VMessError> {
         use base64::Engine as _;
         let decoded = base64::engine::general_purpose::STANDARD
@@ -216,7 +216,7 @@ impl VMessDialer {
         })
     }
 
-    /// 创建新的 VMess 拨号器
+    /// 创建新的 VMess Dialer
     pub fn new(proxy_addr: SocketAddr, uuid: impl Into<String>, dial_timeout_ms: u64) -> Self {
         Self {
             proxy_addr,
@@ -237,73 +237,73 @@ impl VMessDialer {
         }
     }
 
-    /// 设置加密方式
+    /// Set encryption method
     pub fn set_security(&mut self, security: impl Into<String>) -> &mut Self {
         self.security = security.into();
         self
     }
 
-    /// 设置 alter_id
+    /// Set alter_id
     pub fn set_alter_id(&mut self, alter_id: u32) -> &mut Self {
         self.alter_id = alter_id;
         self
     }
 
-    /// 设置传输方式
+    /// 设置Transport method
     pub fn set_network(&mut self, network: VMessNetwork) -> &mut Self {
         self.network = network;
         self
     }
 
-    /// 设置 WebSocket 路径
+    /// 设置 WebSocket path
     pub fn set_ws_path(&mut self, path: impl Into<String>) -> &mut Self {
         self.ws_path = Some(path.into());
         self
     }
 
-    /// 设置 WebSocket 头部
+    /// Set WebSocket headers
     pub fn set_ws_headers(&mut self, headers: std::collections::HashMap<String, String>) -> &mut Self {
         self.ws_headers = Some(headers);
         self
     }
 
-    /// 设置 HTTP/2 路径
+    /// 设置 HTTP/2 path
     pub fn set_h2_path(&mut self, path: impl Into<String>) -> &mut Self {
         self.h2_path = Some(path.into());
         self
     }
 
-    /// 设置 HTTP/2 主机
+    /// 设置 HTTP/2 host
     pub fn set_h2_host(&mut self, host: impl Into<String>) -> &mut Self {
         self.h2_host = Some(host.into());
         self
     }
 
-    /// 设置 gRPC 服务名
+    /// 设置 gRPC service name
     pub fn set_grpc_service_name(&mut self, name: impl Into<String>) -> &mut Self {
         self.grpc_service_name = Some(name.into());
         self
     }
 
-    /// 设置 SNI
+    /// Set SNI
     pub fn set_sni(&mut self, sni: impl Into<String>) -> &mut Self {
         self.sni = sni.into();
         self
     }
 
-    /// 设置证书 SHA256 指纹
+    /// Set certificate SHA256 fingerprint
     pub fn set_ca_sha256(&mut self, ca_sha256: Option<String>) -> &mut Self {
         self.ca_sha256 = ca_sha256;
         self
     }
 
-    /// 设置 fwmark 用于 eBPF 自排除（0 表示不设置）
+    /// Set fwmark for eBPF self-exclusion (0 means not set)
     pub fn set_self_mark(&mut self, self_mark: u32) -> &mut Self {
         self.self_mark = self_mark;
         self
     }
 
-    /// 设置宿主网络命名空间 fd
+    /// Set host network namespace fd
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
@@ -330,7 +330,7 @@ impl VMessDialer {
         })
     }
 
-    /// 解析加密方式 → (security 字节, 是否加密)
+    /// Parse encryption method → (security byte, whether encrypted)
     fn security_type(&self) -> Result<u8, VMessError> {
         match self.security.as_str() {
             "auto" | "aes-128-gcm" => Ok(SEC_AES128_GCM),
@@ -343,7 +343,7 @@ impl VMessDialer {
         }
     }
 
-    /// 建立传输层（TCP / WebSocket / TLS），返回原始双工流
+    /// Establish transport layer (TCP / WebSocket / TLS), return raw duplex stream
     async fn establish_transport(&self) -> Result<Box<dyn crate::AsyncDuplex + Unpin + Send>, VMessError> {
         let tcp = self.connect_with_mark().await?;
         match self.network {
@@ -361,7 +361,7 @@ impl VMessDialer {
         }
     }
 
-    /// WebSocket 升级
+    /// WebSocket upgrade
     async fn upgrade_ws(
         &self,
         tcp: TcpStream,
@@ -404,23 +404,23 @@ impl OutboundDialer for VMessDialer {
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
         let transport = self.establish_transport().await?;
 
-        // 1. 构造并密封请求头
+        // 1. Construct and seal request header
         let security = self.security_type()?;
         let (session, sealed_header) = build_request_header(&self.uuid, target, security, CMD_TCP)
             .map_err(|e| anyhow::anyhow!("VMess header build failed: {}", e))?;
 
-        // 2. 发送密封头
+        // 2. Send sealed header
         let mut stream = transport;
         stream.write_all(&sealed_header).await.map_err(VMessError::Io)?;
 
-        // 3. 读取并校验响应头
+        // 3. Read and verify response header
         let resp_key = session.response_body_key();
         let resp_iv = session.response_body_iv();
         read_response_header(&mut stream, resp_key, resp_iv, session.response_header())
             .await
             .map_err(|e| anyhow::anyhow!("VMess response header failed: {}", e))?;
 
-        // 4. 包装为分块加密流
+        // 4. Wrap into chunked encrypted stream
         let body = VmessBodyStream::new(
             stream,
             session,
@@ -429,7 +429,7 @@ impl OutboundDialer for VMessDialer {
         Ok(ProxyConn::new_boxed(Box::new(body)))
     }
 
-    /// 建立 VMess UDP 中继会话（数据报模式分块流）。
+    /// Establish VMess UDP relay session (datagram mode chunked stream).
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
         let transport = self.establish_transport().await?;
 
@@ -466,10 +466,10 @@ impl OutboundDialer for VMessDialer {
 }
 
 // ============================================================================
-// VMess AEAD 加密原语
+// VMess AEAD encryption primitives
 // ============================================================================
 
-/// VMess KDF：HMAC-SHA256 链
+/// VMess KDF: HMAC-SHA256 chain
 fn kdf(key: &[u8], paths: &[&[u8]]) -> [u8; 32] {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<sha2::Sha256>;
@@ -511,20 +511,20 @@ fn parse_uuid(uuid: &str) -> Result<[u8; 16], VMessError> {
     Ok(out)
 }
 
-/// AES-128-ECB 单块加密
+/// AES-128-ECB single block encryption
 fn aes_ecb_encrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
     use aes::cipher::{BlockEncrypt, KeyInit};
     let cipher = aes::Aes128::new_from_slice(key).expect("aes key");
     cipher.encrypt_block(block.into());
 }
 
-/// 生成 AuthID：AES-ECB(KDF16(cmdKey, "AES Auth ID Encryption"),
-///   timestamp_be64 || 4 随机字节 || crc32(前 12 字节) be32)
+/// Generate AuthID: AES-ECB(KDF16(cmdKey, "AES Auth ID Encryption"),
+///   timestamp_be64 || 4 random bytes || crc32(first 12 bytes) be32)
 fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64) -> [u8; 16] {
     let enc_key = kdf16(cmd_key, &[KDF_AUTH_ID_ENC]);
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&timestamp.to_be_bytes());
-    // 4 随机字节
+    // 4 random bytes
     let mut rng_bytes = [0u8; 4];
     get_random(&mut rng_bytes);
     buf[8..12].copy_from_slice(&rng_bytes);
@@ -534,7 +534,7 @@ fn create_auth_id(cmd_key: &[u8; 16], timestamp: i64) -> [u8; 16] {
     buf
 }
 
-/// FNV-1a 32 位哈希（请求头校验）
+/// FNV-1a 32-bit hash (request header verification)
 fn fnv1a32(data: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c9dc5;
     for b in data {
@@ -545,7 +545,7 @@ fn fnv1a32(data: &[u8]) -> u32 {
 }
 
 fn get_random(buf: &mut [u8]) {
-    // 尽力从系统随机源填充；失败时退化为时间+地址熵（仅影响加密强度，不 panic）
+    // Best effort to fill from system random source; falls back to time+address entropy on failure (only affects encryption strength, does not panic)
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut ok = false;
@@ -567,7 +567,7 @@ fn get_random(buf: &mut [u8]) {
     }
 }
 
-/// 密封 VMess AEAD 请求头
+/// Seal VMess AEAD request header
 fn seal_header(cmd_key: &[u8; 16], header: &[u8], auth_id: &[u8; 16]) -> Result<Vec<u8>, VMessError> {
     use aes_gcm::{Aes128Gcm, KeyInit as _, Nonce};
     use aes_gcm::aead::Aead;
@@ -575,7 +575,7 @@ fn seal_header(cmd_key: &[u8; 16], header: &[u8], auth_id: &[u8; 16]) -> Result<
     let mut conn_nonce = [0u8; 8];
     get_random(&mut conn_nonce);
 
-    // 长度密封
+    // Length seal
     let len_key = kdf16(cmd_key, &[KDF_HEADER_LEN_KEY, auth_id, &conn_nonce]);
     let len_iv = kdf(cmd_key, &[KDF_HEADER_LEN_IV, auth_id, &conn_nonce]);
     let len_cipher = {
@@ -585,7 +585,7 @@ fn seal_header(cmd_key: &[u8; 16], header: &[u8], auth_id: &[u8; 16]) -> Result<
         cipher.encrypt(nonce, plain.as_slice()).map_err(|_| VMessError::Other("header len seal failed".into()))?
     };
 
-    // 负载密封
+    // Payload seal
     let payload_key = kdf16(cmd_key, &[KDF_HEADER_PAYLOAD_KEY, auth_id, &conn_nonce]);
     let payload_iv = kdf(cmd_key, &[KDF_HEADER_PAYLOAD_IV, auth_id, &conn_nonce]);
     let payload_cipher = {
@@ -602,7 +602,7 @@ fn seal_header(cmd_key: &[u8; 16], header: &[u8], auth_id: &[u8; 16]) -> Result<
     Ok(out)
 }
 
-/// 编码目标地址（VMess ATYP：1=IPv4, 2=域名, 3=IPv6；端口在前）
+/// 编码目标地址（VMess ATYP：1=IPv4, 2=Domain name, 3=IPv6；端口在前）
 fn encode_address_port(target: &str) -> Result<(Vec<u8>, u16), VMessError> {
     let (mut host, port) = target
         .rsplit_once(':')
@@ -629,7 +629,7 @@ fn encode_address_port(target: &str) -> Result<(Vec<u8>, u16), VMessError> {
     Ok((addr, port))
 }
 
-/// 编码 VMess UDP 数据报地址：ATYP + ADDR + PORT（1=IPv4, 2=域名, 3=IPv6）
+/// 编码 VMess UDP 数据报地址：ATYP + ADDR + PORT（1=IPv4, 2=Domain name, 3=IPv6）
 fn encode_packet_addr(host: &str, port: u16) -> Vec<u8> {
     let mut addr = Vec::with_capacity(1 + 16 + 2);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
@@ -648,7 +648,7 @@ fn encode_packet_addr(host: &str, port: u16) -> Vec<u8> {
     addr
 }
 
-/// 解码 VMess UDP 数据报地址，返回 `(SocketAddr, 消耗字节数)`
+/// Decode VMess UDP datagram address, return `(SocketAddr, bytes consumed)`
 fn decode_packet_addr(data: &[u8]) -> Result<(SocketAddr, usize), VMessError> {
     if data.is_empty() {
         return Err(VMessError::ProtocolError("empty address".into()));
@@ -694,7 +694,7 @@ fn decode_packet_addr(data: &[u8]) -> Result<(SocketAddr, usize), VMessError> {
     }
 }
 
-/// 一次 VMess 会话的密钥材料
+/// Key material for one VMess session
 struct VmessSession {
     request_body_key: [u8; 16],
     request_body_iv: [u8; 16],
@@ -738,7 +738,7 @@ impl VmessSession {
     }
 }
 
-/// 构建并密封请求头
+/// Construct and seal request header
 fn build_request_header(
     uuid: &str,
     target: &str,
@@ -754,7 +754,7 @@ fn build_request_header(
 
     let (addr, port) = encode_address_port(target)?;
 
-    // 随机 padding（0-15 字节），并打包进 security 高 4 位
+    // Random padding (0-15 bytes), packed into high 4 bits of security
     let mut padding_len = [0u8; 1];
     get_random(&mut padding_len);
     let padding_len = (padding_len[0] % 16) as usize;
@@ -771,14 +771,14 @@ fn build_request_header(
     header.push(security_byte);
     header.push(0); // reserve
     header.push(command);
-    // PortThenAddress：端口在前
+    // PortThenAddress: port first
     header.extend_from_slice(&port.to_be_bytes());
     header.extend_from_slice(&addr);
     // padding
     let mut pad = vec![0u8; padding_len];
     get_random(&mut pad);
     header.extend_from_slice(&pad);
-    // FNV-1a 校验
+    // FNV-1a verification
     header.extend_from_slice(&fnv1a32(&header).to_be_bytes());
 
     let auth_id = create_auth_id(&key, timestamp);
@@ -786,7 +786,7 @@ fn build_request_header(
     Ok((session, sealed))
 }
 
-/// 读取并校验响应头
+/// Read and verify response header
 async fn read_response_header<S>(
     stream: &mut S,
     resp_key: &[u8; 16],
@@ -799,7 +799,7 @@ where
     use aes_gcm::{Aes128Gcm, KeyInit as _, Nonce};
     use aes_gcm::aead::Aead;
 
-    // 1. 长度密封（18 字节）
+    // 1. Length seal（18 字节）
     let mut len_cipher = [0u8; 18];
     stream.read_exact(&mut len_cipher).await.map_err(VMessError::Io)?;
     let len_key = kdf16(resp_key, &[KDF_RESP_LEN_KEY]);
@@ -813,7 +813,7 @@ where
     };
     let header_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
 
-    // 2. 负载密封
+    // 2. Payload seal
     let payload_key = kdf16(resp_key, &[KDF_RESP_PAYLOAD_KEY]);
     let payload_iv = kdf(resp_iv, &[KDF_RESP_PAYLOAD_IV]);
     let mut payload_cipher = vec![0u8; header_len + AEAD_TAG];
@@ -826,7 +826,7 @@ where
             .map_err(|_| VMessError::ProtocolError("response header decrypt failed".into()))?
     };
 
-    // 3. 校验响应头首字节
+    // 3. Verify first byte of response header
     if plain.first() != Some(&expected_header) {
         return Err(VMessError::ProtocolError(format!(
             "unexpected response header: got {:?}, expected {:?}",
@@ -838,10 +838,10 @@ where
 }
 
 // ============================================================================
-// VMess 分块加密流（请求体 AES-GCM 分块 + shake128 长度掩码）
+// VMess chunked encrypted stream (request body AES-GCM chunked + shake128 length mask)
 // ============================================================================
 
-/// 基于 sha3::Shake128 的长度掩码 + padding 生成器（与 v2ray 一致）
+/// Length mask + padding generator based on sha3::Shake128 (consistent with v2ray)
 struct ShakeSize {
     reader: sha3::Shake128Reader,
 }
@@ -868,7 +868,7 @@ impl ShakeSize {
     }
 }
 
-/// 分块 nonce：counter(2 BE) + iv[2..12]
+/// Chunk nonce: counter(2 BE) + iv[2..12]
 struct ChunkNonce {
     counter: u16,
     iv: [u8; 16],
@@ -888,12 +888,12 @@ impl ChunkNonce {
     }
 }
 
-/// VMess 分块加密流（双向）
+/// VMess chunked encrypted stream (bidirectional)
 pub struct VmessBodyStream {
     inner: Box<dyn crate::AsyncDuplex + Unpin + Send>,
-    /// 数据报模式：每次 poll_write/poll_read 恰好一个数据报分块
+    /// Datagram mode: each poll_write/poll_read exactly one datagram chunk
     packet_mode: bool,
-    /// 写方向
+    /// Write direction
     enc_security: u8,
     enc_key: [u8; 16],
     enc_shake: ShakeSize,
@@ -902,7 +902,7 @@ pub struct VmessBodyStream {
     write_out: Vec<u8>,
     write_pos: usize,
     write_eof_sent: bool,
-    /// 读方向
+    /// Read direction
     dec_security: u8,
     dec_key: [u8; 16],
     dec_shake: ShakeSize,
@@ -923,7 +923,7 @@ impl VmessBodyStream {
         Self::new_with_mode(inner, session, security, false)
     }
 
-    /// 创建数据报模式流（UDP 中继用）：每个分块对应一个数据报。
+    /// Create datagram mode stream (for UDP relay): each chunk corresponds to one datagram.
     fn new_packet_mode(
         inner: Box<dyn crate::AsyncDuplex + Unpin + Send>,
         session: VmessSession,
@@ -974,14 +974,14 @@ impl VmessBodyStream {
 
         if self.enc_security == SEC_NONE {
             out.extend_from_slice(payload);
-            // NONE 安全类型仍有 0 长度 tag？v2ray NoOpAuthenticator Overhead=0
+            // NONE security type still has 0-length tag? v2ray NoOpAuthenticator Overhead=0
         } else {
             let key = chacha_or_aes_key(&self.enc_key, self.enc_chacha);
             let nonce = self.enc_nonce.next();
             let ciphertext = aead_seal(&key, &nonce, payload, self.enc_chacha)?;
             out.extend_from_slice(&ciphertext);
         }
-        // 明文 padding
+        // Plaintext padding
         if padding > 0 {
             let mut pad = vec![0u8; padding];
             get_random(&mut pad);
@@ -999,7 +999,7 @@ impl VmessBodyStream {
         aead_open(&key, &nonce, ciphertext, self.dec_chacha)
     }
 
-    /// 尝试从 inner 读满 need 字节到 read_frame
+    /// Try to read need bytes from inner into read_frame
     fn poll_fill_frame(&mut self, cx: &mut Context<'_>, need: usize) -> Poll<io::Result<()>> {
         while self.read_frame.len() < need {
             let mut buf = vec![0u8; need - self.read_frame.len()];
@@ -1068,7 +1068,7 @@ impl AsyncRead for VmessBodyStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // 先消费已解密的剩余字节
+        // Consume remaining decrypted bytes first
         if self.read_decoded_pos < self.read_decoded.len() {
             let remaining = &self.read_decoded[self.read_decoded_pos..];
             let n = remaining.len().min(buf.remaining());
@@ -1085,7 +1085,7 @@ impl AsyncRead for VmessBodyStream {
         }
 
         loop {
-            // 读 2 字节掩码长度
+            // Read 2-byte mask length
             match self.poll_fill_frame(cx, 2) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -1103,7 +1103,7 @@ impl AsyncRead for VmessBodyStream {
                 return Poll::Ready(Ok(()));
             }
 
-            // padding（先于负载消耗同一条 shake 流）
+            // Padding (consumed from same shake stream before payload)
             let padding = if self.dec_security == SEC_NONE {
                 0
             } else {
@@ -1126,7 +1126,7 @@ impl AsyncRead for VmessBodyStream {
             }
             let chunk: Vec<u8> = self.read_frame.drain(..size as usize).collect();
             let payload = self.open_chunk(&chunk[..encrypted_len])?;
-            // 丢弃 padding（chunk[encrypted_len..]）
+            // Discard padding (chunk[encrypted_len..])
 
             if buf.remaining() >= payload.len() {
                 buf.put_slice(&payload);
@@ -1148,7 +1148,7 @@ impl AsyncWrite for VmessBodyStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // 先发送未完成的分帧输出
+        // Send unfinished framed output first
         if self.write_pos < self.write_out.len() {
             return match self.poll_flush(cx) {
                 Poll::Ready(Ok(())) => Poll::Ready(Ok(0)),
@@ -1160,7 +1160,7 @@ impl AsyncWrite for VmessBodyStream {
             return Poll::Ready(Ok(0));
         }
 
-        // 数据报模式：一次 poll_write = 一个数据报分块（不分片）
+        // Datagram mode: one poll_write = one datagram chunk (no fragmentation)
         let chunk_len = if self.packet_mode {
             if buf.len() > 0xFFF0 {
                 return Poll::Ready(Err(io::Error::other("vmess udp: packet too large")));
@@ -1209,14 +1209,14 @@ impl AsyncWrite for VmessBodyStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // 发送终止分块（掩码长度 0）
+        // Send terminating chunk (mask length 0)
         if !self.write_eof_sent {
             let mask = self.enc_shake.next_mask();
             let eof = mask.to_be_bytes();
             self.write_eof_sent = true;
             match Pin::new(&mut self.inner).poll_write(cx, &eof) {
                 Poll::Pending => {
-                    // 保存待发送字节，下次 poll_shutdown 继续
+                    // Save bytes to send, continue on next poll_shutdown
                     self.write_out = eof.to_vec();
                     self.write_pos = 0;
                     return Poll::Pending;
@@ -1224,17 +1224,17 @@ impl AsyncWrite for VmessBodyStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(_)) => {}
             }
-            // 若部分写入，需处理；这里假设一次性写入成功（2 字节）
+            // If partial write, needs handling; here assumes one-time write succeeds (2 bytes)
         }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
 // ============================================================================
-// TLS 支持（WSS）
+// TLS support (WSS)
 // ============================================================================
 
-/// 创建 TLS connector（与 Trojan 相同的根证书库）
+/// Create TLS connector (same root certificate store as Trojan)
 #[allow(dead_code)]
 fn tls_connector(_sni: &str) -> Result<TlsConnector, VMessError> {
     let mut root_store = RootCertStore::empty();
@@ -1259,10 +1259,10 @@ async fn tls_upgrade(
         .map_err(|e| VMessError::Tls(format!("TLS handshake failed: {}", e)))
 }
 
-/// VMess UDP 中继会话。
+/// VMess UDP relay session.
 ///
-/// 同一 TCP 连接：命令为 UDP（0x02），每个数据报作为一个分块传输：
-/// `[掩码长度][AEAD(ATYP + ADDR + PORT + LEN(2) + PAYLOAD)]`。
+/// Same TCP connection: command is UDP (0x02), each datagram transmitted as a chunk:
+/// `[mask length][AEAD(ATYP + ADDR + PORT + LEN(2) + PAYLOAD)]`.
 pub struct VMessUdpSession {
     stream: tokio::sync::Mutex<VmessBodyStream>,
 }
@@ -1270,7 +1270,7 @@ pub struct VMessUdpSession {
 #[async_trait]
 impl crate::UdpSession for VMessUdpSession {
     async fn send(&self, dest: &std::net::SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
-        // [atyp][addr][port(2)][len(2)][payload] 作为一个分块写入
+        // [atyp][addr][port(2)][len(2)][payload] written as one chunk
         let mut pkt = Vec::with_capacity(1 + 16 + 2 + 2 + payload.len());
         pkt.extend_from_slice(&encode_packet_addr(&dest.ip().to_string(), dest.port()));
         pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -1299,11 +1299,11 @@ impl crate::UdpSession for VMessUdpSession {
 }
 
 // ============================================================================
-// WebSocket 字节流适配器（消息式 → 字节流）
+// WebSocket byte stream adapter (message-based -> byte stream)
 // ============================================================================
 
-/// 将 WebSocket 消息流适配为字节流：读方向拼接 Binary/Text 消息，
-/// 写方向按 Binary 消息发送；自动应答 Ping，Close/None 表示 EOF。
+/// 将 WebSocket 消息流适配为字节流：Read direction拼接 Binary/Text 消息，
+/// Write direction按 Binary 消息发送；自动应答 Ping，Close/None 表示 EOF。
 pub struct WsByteStream<S> {
     ws: tokio_tungstenite::WebSocketStream<S>,
     rx: Vec<u8>,
@@ -1332,7 +1332,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for WsByteStream<S> {
     ) -> Poll<io::Result<()>> {
         use futures_util::StreamExt;
 
-        // 先消费已缓冲的消息负载
+        // Consume buffered message payload first
         if self.rx_pos < self.rx.len() {
             let remaining = &self.rx[self.rx_pos..];
             let n = remaining.len().min(buf.remaining());
@@ -1384,7 +1384,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for WsByteStream<S> {
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(p)))) => {
-                    // 自动应答 Pong
+                    // Auto-reply Pong
                     use futures_util::SinkExt;
                     match self.ws.poll_ready_unpin(cx) {
                         Poll::Pending => return Poll::Pending,
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn test_cmd_key_deterministic() {
-        // v2ray-core 已知向量：uuid 空值 + 盐的 MD5
+        // v2ray-core known vector: uuid empty value + MD5 of salt
         let k1 = cmd_key("00000000-0000-0000-0000-000000000000").unwrap();
         let k2 = cmd_key("00000000-0000-0000-0000-000000000000").unwrap();
         assert_eq!(k1, k2);
@@ -1484,7 +1484,7 @@ mod tests {
     fn test_kdf_chain() {
         let k = kdf16(&[0u8; 16], &[b"a", b"b"]);
         assert_eq!(k.len(), 16);
-        // 确定性
+        // Deterministic
         let k2 = kdf16(&[0u8; 16], &[b"a", b"b"]);
         assert_eq!(k, k2);
     }

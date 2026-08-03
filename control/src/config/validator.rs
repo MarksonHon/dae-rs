@@ -4,7 +4,9 @@
 //! checks after [`crate::config::parser::parse_daefile`] succeeds.
 
 use super::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use crate::ruleset::types::{parse_period, parse_time};
 // ============================================================================
 // Semantic Validator
 // ============================================================================
@@ -54,6 +56,9 @@ pub fn validate_config(config: &DaefileConfig) -> std::result::Result<(), Config
 
     // 9. DNS validation
     validate_dns(config)?;
+
+    // 10. Rule set validation (E2101 / E2104 / E2105)
+    validate_rule_set(config)?;
 
     Ok(())
 }
@@ -497,5 +502,207 @@ fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
         }
     }
 
+    Ok(())
+}
+
+/// Rule set validation (design §5.3 / §8.2).
+///
+/// 1. name uniqueness (including default=block name, parser fills block name into `name`) → E2101;
+///    Naming constraint `[a-zA-Z0-9_-]`, length ≤ 63 → E1203 `InvalidValue`;
+/// 2. URL protocol / `#sha256=` validation → E2105;
+/// 3. `update` missing / invalid time format (includes seconds) / `period` invalid unit → E2104;
+/// 4. reference integrity (`set:`/`geoip:`/`geosite:` in data plane / DNS routing / DNS response Routing)
+///    → E2102（§8.2）。
+///
+/// E2103 (compile-time data missing) triggered by matcher / DNS routing at compile phase.
+fn validate_rule_set(config: &DaefileConfig) -> std::result::Result<(), ConfigError> {
+    let mut seen = HashSet::new();
+    // name → type (for E2102 reference integrity validation)
+    let mut name_to_type: HashMap<String, RuleSetType> = HashMap::new();
+    for entry in &config.rule_set {
+        let name = &entry.name;
+        name_to_type.insert(entry.name.clone(), entry.r#type);
+
+        // Naming constraint: [a-zA-Z0-9_-], length ≤ 63
+        if name.is_empty()
+            || name.len() > 63
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(ConfigError::InvalidValue {
+                line: 0,
+                field: "rule_set.name".into(),
+                message: format!(
+                    "rule set name '{}' violates naming constraint `[a-zA-Z0-9_-]` and length <= 63",
+                    name
+                ),
+            });
+        }
+
+        // E2101: name uniqueness (including default=block name)
+        if !seen.insert(name.as_str()) {
+            return Err(ConfigError::DuplicateRuleSet {
+                name: name.clone(),
+            });
+        }
+
+        // E2105: URL validation
+        validate_rule_set_url(entry)?;
+
+        // E2104: update validation
+        validate_rule_set_update(entry)?;
+    }
+
+    // E2102: reference integrity (data plane / DNS routing / DNS response Routing)
+    validate_ruleset_refs(config, &name_to_type)?;
+
+    Ok(())
+}
+
+/// Ruleset reference extraction regex: `(geoip|geosite|set):<value>`.
+///
+/// value allows `[A-Za-z0-9_!@.\-]` (covering ruleset name naming constraint and geosite category names like
+/// `geolocation-!cn`). Static phase only validates `set:` name integrity and geoip/geosite
+/// entry existence; whether specific code exists in dat data is validated at compile time (E2103).
+static RULESET_REF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+fn ruleset_ref_re() -> &'static regex::Regex {
+    RULESET_REF_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)(geoip|geosite|set):([A-Za-z0-9_!@.\-]+)")
+            .expect("valid ruleset ref regex")
+    })
+}
+
+/// E2102: ruleset reference integrity validation in Routing / DNS routing / DNS response Routing.
+///
+/// - `set:<name>` **must always** hit an entry in `rule_set` (name subject to naming constraint) → otherwise E2102;
+/// - `geoip:<code>` / `geosite:<code>`: **when `rule_set` is configured** at least one
+///   entry of corresponding type → otherwise E2102; when `rule_set` is not configured at all, allow (`geoip:private`
+///   has built-in fallback; whether specific `geosite:`/`geoip:` code exists is validated at compile time E2103).
+fn validate_ruleset_refs(
+    config: &DaefileConfig,
+    name_to_type: &HashMap<String, RuleSetType>,
+) -> std::result::Result<(), ConfigError> {
+    let has_geoip = name_to_type.values().any(|t| *t == RuleSetType::GeoIp);
+    let has_geosite = name_to_type.values().any(|t| *t == RuleSetType::GeoSite);
+    // When rule_set is not configured at all, geoip/geosite entry existence is handled at compile time (E2103)
+    let rule_set_configured = !name_to_type.is_empty();
+
+    let check_expr = |expr: &str| -> std::result::Result<(), ConfigError> {
+        for cap in ruleset_ref_re().captures_iter(expr) {
+            let kind = cap[1].to_ascii_lowercase();
+            let value = cap[2].to_string();
+            match kind.as_str() {
+                "set" => {
+                    if !name_to_type.contains_key(&value) {
+                        return Err(ConfigError::UnknownRuleSetRef {
+                            reference: format!("set:{value}"),
+                        });
+                    }
+                }
+                "geoip" => {
+                    if rule_set_configured && !has_geoip {
+                        return Err(ConfigError::UnknownRuleSetRef {
+                            reference: format!("geoip:{value}"),
+                        });
+                    }
+                }
+                "geosite" => {
+                    if rule_set_configured && !has_geosite {
+                        return Err(ConfigError::UnknownRuleSetRef {
+                            reference: format!("geosite:{value}"),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    };
+
+    // data plane Routing rules
+    for rule in &config.routing.rules {
+        check_expr(&rule.r#match)?;
+    }
+
+    // DNS top-level Routing + intra-group request/response Routing
+    if let Some(dns) = &config.dns {
+        for rule in &dns.routing.rules {
+            check_expr(&rule.r#match)?;
+        }
+        for group in &dns.groups {
+            if let Some(rr) = &group.request_routing {
+                for rule in &rr.rules {
+                    check_expr(&rule.r#match)?;
+                }
+            }
+            if let Some(resp) = &group.response_routing {
+                for rule in &resp.rules {
+                    check_expr(&rule.r#match)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// E2105: URL must start with `http://` / `https://`; `#sha256=` fragment is 64 hex digits.
+fn validate_rule_set_url(entry: &RuleSetConfig) -> std::result::Result<(), ConfigError> {
+    let name = &entry.name;
+    let url = entry.url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(ConfigError::InvalidRuleSetUrl {
+            name: name.clone(),
+            message: format!("url must start with http:// or https://, got: '{}'", entry.url),
+        });
+    }
+    if let Some((_, fragment)) = url.split_once('#') {
+        if let Some(hex) = fragment.strip_prefix("sha256=") {
+            if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConfigError::InvalidRuleSetUrl {
+                    name: name.clone(),
+                    message: format!(
+                        "#sha256= fragment must be a 64-char hex digest, got: '{}'",
+                        hex
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// E2104: `update` missing / invalid time format (includes second-level) / `period` has invalid unit.
+fn validate_rule_set_update(entry: &RuleSetConfig) -> std::result::Result<(), ConfigError> {
+    let name = &entry.name;
+    let update = match &entry.update {
+        Some(u) => u,
+        None => {
+            return Err(ConfigError::InvalidRuleSetUpdate {
+                name: name.clone(),
+                message: "missing `update` (provide exactly one of `time: HH:MM` or `period: 3h2m`)"
+                    .into(),
+            });
+        }
+    };
+    match update {
+        RuleSetUpdate::Time(t) => {
+            if let Err(e) = parse_time(t) {
+                return Err(ConfigError::InvalidRuleSetUpdate {
+                    name: name.clone(),
+                    message: e,
+                });
+            }
+        }
+        RuleSetUpdate::Period(p) => {
+            if let Err(e) = parse_period(p) {
+                return Err(ConfigError::InvalidRuleSetUpdate {
+                    name: name.clone(),
+                    message: e,
+                });
+            }
+        }
+    }
     Ok(())
 }

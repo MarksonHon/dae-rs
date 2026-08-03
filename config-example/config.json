@@ -189,8 +189,61 @@
       }
     ]
   },
+  "rule_set": {
+    "geoip_main": {
+      "type": "geoip",
+      "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+      "name": "geoip_main",
+      "update": {
+        "time": "21:47"
+      },
+      "update_on_start": true
+    },
+    "geosite_main": {
+      "type": "geosite",
+      "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+      "name": "geosite_main",
+      "update": {
+        "period": "3h2m"
+      }
+    },
+    "chinadomain": {
+      "type": "domain_list",
+      "url": "https://example.com/rules/chinadomain.txt",
+      "name": "chinadomain",
+      "update": {
+        "time": "04:30"
+      },
+      "update_on_start": false
+    },
+    "chinaip": {
+      "type": "ip_list",
+      "url": "https://example.com/rules/chinaip.txt",
+      "name": "chinaip",
+      "update": {
+        "period": "1d"
+      },
+      "proxy": "proxy_primary"
+    }
+  },
   "routing": {
     "rules": [
+      {
+        "match": "source_ip(set:chinaip)",
+        "action": "direct"
+      },
+      {
+        "match": "target_ip(geoip:cn)",
+        "action": "direct"
+      },
+      {
+        "match": "target_domain(geosite:cn)",
+        "action": "direct"
+      },
+      {
+        "match": "target_domain(set:chinadomain)",
+        "action": "direct"
+      },
       {
         "match": "dip(geoip:private)",
         "action": "direct"
@@ -198,6 +251,10 @@
       {
         "match": "dport(22)",
         "action": "direct"
+      },
+      {
+        "match": "dport(80,443) && !target_ip(geoip:private)",
+        "action": "proxy(proxy_primary)"
       },
       {
         "match": "l4proto(tcp)",
@@ -256,6 +313,10 @@
             {
               "match": "ip(geoip:private) && !qname(geosite:cn)",
               "action": "googledns"
+            },
+            {
+              "match": "ip(set:chinaip)",
+              "action": "googledns"
             }
           ],
           "fallback": "accept"
@@ -284,6 +345,10 @@
       "rules": [
         {
           "match": "qname(geosite:cn)",
+          "action": "china_dns"
+        },
+        {
+          "match": "qname(set:chinadomain)",
           "action": "china_dns"
         },
         {

@@ -1,10 +1,10 @@
-//! SOCKS5 协议拨号器
+//! SOCKS5 协议Dialer
 //!
-//! 实现 SOCKS5 出站代理协议，支持：
-//! - 无认证（No Authentication）
-//! - 用户名/密码认证（Username/Password Authentication）
-//! - TCP 流式连接
-//! - UDP ASSOCIATE（UDP 中继）
+//! Implements the SOCKS5 outbound proxy protocol, supporting:
+//! - No Authentication
+//! - Username/Password Authentication
+//! - TCP stream connection
+//! - UDP ASSOCIATE (UDP relay)
 
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -18,61 +18,61 @@ use tokio::sync::Mutex;
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// SOCKS5 拨号器错误
+/// SOCKS5 Dialer错误
 #[derive(Debug, thiserror::Error)]
 pub enum Socks5Error {
-    /// 连接超时
+    /// Connection timeout
     #[error("SOCKS5 dial timeout: {0}")]
     Timeout(String),
-    /// 连接被拒绝
+    /// Connection refused
     #[error("SOCKS5 connection refused: {0}")]
     ConnectionRefused(String),
-    /// 认证失败
+    /// Authentication failed
     #[error("SOCKS5 authentication failed: {0}")]
     AuthFailed(String),
-    /// 协议错误
+    /// Protocol error
     #[error("SOCKS5 protocol error: {0}")]
     ProtocolError(String),
-    /// IO 错误
+    /// IO error
     #[error("SOCKS5 IO error: {0}")]
     Io(#[from] std::io::Error),
-    /// 其他错误
+    /// Other error
     #[error("SOCKS5 error: {0}")]
     Other(String),
 }
 
-/// SOCKS5 拨号器
+/// SOCKS5 Dialer
 ///
-/// 负责与 SOCKS5 上游服务器建立连接并转发流量。
-/// 自动设置 SO_MARK=self_mark 以防止 eBPF 拦截自身流量。
+/// Responsible for establishing connections with SOCKS5 upstream servers and forwarding traffic.
+/// Automatically sets SO_MARK=self_mark to prevent eBPF from intercepting self-traffic.
 pub struct Socks5Dialer {
-    /// 上游 SOCKS5 代理服务器地址
+    /// Upstream SOCKS5 proxy server address
     pub proxy_addr: SocketAddr,
-    /// 拨号超时时间
+    /// Dial timeout duration
     pub dial_timeout: Duration,
-    /// 认证用户名（空字符串表示无需认证）
+    /// Authentication username (empty string means no authentication required)
     pub username: String,
-    /// 认证密码
+    /// Authentication password
     pub password: String,
-    /// fwmark 用于 eBPF 自排除（0 表示不设置）
+    /// fwmark for eBPF self-exclusion (0 means not set)
     pub self_mark: u32,
-    /// 宿主网络命名空间 fd。
+    /// Host network namespace fd.
     ///
-    /// 设置后，所有上行 socket（到 SOCKS5 代理的 TCP 连接、UDP ASSOCIATE 的
-    /// UDP socket）都在宿主 NS 中创建并发出（与 kdae 对齐），源地址为宿主真实
-    /// WAN 地址而非 daens 内部地址 `169.254.0.11`。`None` 表示在当前命名空间
-    /// 中创建（默认行为，单机直接使用场景）。
+    /// After setting, all upstream sockets (TCP connections to SOCKS5 proxy, UDP ASSOCIATE
+    /// UDP sockets) are created and issued in the host NS (aligned with kdae), source address is the host real
+    /// WAN address instead of daens internal address `169.254.0.11`. `None` means create in the current namespace
+    /// (default behavior, direct use scenario).
     pub host_ns_fd: Option<RawFd>,
 }
 
 impl Socks5Dialer {
-    /// 创建新的 SOCKS5 拨号器
+    /// 创建新的 SOCKS5 Dialer
     ///
-    /// # 参数
-    /// * `proxy_addr` - 上游 SOCKS5 代理服务器地址
-    /// * `username` - 认证用户名（空字符串表示无需认证）
-    /// * `password` - 认证密码
-    /// * `dial_timeout_ms` - 拨号超时时间（毫秒）
+    /// # Parameters
+    /// * `proxy_addr` - Upstream SOCKS5 proxy server address
+    /// * `username` - Authentication username (empty string means no authentication required)
+    /// * `password` - Authentication password
+    /// * `dial_timeout_ms` - Dial timeout时间（毫秒）
     pub fn new(
         proxy_addr: SocketAddr,
         username: impl Into<String>,
@@ -107,10 +107,10 @@ impl Socks5Dialer {
         }
     }
 
-    /// 设置宿主网络命名空间 fd。
+    /// Set host network namespace fd.
     ///
-    /// 设置后，上行 socket 将在宿主 NS 中创建（与 kdae 对齐），
-    /// 使得源地址为宿主真实 WAN 地址而非 daens 内部地址。
+    /// After setting, upstream sockets will be created in the host NS (aligned with kdae),
+    /// making the source address the host real WAN address instead of daens internal address.
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
@@ -126,7 +126,7 @@ impl Socks5Dialer {
     /// source address is the host's real WAN address instead of the daens
     /// internal address `169.254.0.11`. This matches kdae's behavior.
     async fn connect_with_mark(&self) -> Result<TcpStream, Socks5Error> {
-        // 统一的宿主 NS 感知 TCP 连接（SO_MARK + IP_TRANSPARENT + host NS）。
+        // Unified host NS-aware TCP connection (SO_MARK + IP_TRANSPARENT + host NS).
         crate::hostns::connect_tcp(
             self.proxy_addr,
             &crate::hostns::DirectSocket {
@@ -146,25 +146,25 @@ impl Socks5Dialer {
         })
     }
 
-    /// 执行 SOCKS5 握手
+    /// Execute SOCKS5 handshake
     ///
-    /// 包括：
-    /// 1. 协商认证方式
-    /// 2. 认证（如果要求）
-    /// 3. 发送连接请求
+    /// Includes:
+    /// 1. Negotiate authentication method
+    /// 2. Authenticate (if required)
+    /// 3. Send connection request
     async fn handshake(&self, stream: &mut TcpStream, target: &str) -> Result<(), Socks5Error> {
-        // 步骤 1：协商认证方式
-        // 发送：版本 + 支持的认证方法数量 + 方法列表
+        // Step 1: Negotiate authentication method
+        // Send: version + number of supported authentication methods + method list
         let methods: Vec<u8> = if self.username.is_empty() {
-            // 仅支持无认证（0x00）
+            // Only no authentication supported (0x00)
             vec![0x05, 0x01, 0x00]
         } else {
-            // 支持无认证（0x00）和用户名密码认证（0x02）
+            // Support no authentication (0x00) and username/password authentication (0x02)
             vec![0x05, 0x02, 0x00, 0x02]
         };
         stream.write_all(&methods).await?;
 
-        // 读取服务器选择的认证方法
+        // Read the authentication method selected by the server
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
 
@@ -174,10 +174,10 @@ impl Socks5Dialer {
 
         match response[1] {
             0x00 => {
-                // 无认证，继续
+                // No authentication, continue
             }
             0x02 => {
-                // 用户名/密码认证
+                // Username/password authentication
                 if self.username.is_empty() {
                     return Err(Socks5Error::AuthFailed(
                         "server requires auth but no credentials provided".into(),
@@ -198,24 +198,24 @@ impl Socks5Dialer {
             }
         }
 
-        // 步骤 2：发送连接请求
-        // 解析目标地址（支持域名和 IP）
-        // 注意: target 格式为 "host:port"，IPv6 为 "[::1]:80"
+        // Step 2: Send connection request
+        // Parse target address (supports domain names and IP)
+        // Note: target format is "host:port", IPv6 is "[::1]:80"
         let port = parse_port_from_target(target)?;
         let host = parse_host_from_target(target);
 
-        // 构建连接请求
+        // Build connection request
         let mut request = Vec::with_capacity(256);
         request.push(0x05); // SOCKS5 版本
         request.push(0x01); // CONNECT 命令
         request.push(0x00); // 保留位
 
-        // 尝试解析为 IPv4 地址
+        // Try to parse as IPv4 address
         if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
             request.push(0x01); // IPv4 地址类型
             request.extend_from_slice(&ip.octets());
         }
-        // 尝试解析为 IPv6 地址（需去除方括号）
+        // Try to parse as IPv6 address (need to remove brackets)
         else if let Ok(ip) = host
             .trim_start_matches('[')
             .trim_end_matches(']')
@@ -224,7 +224,7 @@ impl Socks5Dialer {
             request.push(0x04); // IPv6 地址类型
             request.extend_from_slice(&ip.octets());
         }
-        // 否则以域名方式发送
+        // Otherwise send as domain name
         else {
             request.push(0x03); // 域名类型
             let host_bytes = host.as_bytes();
@@ -237,12 +237,12 @@ impl Socks5Dialer {
             request.extend_from_slice(host_bytes);
         }
 
-        // 端口（网络字节序）
+        // Port (network byte order)
         request.extend_from_slice(&port.to_be_bytes());
 
         stream.write_all(&request).await?;
 
-        // 读取连接响应
+        // Read connection response
         let mut reply = [0u8; 4];
         stream.read_exact(&mut reply).await?;
 
@@ -254,13 +254,13 @@ impl Socks5Dialer {
 
         match reply[1] {
             0x00 => {
-                // 成功，读取剩余地址信息
+                // Success, read remaining address info
                 let addr_type = reply[3];
                 let addr_len = match addr_type {
                     0x01 => 4,  // IPv4
                     0x04 => 16, // IPv6
                     0x03 => {
-                        // 域名
+                        // Domain name
                         let mut len_buf = [0u8; 1];
                         stream.read_exact(&mut len_buf).await?;
                         len_buf[0] as usize
@@ -737,11 +737,11 @@ fn parse_host_from_target(target: &str) -> &str {
 
 #[async_trait]
 impl OutboundDialer for Socks5Dialer {
-    /// 通过 SOCKS5 代理拨号到目标地址
+    /// Dial to target address through SOCKS5 proxy
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
         let mut stream = self.connect_with_mark().await?;
 
-        // 执行 SOCKS5 握手
+        // Execute SOCKS5 handshake
         self.handshake(&mut stream, target)
             .await
             .map_err(|e| anyhow::anyhow!("SOCKS5 handshake failed: {}", e))?;
@@ -749,13 +749,13 @@ impl OutboundDialer for Socks5Dialer {
         ProxyConn::new_tcp(stream).map_err(Into::into)
     }
 
-    /// 建立 SOCKS5 UDP ASSOCIATE 会话
+    /// Establish SOCKS5 UDP ASSOCIATE session
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
         let session = self.udp_associate().await?;
         Ok(Box::new(SocksUdpSession { session }))
     }
 
-    /// 返回协议名称
+    /// Return protocol name
     fn protocol_name(&self) -> &'static str {
         "socks5"
     }
@@ -768,10 +768,10 @@ impl OutboundDialer for Socks5Dialer {
     }
 }
 
-/// SOCKS5 UDP ASSOCIATE 会话的 `UdpSession` 适配。
+/// SOCKS5 UDP ASSOCIATE session `UdpSession` adapter.
 ///
-/// 发送：SOCKS5 UDP 请求头（RSV/FRAG/ATYP/ADDR/PORT）+ payload。
-/// 接收：解析 SOCKS5 UDP 响应头，返回原始目标地址 + payload。
+/// Send: SOCKS5 UDP request header (RSV/FRAG/ATYP/ADDR/PORT) + payload.
+/// Receive: parse SOCKS5 UDP response header, return original target address + payload.
 pub struct SocksUdpSession {
     session: UdpAssociateSession,
 }
@@ -794,12 +794,12 @@ impl crate::UdpSession for SocksUdpSession {
             {
                 return Ok((dest, buf[offset..len].to_vec()));
             }
-            // 非 SOCKS5 UDP 数据包（如碎片），忽略重试
+            // Non-SOCKS5 UDP packets (like fragments), ignore and retry
         }
     }
 }
 
-/// SOCKS5 UDP 数据包最大尺寸
+/// SOCKS5 UDP packet maximum size
 const MAX_UDP_PACKET_SIZE: usize = 65535;
 
 #[cfg(test)]

@@ -1,12 +1,12 @@
-//! TUIC v5 协议拨号器（基于 QUIC）
+//! TUIC v5 协议Dialer（基于 QUIC）
 //!
-//! 实现 TUIC v5 出站代理协议：
-//! - QUIC 传输（quinn + rustls，ALPN `tuic-v5`，0-RTT 早期数据）
-//! - `Authenticate` 命令：UUID + RFC 5705 Keying Material Exporter token
-//! - `Connect` 命令：双向流上多路复用 TCP 连接
-//! - BBR 拥塞控制
+//! Implements TUIC v5 outbound proxy protocol:
+//! - QUIC transport (quinn + rustls, ALPN `tuic-v5`, 0-RTT early data)
+//! - `Authenticate` command: UUID + RFC 5705 Keying Material Exporter token
+//! - `Connect` command: multiplexed TCP connections over bidirectional streams
+//! - BBR congestion control
 //!
-//! 参考: https://github.com/tuic-protocol/tuic/blob/master/SPEC.md
+//! Reference: https://github.com/tuic-protocol/tuic/blob/master/SPEC.md
 
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -25,16 +25,16 @@ use tokio::time::timeout;
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// TUIC 协议版本
+/// TUIC protocol version
 const TUIC_VERSION: u8 = 0x05;
-/// 命令类型
+/// Command type
 const CMD_AUTHENTICATE: u8 = 0x00;
 const CMD_CONNECT: u8 = 0x01;
 const CMD_PACKET: u8 = 0x02;
 /// ALPN
 const TUIC_ALPN: &[u8] = b"tuic-v5";
 
-/// TUIC 拨号器错误
+/// TUIC Dialer错误
 #[derive(Debug, thiserror::Error)]
 pub enum TuicError {
     #[error("TUIC dial timeout: {0}")]
@@ -53,33 +53,33 @@ pub enum TuicError {
     Other(String),
 }
 
-/// TUIC v5 拨号器
+/// TUIC v5 Dialer
 pub struct TuicDialer {
-    /// 上游 TUIC 服务器地址
+    /// Upstream TUIC server address
     pub proxy_addr: SocketAddr,
-    /// 拨号超时时间
+    /// Dial timeout duration
     pub dial_timeout: Duration,
-    /// 用户 UUID
+    /// User UUID
     pub uuid: String,
-    /// 认证密码
+    /// Authentication password
     pub password: String,
-    /// 拥塞控制算法
+    /// Congestion control algorithm
     pub congestion_control: String,
-    /// ALPN 协议列表
+    /// ALPN protocol list
     pub alpn: Vec<String>,
     /// TLS SNI
     pub sni: String,
-    /// 证书 SHA256 指纹
+    /// Certificate SHA256 fingerprint
     pub ca_sha256: Option<String>,
-    /// fwmark 用于 eBPF 自排除
+    /// fwmark for eBPF self-exclusion
     pub self_mark: u32,
-    /// 宿主网络命名空间 fd
+    /// Host network namespace fd
     pub host_ns_fd: Option<RawFd>,
-    /// 懒创建的 QUIC endpoint + 连接（TUIC 连接可复用，多路复用流）
+    /// Lazily created QUIC endpoint + connection (TUIC connections can be reused, multiplexing streams)
     state: Mutex<Option<QuinnConnection>>,
 }
 
-/// QUIC 连接状态（endpoint 保持存活，连接惰性建立）
+/// QUIC connection state (endpoint kept alive, connection lazily established)
 struct QuinnConnection {
     #[allow(dead_code)]
     endpoint: QuinnEndpoint,
@@ -88,7 +88,7 @@ struct QuinnConnection {
 }
 
 impl TuicDialer {
-    /// 创建新的 TUIC 拨号器
+    /// 创建新的 TUIC Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         uuid: impl Into<String>,
@@ -110,43 +110,43 @@ impl TuicDialer {
         }
     }
 
-    /// 设置拥塞控制算法
+    /// Set Congestion control algorithm
     pub fn set_congestion_control(&mut self, cc: impl Into<String>) -> &mut Self {
         self.congestion_control = cc.into();
         self
     }
 
-    /// 设置 ALPN 协议
+    /// Set ALPN protocol
     pub fn set_alpn(&mut self, alpn: Vec<String>) -> &mut Self {
         self.alpn = alpn;
         self
     }
 
-    /// 设置 SNI
+    /// Set SNI
     pub fn set_sni(&mut self, sni: impl Into<String>) -> &mut Self {
         self.sni = sni.into();
         self
     }
 
-    /// 设置证书 SHA256 指纹
+    /// Set certificate SHA256 fingerprint
     pub fn set_ca_sha256(&mut self, ca_sha256: Option<String>) -> &mut Self {
         self.ca_sha256 = ca_sha256;
         self
     }
 
-    /// 设置 fwmark 用于 eBPF 自排除（0 表示不设置）
+    /// Set fwmark for eBPF self-exclusion (0 means not set)
     pub fn set_self_mark(&mut self, self_mark: u32) -> &mut Self {
         self.self_mark = self_mark;
         self
     }
 
-    /// 设置宿主网络命名空间 fd
+    /// Set host network namespace fd
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
     }
 
-    /// 建立 QUIC 连接（0-RTT；已存在则复用）
+    /// Establish QUIC connection (0-RTT; reuse if already exists)
     async fn ensure_connection(&self) -> Result<quinn::Connection, TuicError> {
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.as_ref() {
@@ -155,13 +155,13 @@ impl TuicDialer {
             }
         }
 
-        // ---- 构造 rustls ClientConfig ----
+        // ---- Construct rustls ClientConfig ----
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut crypto = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        // TUIC 必须使用 TLS 1.3
+        // TUIC must use TLS 1.3
         crypto.alpn_protocols = if self.alpn.is_empty() {
             vec![TUIC_ALPN.to_vec()]
         } else {
@@ -179,7 +179,7 @@ impl TuicDialer {
             .max_concurrent_bidi_streams(1024u32.into())
             .max_concurrent_uni_streams(1024u32.into())
             .max_idle_timeout(None);
-        // 允许 datagram（Heartbeat）
+        // Allow datagram (Heartbeat)
         tp_cfg.datagram_receive_buffer_size(Some(1024 * 1024));
         tp_cfg.datagram_send_buffer_size(1024 * 1024);
         match self.congestion_control.as_str() {
@@ -193,7 +193,7 @@ impl TuicDialer {
         };
         config.transport_config(Arc::new(tp_cfg));
 
-        // ---- Endpoint（UDP socket 在宿主 NS 中创建）----
+        // ---- Endpoint (UDP socket created in host NS) ----
         let socket = crate::hostns::create_udp(
             self.proxy_addr,
             &crate::hostns::DirectSocket {
@@ -237,11 +237,11 @@ impl TuicDialer {
         Ok(conn)
     }
 
-    /// 发送 Authenticate 命令（UUID + RFC 5705 exporter token）
+    /// Send Authenticate command (UUID + RFC 5705 exporter token)
     async fn authenticate(&self, conn: &quinn::Connection) -> Result<(), TuicError> {
         let uuid = parse_uuid(&self.uuid)?;
 
-        // RFC 5705 Keying Material Exporter：label = UUID，context = 密码
+        // RFC 5705 Keying Material Exporter：label = UUID，context = Password
         let mut token = [0u8; 32];
         conn.export_keying_material(&mut token, &uuid, self.password.as_bytes())
             .map_err(|e| TuicError::Quic(format!("key exporter failed: {:?}", e)))?;
@@ -265,7 +265,7 @@ impl TuicDialer {
     }
 }
 
-/// 编码 TUIC 目标地址：TYPE(1) + ADDR + PORT(2)
+/// Encode TUIC target address: TYPE(1) + ADDR + PORT(2)
 fn encode_tuic_address(target: &str) -> Result<Vec<u8>, TuicError> {
     let (mut host, port) = target
         .rsplit_once(':')
@@ -311,7 +311,7 @@ fn parse_uuid(uuid: &str) -> Result<[u8; 16], TuicError> {
     Ok(out)
 }
 
-/// QUIC 双向流双工适配（tokio AsyncRead/AsyncWrite）
+/// QUIC bidirectional stream duplex adapter (tokio AsyncRead/AsyncWrite)
 pub struct QuicStreamDuplex {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -356,10 +356,10 @@ impl AsyncWrite for QuicStreamDuplex {
 #[async_trait]
 impl OutboundDialer for TuicDialer {
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
-        // 1. 建立（或复用）QUIC 连接
+        // 1. Establish (or reuse) QUIC connection
         let conn = self.ensure_connection().await?;
 
-        // 2. 首次连接发送 Authenticate（可与 Connect 并行，这里简单串行）
+        // 2. Send Authenticate on first connection (can be parallel with Connect, here simple serial)
         {
             let mut guard = self.state.lock().await;
             if let Some(state) = guard.as_mut() {
@@ -370,7 +370,7 @@ impl OutboundDialer for TuicDialer {
             }
         }
 
-        // 3. 打开双向流并发送 Connect 命令
+        // 3. Open bidirectional stream and send Connect command
         let (send, recv) = conn
             .open_bi()
             .await
@@ -387,14 +387,14 @@ impl OutboundDialer for TuicDialer {
         Ok(ProxyConn::new_boxed(Box::new(QuicStreamDuplex::new(send, recv))))
     }
 
-    /// 建立 TUIC UDP 中继会话（quic 模式：每个 Packet 走 unidirectional stream）。
+    /// Establish TUIC UDP relay session (quic mode: each Packet goes over unidirectional stream).
     ///
-    /// 全锥形 NAT：assoc_id 标识服务端 UDP socket，响应经 accept_uni 回传，
-    /// 由后台任务解析后转发到通道。
+    /// Full-cone NAT: assoc_id identifies server UDP socket, response returned via accept_uni,
+    /// parsed by background task and forwarded to channel.
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
         let conn = self.ensure_connection().await?;
 
-        // 首次连接时发送 Authenticate
+        // Send Authenticate on first connection
         {
             let mut guard = self.state.lock().await;
             if let Some(state) = guard.as_mut() {
@@ -408,7 +408,7 @@ impl OutboundDialer for TuicDialer {
         let assoc_id = rand_assoc_id();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // 后台任务：接收服务端 Packet 命令（unidirectional stream）
+        // Background task: receive server Packet commands (unidirectional stream)
         let conn2 = conn.clone();
         tokio::spawn(async move {
             loop {
@@ -448,7 +448,7 @@ impl OutboundDialer for TuicDialer {
     }
 }
 
-/// TUIC UDP 中继会话（全锥形，quic 模式）。
+/// TUIC UDP relay session (full-cone, quic mode).
 pub struct TuicUdpSession {
     conn: quinn::Connection,
     assoc_id: u16,
@@ -456,17 +456,17 @@ pub struct TuicUdpSession {
     rx: UdpRx,
 }
 
-/// 后台任务 → 会话的响应通道
+/// Background task -> session response channel
 type UdpRx = std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>>;
 
-/// 生成递增 assoc_id
+/// Generate incrementing assoc_id
 fn rand_assoc_id() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static COUNTER: AtomicU16 = AtomicU16::new(0);
     COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(0xBEEF)
 }
 
-/// 编码 TUIC 地址：TYPE + ADDR + PORT
+/// Encode TUIC address: TYPE + ADDR + PORT
 fn encode_tuic_addr(host: &str, port: u16) -> Vec<u8> {
     let mut addr = Vec::with_capacity(1 + 16 + 2);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
@@ -487,9 +487,9 @@ fn encode_tuic_addr(host: &str, port: u16) -> Vec<u8> {
     addr
 }
 
-/// 从 unidirectional stream 解析 Packet 命令（第 2 字节必须是 Packet 类型）。
+/// Parse Packet command from unidirectional stream (byte 2 must be Packet type).
 ///
-/// 返回 `(dest, payload)`；非 Packet 命令返回 None。
+/// Return `(dest, payload)`; non-Packet command returns None.
 async fn parse_packet_command(
     recv: &mut quinn::RecvStream,
 ) -> anyhow::Result<Option<(SocketAddr, Vec<u8>)>> {
@@ -504,7 +504,7 @@ async fn parse_packet_command(
     recv.read_exact(&mut meta).await?;
     let size = u16::from_be_bytes([meta[6], meta[7]]) as usize;
 
-    // 地址：TYPE(1) + ADDR + PORT(2)
+    // Address: TYPE(1) + ADDR + PORT(2)
     let mut typ = [0u8; 1];
     recv.read_exact(&mut typ).await?;
     let dest = match typ[0] {

@@ -54,6 +54,11 @@ enum ParseState {
     DnsGroupRequestRouting(String), // group_name
     /// Inside dns group > response_routing block
     DnsGroupResponseRouting(String), // group_name
+    // ── Rule set states ──
+    /// Inside rule_set section
+    RuleSet,
+    /// Inside a specific rule set entry block
+    RuleSetEntry(String), // entry_name
 }
 /// Parse daefile text into [`DaefileConfig`]
 ///
@@ -128,6 +133,17 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
     let mut current_dns_resp_rules: Vec<DnsResponseRule> = Vec::new();
     let mut current_dns_resp_fallback = String::new();
 
+    // Rule set section parsing temporary variables
+    let mut current_rule_set = RuleSetConfig {
+        name: String::new(),
+        r#type: RuleSetType::GeoIp,
+        url: String::new(),
+        expected_sha256: None,
+        update: None,
+        update_on_start: false,
+        proxy: None,
+    };
+
     // Preprocess: merge continuation lines (lines ending with `\`)
     let preprocessed = preprocess_multiline(input);
 
@@ -156,6 +172,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                             current_dns_config = Some(DnsConfig::default());
                             state = ParseState::Dns;
                         }
+                        "rule_set" => state = ParseState::RuleSet,
                         _ => {
                             return Err(ConfigError::UnknownSection {
                                 line: line_number,
@@ -245,7 +262,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 if line.starts_with("match") && line.contains('{') {
                     state_stack.push(ParseState::ProcessExclusion);
                     state = ParseState::ProcessMatch;
-                    // match { 可能在同一行或跨行
+                    // match { may be on same line or across lines
                     let after_brace = line.trim_start_matches("match").trim();
                     if after_brace == "{" {
                         // Multi-line, wait for next line content
@@ -426,7 +443,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     continue;
                 }
 
-                // 解析键值对
+                // parse key-value pairs
                 parse_kv_pair(line, line_number, |key, value| {
                     if current_node_has_import {
                         return Err(ConfigError::ImportConflict {
@@ -776,7 +793,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     match section_name {
                         "upstream" => {
                             // Enter upstream sub-block: push current state and stay.
-                            // 清空 Default 预置的 bootstrap，避免与解析出的条目重复。
+                            // Clear default-preset bootstrap to avoid duplication with parsed entries.
                             if let Some(ref mut dns) = current_dns_config {
                                 dns.starting_dns.upstream.clear();
                             }
@@ -1082,6 +1099,138 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     line: line_number,
                     message: format!("expected response routing rule or fallback, got: '{}'", line),
                 });
+            }
+
+            // ── rule_set (top-level) ──
+            ParseState::RuleSet => {
+                if line == "}" {
+                    state = ParseState::Top;
+                    continue;
+                }
+                // Entry declaration: entry_name {
+                if let Some(name) = line.strip_suffix('{').map(|s| s.trim()) {
+                    if !name.is_empty() && !name.contains(' ') {
+                        current_rule_set = RuleSetConfig {
+                            name: name.to_string(),
+                            r#type: RuleSetType::GeoIp,
+                            url: String::new(),
+                            expected_sha256: None,
+                            update: None,
+                            update_on_start: false,
+                            proxy: None,
+                        };
+                        state = ParseState::RuleSetEntry(name.to_string());
+                        continue;
+                    }
+                }
+                return Err(ConfigError::Syntax {
+                    line: line_number,
+                    message: format!(
+                        "expected rule set entry declaration (e.g. `geoip_main {{`), got: '{}'",
+                        line
+                    ),
+                });
+            }
+
+            // ── rule_set > entry_name ──
+            ParseState::RuleSetEntry(entry_name) => {
+                if line == "}" {
+                    // Finalize entry and push to config
+                    let entry = std::mem::replace(
+                        &mut current_rule_set,
+                        RuleSetConfig {
+                            name: String::new(),
+                            r#type: RuleSetType::GeoIp,
+                            url: String::new(),
+                            expected_sha256: None,
+                            update: None,
+                            update_on_start: false,
+                            proxy: None,
+                        },
+                    );
+                    config.rule_set.push(entry);
+                    state = ParseState::RuleSet;
+                    continue;
+                }
+
+                parse_kv_pair(line, line_number, |key, value| {
+                    match key {
+                        "type" => {
+                            let v = unquote(value);
+                            current_rule_set.r#type = match v {
+                                "geoip" => RuleSetType::GeoIp,
+                                "geosite" => RuleSetType::GeoSite,
+                                "domain_list" => RuleSetType::DomainList,
+                                "ip_list" => RuleSetType::IpList,
+                                _ => {
+                                    return Err(ConfigError::InvalidValue {
+                                        line: line_number,
+                                        field: format!("rule_set.{}.type", entry_name),
+                                        message: format!(
+                                            "unknown rule set type '{}', expected geoip/geosite/domain_list/ip_list",
+                                            v
+                                        ),
+                                    });
+                                }
+                            };
+                        }
+                        "url" => {
+                            let url = unquote(value).to_string();
+                            // Extract expected checksum from url#sha256= fragment (consistent with JSON path)
+                            current_rule_set.expected_sha256 =
+                                RuleSetConfig::expected_sha256_from_url(&url);
+                            current_rule_set.url = url;
+                        }
+                        "name" => {
+                            current_rule_set.name = unquote(value).to_string();
+                        }
+                        "update" => {
+                            if current_rule_set.update.is_some() {
+                                return Err(ConfigError::Syntax {
+                                    line: line_number,
+                                    message: format!(
+                                        "rule_set '{}' update already set: `time` and `period` are mutually exclusive",
+                                        entry_name
+                                    ),
+                                });
+                            }
+                            let v = value.trim();
+                            if let Some(t) = v.strip_prefix("time:") {
+                                current_rule_set.update =
+                                    Some(RuleSetUpdate::Time(t.trim().to_string()));
+                            } else if let Some(p) = v.strip_prefix("period:") {
+                                current_rule_set.update =
+                                    Some(RuleSetUpdate::Period(p.trim().to_string()));
+                            } else {
+                                return Err(ConfigError::Syntax {
+                                    line: line_number,
+                                    message: format!(
+                                        "rule_set '{}' update expected `time: HH:MM` or `period: 3h2m`, got: '{}'",
+                                        entry_name, v
+                                    ),
+                                });
+                            }
+                        }
+                        "update_on_start" => {
+                            current_rule_set.update_on_start =
+                                parse_bool(value).map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as boolean: '{}'", value),
+                                })?;
+                        }
+                        "proxy" => {
+                            current_rule_set.proxy = Some(unquote(value).to_string());
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown rule set field: '{}'", key),
+                            });
+                        }
+                    }
+                    Ok(())
+                })?;
             }
         }
     }

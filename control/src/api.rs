@@ -1,20 +1,20 @@
-//! REST API 控制接口
+//! REST API control interface
 //!
-//! 本模块实现基于 Axum 的 REST API 服务器，提供对 dae-rs 控制面的
-//! HTTP 管理接口。所有请求需通过 Bearer Token 认证。
+//! This module implements an Axum-based REST API server providing the dae-rs control plane's
+//! HTTP management interface. All requests require Bearer Token authentication.
 //!
-//! # 架构
+//! # Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────┐
 //! │                    ApiServer                         │
 //! │                                                     │
 //! │  ┌──────────────┐  ┌────────────────────────────┐   │
-//! │  │  中间件栈     │  │  路由表                    │   │
+//! │  │  Middleware stack     │  │  Router table                    │   │
 //! │  │              │  │                            │   │
-//! │  │ · 认证       │  │ GET  /api/v1/status        │   │
+//! │  │ · Auth         │  │ GET  /api/v1/status        │   │
 //! │  │ · CORS       │  │ GET  /api/v1/metrics       │   │
-//! │  │ · 日志       │  │ GET  /api/v1/nodes         │   │
+//! │  │ · Logging      │  │ GET  /api/v1/nodes         │   │
 //! │  │              │  │ GET  /api/v1/nodes/{name}  │   │
 //! │  │              │  │ GET  /api/v1/groups        │   │
 //! │  │              │  │ GET  /api/v1/groups/{name} │   │
@@ -44,25 +44,25 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 // ============================================================================
-// API 状态与配置
+// API status and configuration
 // ============================================================================
 
-/// API 服务器共享状态
+/// API server shared state
 ///
-/// 通过 Axum 的 State 提取器注入到每个 handler 中。
+/// Injected into each handler via Axum's State extractor.
 pub struct ApiState {
-    /// 控制面引用
+    /// Control plane reference
     pub control: Arc<RwLock<ControlPlane>>,
-    /// API 配置
+    /// API configuration
     pub config: ApiConfig,
-    /// 服务器启动时间（用于计算 uptime）
+    /// Server startup time (for calculating uptime)
     pub start_time: std::time::Instant,
 }
 
-/// Axum 路由器持有状态（用于 State 提取器）
+/// Axum Router holds state (for State extractor)
 #[derive(Clone)]
 struct AppState {
-    /// API 状态，包在 Arc 中以便跨线程共享
+    /// API state, wrapped in Arc for cross-thread sharing
     inner: Arc<ApiState>,
 }
 
@@ -70,11 +70,11 @@ struct AppState {
 // ApiServer
 // ============================================================================
 
-/// REST API 服务器
+/// REST API server
 ///
-/// 封装了 Axum 应用和监听地址，提供统一的启停接口。
+/// Encapsulates Axum application and listen address, providing unified start/stop interface.
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```no_run
 /// use control::api::{ApiServer, ApiState};
@@ -100,41 +100,41 @@ struct AppState {
 /// # }
 /// ```
 pub struct ApiServer {
-    /// Axum 应用（Router）
+    /// Axum application (Router)
     app: Router,
-    /// 监听地址
+    /// Listen address
     listen_addr: String,
 }
 
 impl ApiServer {
-    /// 创建新的 API 服务器
+    /// Create a new API server
     ///
-    /// 构建完整的 Axum Router，包括：
-    /// - 认证中间件（Bearer Token）
-    /// - CORS 中间件
-    /// - 请求日志中间件
-    /// - 所有 REST 端点路由
+    /// Build complete Axum Router, Includes:
+    /// - Authentication middleware (Bearer Token)
+    /// - CORS middleware
+    /// - Request logging middleware
+    /// - All REST endpoint Routing
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// * `state` — API 共享状态，包含控制面引用和配置
+    /// * `state` — API shared state, includes control plane reference and configuration
     pub fn new(state: ApiState) -> Self {
         let listen_addr = state.config.listen.clone();
 
-        // 构建 AppState（Axum 要求 State 实现 Clone）
+        // Build AppState (Axum requires State to implement Clone)
         let app_state = AppState {
             inner: Arc::new(state),
         };
 
-        // 构建路由
+        // Build routing
         let app = Router::new()
-            // ── 系统状态 ──
+            // ── System state ──
             .route("/api/v1/status", get(status_handler))
             .route("/api/v1/metrics", get(metrics_handler))
-            // ── 节点 ──
+            // ── Nodes ──
             .route("/api/v1/nodes", get(nodes_list_handler))
             .route("/api/v1/nodes/{name}", get(node_detail_handler))
-            // ── 出站组 ──
+            // ── Outbound groups ──
             .route("/api/v1/groups", get(groups_list_handler))
             .route("/api/v1/groups/{name}", get(group_detail_handler))
             .route("/api/v1/groups/{name}/policy", put(group_policy_handler))
@@ -142,13 +142,13 @@ impl ApiServer {
                 "/api/v1/groups/{name}/selected",
                 put(group_selected_handler),
             )
-            // ── 路由规则 ──
+            // ── Routing rules ──
             .route("/api/v1/routing", get(routing_handler))
-            // ── 配置重载 ──
+            // ── Configuration reload ──
             .route("/api/v1/reload", post(reload_handler))
-            // ── 共享状态 ──
+            // ── Shared state ──
             .with_state(app_state)
-            // ── 中间件（从外到内：CORS → 日志 → 认证 → 路由） ──
+            // ── Middleware (outside to inside: CORS → logging → auth → Routing) ──
             .layer(middleware::from_fn(auth_middleware))
             .layer(tower_http::cors::CorsLayer::permissive().allow_origin(tower_http::cors::Any))
             .layer(
@@ -164,15 +164,15 @@ impl ApiServer {
         Self { app, listen_addr }
     }
 
-    /// 启动 API 服务器（非阻塞）
+    /// Start API server (non-blocking)
     ///
-    /// 绑定到配置的监听地址，在当前 tokio runtime 上启动 HTTP 服务。
-    /// 返回一个 JoinHandle，可用于等待服务器退出或取消任务。
+    /// Binds to configured listen address and starts HTTP service on current tokio runtime.
+    /// Returns a JoinHandle that can be used to wait for server exit or cancel the task.
     ///
-    /// # 返回
+    /// # Returns
     ///
-    /// 返回 `tokio::task::JoinHandle<()>`，服务器运行时持有此句柄。
-    /// 可通过 `handle.abort()` 或等待其完成来管理服务器生命周期。
+    /// Returns `tokio::task::JoinHandle<()>`, server runtime holds this handle.
+    /// Server lifecycle can be managed via `handle.abort()` or by waiting for it to complete.
     pub async fn start(self) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
         let addr: std::net::SocketAddr = self
             .listen_addr
@@ -203,18 +203,18 @@ impl ApiServer {
 }
 
 // ============================================================================
-// 认证中间件
+// Authentication middleware
 // ============================================================================
 
-/// Bearer Token 认证中间件
+/// Bearer Token authentication middleware
 ///
-/// 从 `Authorization` 请求头中提取 Bearer Token，与配置中的
-/// `api.token` 比对。缺失或无效时返回 `401 Unauthorized`。
+/// Extract Bearer Token from `Authorization` request header, compare with configured
+/// `api.token`. Returns `401 Unauthorized` if missing or invalid.
 async fn auth_middleware(
     mut req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> impl IntoResponse {
-    // 提取 Authorization header 并注入到请求扩展中
+    // Extract Authorization header and inject into request extensions
     let token: Option<String> = req
         .headers()
         .get("Authorization")
@@ -229,7 +229,7 @@ async fn auth_middleware(
     next.run(req).await
 }
 
-/// 从请求中提取的认证信息
+/// Authentication info extracted from request
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 struct AuthInfo {
@@ -237,10 +237,10 @@ struct AuthInfo {
     token: String,
 }
 
-/// 验证请求的 Bearer Token
+/// Verify request's Bearer Token
 ///
-/// 在每个需要认证的 handler 中调用此函数。
-/// 如果 token 无效，返回 `ApiError::Unauthorized`。
+/// Call this function in every handler that requires authentication.
+/// If token is invalid, returns `ApiError::Unauthorized`.
 fn verify_auth(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
     let auth_header = headers
         .get("Authorization")
@@ -259,22 +259,22 @@ fn verify_auth(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
 }
 
 // ============================================================================
-// 统一错误类型
+// Unified error type
 // ============================================================================
 
-/// API 统一错误类型
+/// API unified error type
 ///
-/// 实现 `IntoResponse`，可按标准错误格式 `{ "code": "E_XXXX", "message": "..." }`
-/// 返回给客户端。
+/// Implements `IntoResponse`, can return errors in standard format `{ "code": "E_XXXX", "message": "..." }`
+/// Return to client.
 #[derive(Debug)]
 pub enum ApiError {
-    /// 401 — 认证失败
+    /// 401 — Authentication failed
     Unauthorized,
-    /// 404 — 资源不存在
+    /// 404 — Resource not found
     NotFound(String),
-    /// 422 — 请求语义错误
+    /// 422 — Request semantic error
     Unprocessable(String),
-    /// 500 — 服务器内部错误
+    /// 500 — Internal server error
     Internal(String),
 }
 
@@ -305,10 +305,10 @@ impl IntoResponse for ApiError {
 }
 
 // ============================================================================
-// 响应类型
+// Response types
 // ============================================================================
 
-/// 状态端点响应
+/// Status endpoint response
 #[derive(Serialize)]
 struct StatusResponse {
     version: String,
@@ -318,14 +318,14 @@ struct StatusResponse {
     netns: String,
 }
 
-/// eBPF 状态子对象
+/// eBPF state sub-object
 #[derive(Serialize)]
 struct EbpfStatus {
     loaded: bool,
     programs: Vec<String>,
 }
 
-/// 指标端点响应
+/// Metrics endpoint response
 #[derive(Serialize)]
 struct MetricsResponse {
     total_packets: u64,
@@ -336,7 +336,7 @@ struct MetricsResponse {
     active_connections: u64,
 }
 
-/// 节点信息响应
+/// Node info response
 #[derive(Serialize, Clone)]
 struct NodeInfo {
     name: String,
@@ -346,7 +346,7 @@ struct NodeInfo {
     latency_ms: LatencyInfo,
 }
 
-/// 延迟信息
+/// Latency info
 #[derive(Serialize, Clone)]
 struct LatencyInfo {
     #[serde(rename = "last")]
@@ -355,11 +355,11 @@ struct LatencyInfo {
     moving_avg: u64,
 }
 
-/// 出站组信息
+/// Outbound group info
 #[derive(Serialize)]
 #[serde(untagged)]
 enum GroupInfo {
-    /// auto 组
+    /// auto group
     Auto {
         name: String,
         #[serde(rename = "type")]
@@ -368,7 +368,7 @@ enum GroupInfo {
         active_node: String,
         nodes: Vec<String>,
     },
-    /// select 组
+    /// select group
     Select {
         name: String,
         #[serde(rename = "type")]
@@ -378,14 +378,14 @@ enum GroupInfo {
     },
 }
 
-/// 路由规则响应
+/// Routing rules response
 #[derive(Serialize)]
 struct RoutingResponse {
     rules: Vec<RuleInfo>,
     fallback: String,
 }
 
-/// 路由规则条目
+/// Routing rule entry
 #[derive(Serialize)]
 struct RuleInfo {
     #[serde(rename = "match")]
@@ -393,40 +393,40 @@ struct RuleInfo {
     action: String,
 }
 
-/// 重载响应
+/// Reload response
 #[derive(Serialize)]
 struct ReloadResponse {
     status: String,
     config_ts: u64,
 }
 
-/// Policy 更新请求体
+/// Policy update request body
 #[derive(Deserialize)]
 struct PolicyUpdate {
     policy: String,
 }
 
-/// Selected 更新请求体
+/// Selected update request body
 #[derive(Deserialize)]
 struct SelectedUpdate {
     selected: String,
 }
 
 // ============================================================================
-// Handler — 系统状态
+// Handler — system status
 // ============================================================================
 
 /// `GET /api/v1/status`
 ///
-/// 返回 dae-rs 的运行状态，包括版本、运行时间、eBPF 加载状态、
-/// TProxy 端口和网络命名空间状态。
+/// Returns dae-rs runtime status, including version, uptime, eBPF loading status,
+/// TProxy port and Network namespace state.
 async fn status_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let control = api_state.control.read().await;
@@ -462,20 +462,20 @@ async fn status_handler(
 
 /// `GET /api/v1/metrics`
 ///
-/// 返回从 eBPF STATS_MAP 读取的基础指标，包括总包数、
-/// direct/proxy 决策数、bypass 计数、conntrack 命中数和活跃连接数。
+/// Returns basic metrics read from eBPF STATS_MAP, including total packets,
+/// direct/proxy decision counts, bypass count, conntrack hits, and active connections.
 async fn metrics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let control = api_state.control.write().await;
 
-    // 从 eBPF STATS_MAP 读取指标，如果 eBPF 未加载则返回零值
+    // Read metrics from eBPF STATS_MAP, return zero values if eBPF not loaded
     let stats = control
         .ebpf_mgr
         .lock()
@@ -497,22 +497,22 @@ async fn metrics_handler(
 }
 
 // ============================================================================
-// Handler — 节点
+// Handler — nodes
 // ============================================================================
 
 /// `GET /api/v1/nodes`
 ///
-/// 列出所有配置的出站节点及其当前延迟快照。
+/// List all configured outbound nodes and their current latency snapshots.
 ///
-/// 第一阶段：从配置读取节点信息，延迟数据使用默认值（0），
-/// 后续集成健康探测后返回真实延迟。
+/// Phase 1: read node info from configuration, latency data uses default value (0),
+/// real latency will be returned after health probe integration in subsequent phases.
 async fn nodes_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<NodeInfo>>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let control = api_state.control.read().await;
@@ -528,9 +528,9 @@ async fn nodes_list_handler(
                     name: n.name.clone(),
                     protocol: n.protocol.clone(),
                     address: n.address.clone(),
-                    // 第一阶段：所有节点标记为存活
+                    // Phase 1: all nodes marked as alive
                     alive: true,
-                    // 第一阶段：延迟数据使用默认值
+                    // Phase 1: latency data uses default values
                     latency_ms: LatencyInfo {
                         last_ms: 0,
                         avg10: 0,
@@ -546,7 +546,7 @@ async fn nodes_list_handler(
 
 /// `GET /api/v1/nodes/{name}`
 ///
-/// 查询单个出站节点的详情。
+/// Query details of a single outbound node.
 async fn node_detail_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -554,7 +554,7 @@ async fn node_detail_handler(
 ) -> Result<Json<NodeInfo>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let control = api_state.control.read().await;
@@ -579,19 +579,19 @@ async fn node_detail_handler(
 }
 
 // ============================================================================
-// Handler — 出站组
+// Handler — outbound groups
 // ============================================================================
 
 /// `GET /api/v1/groups`
 ///
-/// 列出所有出站组及其详细信息。
+/// List all outbound groups and their details.
 async fn groups_list_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<GroupInfo>>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let control = api_state.control.read().await;
@@ -604,7 +604,7 @@ async fn groups_list_handler(
                 .groups
                 .iter()
                 .map(|g| {
-                    // 收集组可达节点名
+                    // Collect reachable node names for group
                     let node_names: Vec<String> = collect_group_node_names(g, &dc.outbounds.nodes);
 
                     match g.group_type {
@@ -645,7 +645,7 @@ async fn groups_list_handler(
 
 /// `GET /api/v1/groups/{name}`
 ///
-/// 查询单个出站组的详情。
+/// Query details of a single outbound group.
 async fn group_detail_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -653,7 +653,7 @@ async fn group_detail_handler(
 ) -> Result<Json<GroupInfo>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let control = api_state.control.read().await;
@@ -706,9 +706,9 @@ async fn group_detail_handler(
 
 /// `PUT /api/v1/groups/{name}/policy`
 ///
-/// 修改 auto 组的节点选择策略。
+/// Modify the node selection strategy for auto groups.
 ///
-/// 仅对 `type: auto` 的组有效；对 `select` 组返回 `422 Unprocessable Entity`。
+/// Only effective for `type: auto` groups; returns `422 Unprocessable Entity` for `select` groups.
 async fn group_policy_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -717,7 +717,7 @@ async fn group_policy_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let mut control = api_state.control.write().await;
@@ -734,7 +734,7 @@ async fn group_policy_handler(
         .find(|g| g.name == name)
         .ok_or_else(|| ApiError::NotFound(format!("出站组 '{}' 不存在", name)))?;
 
-    // 仅 auto 组支持 policy 修改
+    // Only auto groups support policy modification
     if group.group_type != config::GroupType::Auto {
         return Err(ApiError::Unprocessable(format!(
             "组 '{}' 的类型为 select，不支持 policy 修改",
@@ -742,7 +742,7 @@ async fn group_policy_handler(
         )));
     }
 
-    // 解析 policy 值
+    // Parse policy value
     let policy = match body.policy.as_str() {
         "fixed" => config::PolicyType::Fixed,
         "random" => config::PolicyType::Random,
@@ -770,10 +770,10 @@ async fn group_policy_handler(
 
 /// `PUT /api/v1/groups/{name}/selected`
 ///
-/// 修改 select 组当前选中节点。
+/// Modify the currently selected node for select groups.
 ///
-/// 仅对 `type: select` 的组有效；对 `auto` 组返回 `422`。
-/// `selected` 节点必须在组可达集合内，否则返回 `422`。
+/// Only effective for `type: select` groups; returns `422` for `auto` groups.
+/// `selected` node must be within the group's reachable set, otherwise returns `422`.
 async fn group_selected_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -782,7 +782,7 @@ async fn group_selected_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let mut control = api_state.control.write().await;
@@ -799,7 +799,7 @@ async fn group_selected_handler(
         .find(|g| g.name == name)
         .ok_or_else(|| ApiError::NotFound(format!("出站组 '{}' 不存在", name)))?;
 
-    // 仅 select 组支持 selected 修改
+    // Only select groups support selected modification
     if group.group_type != config::GroupType::Select {
         return Err(ApiError::Unprocessable(format!(
             "组 '{}' 的类型为 auto，不支持 selected 修改",
@@ -807,7 +807,7 @@ async fn group_selected_handler(
         )));
     }
 
-    // 检查 selected 节点是否在组可达集合内
+    // Check if selected node is within the group's reachable set
     let node_names: Vec<String> = collect_group_node_names(group, &daefile.outbounds.nodes);
     if !node_names.contains(&body.selected) {
         return Err(ApiError::Unprocessable(format!(
@@ -828,19 +828,19 @@ async fn group_selected_handler(
 }
 
 // ============================================================================
-// Handler — 路由规则
+// Handler — Routing rules
 // ============================================================================
 
 /// `GET /api/v1/routing`
 ///
-/// 返回当前生效的规则列表和 fallback 动作。
+/// Returns the current active rule list and fallback action.
 async fn routing_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<RoutingResponse>, ApiError> {
     let api_state = &state.inner;
 
-    // 验证认证
+    // Verify authentication
     verify_auth(api_state, &headers)?;
 
     let control = api_state.control.read().await;
@@ -873,13 +873,13 @@ async fn routing_handler(
 }
 
 // ============================================================================
-// Handler — 配置重载
+// Handler — configuration reload
 // ============================================================================
 
 /// `POST /api/v1/reload`
 ///
-/// 触发配置热重载。重新解析 daefile，原子替换 JSON 配置，
-/// 不中断已有连接。失败时返回 `500`，原配置继续运行。
+/// Trigger configuration hot-reload. Re-parse daefile, atomically replace JSON configuration,
+/// without interrupting existing connections. Returns `500` on failure, original config continues running.
 async fn reload_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -916,12 +916,12 @@ async fn reload_handler(
 }
 
 // ============================================================================
-// 辅助函数
+// Helper function
 // ============================================================================
 
-/// 收集出站组可达节点名列表
+/// Collect list of reachable node names for outbound group
 ///
-/// 根据组的选择器（list 或 regex）从所有节点中筛选出匹配的节点名。
+/// Filter matching node names from all nodes based on the group's selector (list or regex).
 fn collect_group_node_names(
     group: &config::OutboundGroupConfig,
     all_nodes: &[config::OutboundNodeConfig],
@@ -959,7 +959,7 @@ fn collect_group_node_names(
 }
 
 // ============================================================================
-// 单元测试
+// Unit test
 // ============================================================================
 
 #[cfg(test)]
@@ -972,7 +972,7 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    /// 创建测试用的 ApiState
+    /// Create ApiState for testing
     fn test_state() -> ApiState {
         let mut cp = ControlPlane::new(crate::Config::default());
         let example = crate::config::default_config_example();
@@ -995,17 +995,17 @@ mod tests {
         }
     }
 
-    /// 创建测试用应用（带认证）
+    /// Create test application (with authentication)
     fn test_app() -> Router {
         let state = test_state();
         let server = ApiServer::new(state);
         server.app
     }
 
-    /// 创建测试用应用（不带认证 — 用于测试未认证场景）
+    /// Create test application (without authentication — for testing unauthenticated scenarios)
     fn test_app_no_auth() -> Router {
         let state = test_state();
-        // 移除认证中间件
+        // Remove authentication middleware
         let app_state = AppState {
             inner: Arc::new(state),
         };
@@ -1027,7 +1027,7 @@ mod tests {
             .with_state(app_state)
     }
 
-    /// 添加 Authorization header 的辅助函数
+    /// Helper function to add Authorization header
     fn authed_request(uri: &str) -> Request<Body> {
         Request::builder()
             .uri(uri)

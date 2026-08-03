@@ -1,9 +1,13 @@
 use anyhow::Context;
+use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, info, warn};
+
+use crate::ruleset::cache::RuleSetCache;
+use crate::ruleset::refparse::{match_domain_patterns, match_qname_value, parse_ref, RuleSetRef};
 
 // ============================================================================
 // Linux socket option constants for IP_TRANSPARENT
@@ -54,6 +58,8 @@ pub struct DnsListener {
     /// Callback invoked on each accepted DNS resolution (domain, ip, ttl).
     /// Feeds the domain_routing_map eBPF map for domain-based routing.
     on_resolve: Option<DnsResolveCallback>,
+    /// Ruleset in-memory cache (for DNS response Routing `ip(geoip:/set:)` / `qname(geosite:/set:)` evaluation).
+    rule_set_cache: RuleSetCache,
 }
 
 impl DnsListener {
@@ -64,6 +70,7 @@ impl DnsListener {
         cache: Arc<std::sync::RwLock<DnsCache>>,
         router: DnsRouter,
         on_resolve: Option<DnsResolveCallback>,
+        rule_set_cache: RuleSetCache,
     ) -> Self {
         Self {
             bind_addr,
@@ -75,6 +82,7 @@ impl DnsListener {
             tcp_handle: None,
             shutdown_tx: None,
             on_resolve,
+            rule_set_cache,
         }
     }
 
@@ -94,6 +102,7 @@ impl DnsListener {
         let cache = self.cache.clone();
         let router = Arc::new(self.router.clone());
         let on_resolve = self.on_resolve.clone();
+        let rule_set_cache = self.rule_set_cache.clone();
 
         debug!(bind = %bind, "DNS listener starting");
 
@@ -107,8 +116,18 @@ impl DnsListener {
         let u_cache = cache.clone();
         let u_router = router.clone();
         let u_on_resolve = on_resolve.clone();
+        let u_ruleset = rule_set_cache.clone();
         let udp_handle = tokio::spawn(async move {
-            run_udp_listener(udp_socket, u_config, u_pools, u_cache, u_router, u_on_resolve).await;
+            run_udp_listener(
+                udp_socket,
+                u_config,
+                u_pools,
+                u_cache,
+                u_router,
+                u_on_resolve,
+                u_ruleset,
+            )
+            .await;
         });
         self.udp_handle = Some(udp_handle);
 
@@ -117,7 +136,16 @@ impl DnsListener {
             anyhow::anyhow!("failed to bind DNS TCP listener on {}: {}", bind, e)
         })?;
         let tcp_handle = tokio::spawn(async move {
-            run_tcp_listener(tcp_listener, config, upstream_pools, cache, router, on_resolve).await;
+            run_tcp_listener(
+                tcp_listener,
+                config,
+                upstream_pools,
+                cache,
+                router,
+                on_resolve,
+                rule_set_cache,
+            )
+            .await;
         });
         self.tcp_handle = Some(tcp_handle);
 
@@ -144,9 +172,18 @@ impl DnsListener {
                 let i_cache = self.cache.clone();
                 let i_router = Arc::new(self.router.clone());
                 let i_on_resolve = self.on_resolve.clone();
+                let i_ruleset = self.rule_set_cache.clone();
                 tokio::spawn(async move {
-                    run_udp_listener(internal_socket, i_config, i_pools, i_cache, i_router, i_on_resolve)
-                        .await;
+                    run_udp_listener(
+                        internal_socket,
+                        i_config,
+                        i_pools,
+                        i_cache,
+                        i_router,
+                        i_on_resolve,
+                        i_ruleset,
+                    )
+                    .await;
                 });
                 info!(
                     "DNS internal listener started on {} for cross-namespace forwarding",
@@ -196,6 +233,7 @@ async fn run_udp_listener(
     cache: Arc<std::sync::RwLock<DnsCache>>,
     router: Arc<DnsRouter>,
     on_resolve: Option<DnsResolveCallback>,
+    rule_set_cache: RuleSetCache,
 ) {
     let mut buf = vec![0u8; 4096];
     loop {
@@ -213,6 +251,7 @@ async fn run_udp_listener(
         let cache = cache.clone();
         let router = router.clone();
         let on_resolve = on_resolve.clone();
+        let rule_set_cache = rule_set_cache.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_dns_query(
@@ -223,6 +262,7 @@ async fn run_udp_listener(
                 &cache,
                 &router,
                 &on_resolve,
+                &rule_set_cache,
             )
             .await
             {
@@ -240,6 +280,7 @@ async fn run_tcp_listener(
     cache: Arc<std::sync::RwLock<DnsCache>>,
     router: Arc<DnsRouter>,
     on_resolve: Option<DnsResolveCallback>,
+    rule_set_cache: RuleSetCache,
 ) {
     loop {
         let result = listener.accept().await;
@@ -255,6 +296,7 @@ async fn run_tcp_listener(
         let cache = cache.clone();
         let router = router.clone();
         let on_resolve = on_resolve.clone();
+        let rule_set_cache = rule_set_cache.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -279,8 +321,16 @@ async fn run_tcp_listener(
                 return;
             }
 
-            if let Ok((response, _upstream_addr)) =
-                handle_dns_internal(&request, &config, &upstream_pools, &cache, &router, &on_resolve).await
+            if let Ok((response, _upstream_addr)) = handle_dns_internal(
+                &request,
+                &config,
+                &upstream_pools,
+                &cache,
+                &router,
+                &on_resolve,
+                &rule_set_cache,
+            )
+            .await
             {
                 // Write response with length prefix
                 let resp_len = (response.len() as u16).to_be_bytes();
@@ -313,9 +363,18 @@ async fn handle_dns_query(
     cache: &Arc<std::sync::RwLock<DnsCache>>,
     router: &Arc<DnsRouter>,
     on_resolve: &Option<DnsResolveCallback>,
+    rule_set_cache: &RuleSetCache,
 ) -> anyhow::Result<()> {
-    let (response, upstream_addr) =
-        handle_dns_internal(request, config, upstream_pools, cache, router, on_resolve).await?;
+    let (response, upstream_addr) = handle_dns_internal(
+        request,
+        config,
+        upstream_pools,
+        cache,
+        router,
+        on_resolve,
+        rule_set_cache,
+    )
+    .await?;
 
     // Determine the bind address for the response socket:
     // - Upstream query result: bind to the upstream DNS server address with IP_TRANSPARENT
@@ -352,8 +411,9 @@ async fn handle_dns_internal(
     #[allow(unused)] config: &Arc<DnsConfig>,
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
     cache: &Arc<std::sync::RwLock<DnsCache>>,
-    #[allow(unused)] router: &Arc<DnsRouter>,
+    router: &Arc<DnsRouter>,
     on_resolve: &Option<DnsResolveCallback>,
+    rule_set_cache: &RuleSetCache,
 ) -> anyhow::Result<(Vec<u8>, Option<SocketAddr>)> {
     // Parse query name and type
     let (qname, qtype) = parse_dns_question(request);
@@ -404,7 +464,14 @@ async fn handle_dns_internal(
     let response = pool.query(request).await?;
 
     // Apply response routing
-    let action = check_dns_response(&response, &route.group, router, &route.upstream_label);
+    let action = check_dns_response(
+        &response,
+        &qname,
+        &route.group,
+        router,
+        &route.upstream_label,
+        rule_set_cache,
+    );
 
     match action {
         DnsResponseAction::Accept => {
@@ -518,9 +585,11 @@ fn extract_answer_addrs(response: &[u8]) -> Vec<(IpAddr, u32)> {
 /// Check DNS response routing
 fn check_dns_response(
     response: &[u8],
+    qname: &str,
     group: &crate::config::DnsGroupConfig,
     #[allow(unused)] router: &Arc<DnsRouter>,
     upstream_label: &str,
+    rule_set_cache: &RuleSetCache,
 ) -> DnsResponseAction {
     let routing = match &group.response_routing {
         Some(r) => r,
@@ -532,20 +601,22 @@ fn check_dns_response(
         let raw = rule.r#match.trim();
         let action = rule.action.trim();
 
+        let matched =
+            evaluate_response_condition(raw, qname, response, upstream_label, rule_set_cache);
         match action {
             "accept" => {
-                if evaluate_response_condition(raw, response, upstream_label) {
+                if matched {
                     return DnsResponseAction::Accept;
                 }
             }
             "reject" => {
-                if evaluate_response_condition(raw, response, upstream_label) {
+                if matched {
                     return DnsResponseAction::Reject;
                 }
             }
             requery_label => {
                 // Requery with different upstream
-                if evaluate_response_condition(raw, response, upstream_label) {
+                if matched {
                     return DnsResponseAction::Requery(requery_label.to_string());
                 }
             }
@@ -560,21 +631,79 @@ fn check_dns_response(
     }
 }
 
-/// Evaluate a single response condition
-fn evaluate_response_condition(condition: &str, response: &[u8], upstream_label: &str) -> bool {
-    if condition.is_empty() || condition == "any" || condition == "*" {
+/// Split condition expression by `&&` (DNS conditions have no parenthetical nesting, simple split suffices).
+fn split_condition_and(expr: &str) -> Vec<&str> {
+    expr.split("&&")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Split function arguments by comma (DNS condition arguments contain no nested parentheses).
+fn split_condition_params(inner: &str) -> Vec<&str> {
+    inner.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+}
+
+/// Evaluate a single response condition.
+///
+/// Supports `&&` and `!` combinations (design §6.5 / §10.3): **AND** between atomic conditions, `!` negates.
+///
+/// Atomic conditions:
+/// - `any` / `*` / empty → always true;
+/// - `upstream(label)` → matches this upstream;
+/// - `nocontent` → response has no answer;
+/// - `ip(geoip:<code> / set:<name> / CIDR / bare IP)` → any A/AAAA address in response hits;
+/// - `qname(geosite:<code> / set:<name> / normal Domain name pattern)` → query name hits.
+///
+/// Unknown conditions default to **return false and warn** (fixes "unimplemented always true" defect 5).
+fn evaluate_response_condition(
+    condition: &str,
+    qname: &str,
+    response: &[u8],
+    upstream_label: &str,
+    rule_set_cache: &RuleSetCache,
+) -> bool {
+    let parts = split_condition_and(condition);
+    if parts.is_empty() {
+        // Empty condition → always true (equivalent to any)
+        return true;
+    }
+    for part in parts {
+        let (negated, cond) = if let Some(stripped) = part.strip_prefix('!') {
+            (true, stripped.trim())
+        } else {
+            (false, part)
+        };
+        let v = eval_atomic_condition(cond, qname, response, upstream_label, rule_set_cache);
+        let result = if negated { !v } else { v };
+        if !result {
+            return false;
+        }
+    }
+    true
+}
+
+/// Evaluate a single atomic condition (**without** NOT negation).
+fn eval_atomic_condition(
+    cond: &str,
+    qname: &str,
+    response: &[u8],
+    upstream_label: &str,
+    rule_set_cache: &RuleSetCache,
+) -> bool {
+    if cond.is_empty() || cond == "any" || cond == "*" {
         return true;
     }
 
-    // Check for upstream(label) condition — match if the label matches the actual upstream
-    if let Some(label) = condition.strip_prefix("upstream(") {
+    // upstream(label) — matches this actual upstream
+    if let Some(label) = cond.strip_prefix("upstream(") {
         if let Some(label) = label.strip_suffix(')') {
             return label == upstream_label;
         }
     }
 
-    // Check for nocontent (NODATA) response
-    if condition == "nocontent" {
+    // nocontent（NODATA）
+    if cond == "nocontent" {
         if response.len() < 12 {
             return true;
         }
@@ -582,8 +711,108 @@ fn evaluate_response_condition(condition: &str, response: &[u8], upstream_label:
         return ancount == 0;
     }
 
-    // Default: accept
-    true
+    // ip(...) — response address hits geoip/set/CIDR/bare IP
+    if let Some(inner) = cond.strip_prefix("ip(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let addrs = extract_answer_addrs(response);
+            return eval_ip_condition(inner, &addrs, rule_set_cache);
+        }
+    }
+
+    // qname(...) — query name hits geosite/set/normal Domain name pattern
+    if let Some(inner) = cond.strip_prefix("qname(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            return eval_qname_condition(inner, qname, rule_set_cache);
+        }
+    }
+
+    // Unknown condition → fix "always true" defect: default false and warn
+    warn!(
+        condition = cond,
+        "unsupported DNS response condition; returning false"
+    );
+    false
+}
+
+/// `ip(...)` inner evaluation: any A/AAAA address hits any parameter (geoip:/set:/CIDR/bare IP).
+fn eval_ip_condition(inner: &str, addrs: &[(IpAddr, u32)], rule_set_cache: &RuleSetCache) -> bool {
+    for val in split_condition_params(inner) {
+        let hit = match parse_ref(val) {
+            RuleSetRef::GeoIp(code) => match rule_set_cache.find_geoip_code(&code) {
+                Some(nets) => addrs.iter().any(|(ip, _)| nets.iter().any(|n| n.contains(ip))),
+                None => {
+                    warn!(code = %code, "DNS response ip(geoip:...) code not found; no match");
+                    false
+                }
+            },
+            RuleSetRef::Set(name) => match rule_set_cache.get_set_ips(&name) {
+                Some(nets) => addrs.iter().any(|(ip, _)| nets.iter().any(|n| n.contains(ip))),
+                None => {
+                    warn!(
+                        name = %name,
+                        "DNS response ip(set:...) not found or not an ip_list; no match"
+                    );
+                    false
+                }
+            },
+            RuleSetRef::GeoSite(code) => {
+                warn!(code = %code, "DNS response ip(geosite:...) is invalid; no match");
+                false
+            }
+            RuleSetRef::Plain(v) => {
+                // CIDR or bare IP (/32, /128)
+                if let Ok(cidr) = v.parse::<IpNet>() {
+                    addrs.iter().any(|(ip, _)| cidr.contains(ip))
+                } else if let Ok(addr) = v.parse::<IpAddr>() {
+                    let bits = if addr.is_ipv4() { 32 } else { 128 };
+                    let cidr = IpNet::new(addr, bits);
+                    addrs
+                        .iter()
+                        .any(|(ip, _)| cidr.as_ref().map_or(false, |c| c.contains(ip)))
+                } else {
+                    false
+                }
+            }
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// `qname(...)` inner evaluation: query name hits any parameter (geosite:/set:/normal Domain name pattern).
+fn eval_qname_condition(inner: &str, qname: &str, rule_set_cache: &RuleSetCache) -> bool {
+    for val in split_condition_params(inner) {
+        let hit = match parse_ref(val) {
+            RuleSetRef::GeoSite(code) => match rule_set_cache.find_geosite_code(&code) {
+                Some(patterns) => match_domain_patterns(qname, &patterns),
+                None => {
+                    warn!(code = %code, "DNS response qname(geosite:...) code not found; no match");
+                    false
+                }
+            },
+            RuleSetRef::Set(name) => match rule_set_cache.get_set_domains(&name) {
+                Some(patterns) => match_domain_patterns(qname, &patterns),
+                None => {
+                    warn!(
+                        name = %name,
+                        "DNS response qname(set:...) not found or not a domain_list; no match"
+                    );
+                    false
+                }
+            },
+            RuleSetRef::GeoIp(code) => {
+                warn!(code = %code, "DNS response qname(geoip:...) is invalid; no match");
+                false
+            }
+            RuleSetRef::Plain(v) => match_qname_value(qname, &v),
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse DNS question section to extract qname and qtype
@@ -824,7 +1053,7 @@ async fn bind_tcp_with_reuseaddr(addr: SocketAddr) -> anyhow::Result<tokio::net:
 ///
 /// # Parameters
 ///
-/// 创建用于 DNS 响应的 IP_TRANSPARENT UDP socket（绑定到 orig_dst）。
+/// Create IP_TRANSPARENT UDP socket for DNS response (bound to orig_dst).
 ///
 /// 统一委托 [`protocols::hostns::create_transparent_udp`] 实现“dae-rs 自身
 /// 流量必须直连”的约定（SO_MARK=0x100 自排除 + 宿主 NS）。
@@ -848,5 +1077,164 @@ async fn create_marked_udp_socket_for_dns(
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ruleset::types::{DomainPattern, DomainPatternType, RuleSetData};
+    use std::collections::HashMap;
+
+    /// Construct Ruleset cache with geoip/geosite/ip_list/domain_list.
+    fn make_cache() -> RuleSetCache {
+        let cache = RuleSetCache::new();
+        let mut geoip = HashMap::new();
+        geoip.insert(
+            "cn".to_string(),
+            vec![
+                "1.0.1.0/24".parse::<IpNet>().unwrap(),
+                "223.5.5.0/24".parse::<IpNet>().unwrap(),
+            ],
+        );
+        cache.insert("geoip_main".into(), RuleSetData::GeoIp { entries: geoip });
+
+        let mut geosite = HashMap::new();
+        geosite.insert(
+            "cn".to_string(),
+            vec![DomainPattern {
+                pattern_type: DomainPatternType::Suffix,
+                value: "baidu.com".into(),
+            }],
+        );
+        cache.insert("geosite_main".into(), RuleSetData::GeoSite { entries: geosite });
+
+        cache.insert(
+            "chinaip".into(),
+            RuleSetData::IpList(vec!["10.0.0.0/8".parse().unwrap()]),
+        );
+        cache.insert(
+            "chinadom".into(),
+            RuleSetData::DomainList(vec![DomainPattern {
+                pattern_type: DomainPatternType::Full,
+                value: "example.cn".into(),
+            }]),
+        );
+        cache
+    }
+
+    fn encode_qname(name: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in name.split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    /// Construct DNS response with A record.
+    fn make_a_response(qname: &str, ips: &[IpAddr]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x12, 0x34, 0x81, 0x80, 0x00, 0x01]);
+        buf.extend_from_slice(&(ips.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // nscount, arcount
+        buf.extend_from_slice(&encode_qname(qname));
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // qtype A, qclass IN
+        for ip in ips {
+            buf.extend_from_slice(&[0xC0, 0x0C]); // name pointer
+            buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // type A, class IN
+            buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // ttl 60
+            buf.extend_from_slice(&[0x00, 0x04]); // rdlength 4
+            match ip {
+                IpAddr::V4(v4) => buf.extend_from_slice(&v4.octets()),
+                IpAddr::V6(_) => panic!("A-record helper expects IPv4"),
+            }
+        }
+        buf
+    }
+
+    fn eval(cond: &str, qname: &str, resp: &[u8], upstream: &str) -> bool {
+        evaluate_response_condition(cond, qname, resp, upstream, &make_cache())
+    }
+
+    #[test]
+    fn test_response_ip_geoip() {
+        let resp = make_a_response("www.test.com", &["1.0.1.5".parse().unwrap()]);
+        assert!(eval("ip(geoip:cn)", "www.test.com", &resp, "u1"), "geoip:cn 命中");
+        assert!(eval("ip(geoip:CN)", "www.test.com", &resp, "u1"), "大小写不敏感");
+        assert!(eval("ip(geoip:cn)", "www.test.com", &[], "u1") == false, "空响应不命中");
+    }
+
+    #[test]
+    fn test_response_ip_set() {
+        let resp = make_a_response("www.test.com", &["10.1.1.1".parse().unwrap()]);
+        assert!(eval("ip(set:chinaip)", "www.test.com", &resp, "u1"), "set:chinaip 命中");
+    }
+
+    #[test]
+    fn test_response_ip_plain_cidr_and_miss() {
+        let resp = make_a_response("www.test.com", &["8.8.8.8".parse().unwrap()]);
+        assert!(eval("ip(8.8.8.0/24)", "www.test.com", &resp, "u1"), "普通 CIDR 命中");
+        assert!(!eval("ip(geoip:cn)", "www.test.com", &resp, "u1"), "geoip 未命中");
+    }
+
+    #[test]
+    fn test_response_qname_geosite() {
+        let resp = make_a_response("www.baidu.com", &["1.2.3.4".parse().unwrap()]);
+        assert!(eval("qname(geosite:cn)", "www.baidu.com", &resp, "u1"));
+        assert!(eval("qname(geosite:cn)", "WWW.BAIDU.COM", &resp, "u1"), "大小写不敏感");
+        assert!(!eval("qname(geosite:cn)", "www.google.com", &resp, "u1"));
+    }
+
+    #[test]
+    fn test_response_qname_set() {
+        let resp = make_a_response("example.cn", &["1.2.3.4".parse().unwrap()]);
+        assert!(eval("qname(set:chinadom)", "example.cn", &resp, "u1"), "set full 命中");
+        assert!(!eval("qname(set:chinadom)", "sub.example.cn", &resp, "u1"), "full 不含子域");
+    }
+
+    #[test]
+    fn test_response_any_and_upstream_and_nocontent() {
+        let resp = make_a_response("www.test.com", &["1.2.3.4".parse().unwrap()]);
+        assert!(eval("any", "www.test.com", &resp, "u1"));
+        assert!(eval("*", "www.test.com", &resp, "u1"));
+        assert!(eval("upstream(u1)", "www.test.com", &resp, "u1"));
+        assert!(!eval("upstream(u2)", "www.test.com", &resp, "u1"));
+        // nocontent: empty response
+        assert!(eval("nocontent", "www.test.com", &[], "u1"));
+        assert!(!eval("nocontent", "www.test.com", &resp, "u1"));
+    }
+
+    #[test]
+    fn test_response_unknown_condition_false() {
+        // Fix defect 5: unknown condition defaults to false (no longer always true)
+        let resp = make_a_response("www.test.com", &["1.2.3.4".parse().unwrap()]);
+        assert!(!eval("bogus(x)", "www.test.com", &resp, "u1"), "未知条件应 false");
+        assert!(!eval("ip(geoip:unknown-code)", "www.test.com", &resp, "u1"));
+    }
+
+    #[test]
+    fn test_response_condition_and_not() {
+        // ip(geoip:cn) && !qname(geosite:cn)
+        let resp = make_a_response("www.google.com", &["1.0.1.5".parse().unwrap()]);
+        // IP hits and Domain name does not hit → true
+        assert!(eval(
+            "ip(geoip:cn) && !qname(geosite:cn)",
+            "www.google.com",
+            &resp,
+            "u1"
+        ));
+        // IP hits but Domain name also hits → false
+        let resp2 = make_a_response("www.baidu.com", &["1.0.1.5".parse().unwrap()]);
+        assert!(!eval(
+            "ip(geoip:cn) && !qname(geosite:cn)",
+            "www.baidu.com",
+            &resp2,
+            "u1"
+        ));
+        // Single negation
+        assert!(!eval("!ip(geoip:cn)", "www.google.com", &resp, "u1"));
+        assert!(eval("!qname(geosite:cn)", "www.google.com", &resp, "u1"));
     }
 }

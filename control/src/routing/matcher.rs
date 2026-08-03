@@ -13,11 +13,14 @@ use bytemuck::Zeroable;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config;
+use crate::config::ConfigError;
 use crate::net::ebpf::{match_type, outbound};
 use crate::net::ebpf::{CidrEntry, LpmKey, MatchSet, MatchSetValue, PortRange};
+use crate::ruleset::cache::RuleSetCache;
+use crate::ruleset::refparse::{domain_pattern_to_string, parse_ref, RuleSetRef};
 
 // ============================================================================
 // Constants (must match tproxy.c and common/consts/ebpf_generated.go)
@@ -616,7 +619,7 @@ pub fn parse_dip_fn(
     values: &[String],
     override_outbound: &Outbound,
 ) -> Result<Vec<MatchSet>> {
-    let _cidrs = parse_cidr_values(values)?;
+    let _cidrs = parse_cidr_values(values, None)?;
     // cidrs are accumulated into the LPM trie during compile_rules
     // The MatchSet is written with index = 0 (the caller fixes it later)
     let mut ms = MatchSet::zeroed();
@@ -636,7 +639,7 @@ pub fn parse_sip_fn(
     values: &[String],
     override_outbound: &Outbound,
 ) -> Result<Vec<MatchSet>> {
-    let _cidrs = parse_cidr_values(values)?;
+    let _cidrs = parse_cidr_values(values, None)?;
     let mut ms = MatchSet::zeroed();
     ms.r#type = match_type::SOURCE_IP_SET;
     ms.value.index = 0; // placeholder
@@ -956,36 +959,97 @@ fn lookup_outbound_id_for_ms(outbound: &Outbound) -> Result<u8> {
     }
 }
 
+/// 内置的 `geoip:private` 回退网段（RFC1918 + 回环）。
+///
+/// 仅当内存缓存缺失 `private` 数据时使用（设计 §1.1 缺陷 1 / §6.1）；
+/// 有数据时优先使用数据（比硬编码更完整）。
+const PRIVATE_NETWORKS: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+];
+
+/// 构造 E2103 错误（编译期数据缺失，默认编译失败）。
+fn ruleset_data_missing(reference: &str, reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ConfigError::RuleSetDataMissing {
+        reference: reference.to_string(),
+        reason: reason.into(),
+    })
+}
+
 /// Parse CIDR values from string representations.
-fn parse_cidr_values(values: &[String]) -> Result<Vec<ipnet::IpNet>> {
+///
+/// 识别 `geoip:<code>`（查内存缓存，大小写不敏感）与 `set:<name>`（ip_list）；
+/// `geoip:private` 优先用数据，数据缺失回退内置 4 网段并 warn。
+/// 其余按 CIDR / 裸 IP 解析。
+fn parse_cidr_values(values: &[String], cache: Option<&RuleSetCache>) -> Result<Vec<ipnet::IpNet>> {
     let mut cidrs = Vec::new();
 
     for val in values {
-        if val == "geoip:private" {
-            cidrs.push("10.0.0.0/8".parse().unwrap());
-            cidrs.push("172.16.0.0/12".parse().unwrap());
-            cidrs.push("192.168.0.0/16".parse().unwrap());
-            cidrs.push("127.0.0.0/8".parse().unwrap());
-            continue;
-        }
+        match parse_ref(val) {
+            RuleSetRef::GeoIp(code) => {
+                if code.eq_ignore_ascii_case("private") {
+                    if let Some(cache) = cache {
+                        if let Some(list) = cache.find_geoip_code("private") {
+                            cidrs.extend(list);
+                            continue;
+                        }
+                    }
+                    warn!(
+                        reference = %val,
+                        "geoip:private data not in memory cache; falling back to built-in private networks"
+                    );
+                    for net in PRIVATE_NETWORKS {
+                        cidrs.push(net.parse().expect("valid private network"));
+                    }
+                    continue;
+                }
+                let cache = cache.ok_or_else(|| {
+                    ruleset_data_missing(val, "rule set memory cache not available")
+                })?;
+                let list = cache.find_geoip_code(&code).ok_or_else(|| {
+                    ruleset_data_missing(val, "geoip code not found in memory cache")
+                })?;
+                cidrs.extend(list);
+            }
+            RuleSetRef::Set(name) => {
+                let cache = cache.ok_or_else(|| {
+                    ruleset_data_missing(val, "rule set memory cache not available")
+                })?;
+                let list = cache.get_set_ips(&name).ok_or_else(|| {
+                    ruleset_data_missing(
+                        val,
+                        "ip_list rule set not found or rule set type mismatch",
+                    )
+                })?;
+                cidrs.extend(list);
+            }
+            RuleSetRef::GeoSite(code) => {
+                return Err(anyhow!(
+                    "geosite: reference '{val}' is not valid in an IP match function (code='{code}')"
+                ));
+            }
+            RuleSetRef::Plain(v) => {
+                // Try parsing as CIDR
+                if let Ok(cidr) = v.parse::<ipnet::IpNet>() {
+                    cidrs.push(cidr);
+                    continue;
+                }
 
-        // Try parsing as CIDR
-        if let Ok(cidr) = val.parse::<ipnet::IpNet>() {
-            cidrs.push(cidr);
-            continue;
-        }
+                // Try parsing as plain IP
+                if let Ok(addr) = v.parse::<Ipv4Addr>() {
+                    cidrs.push(ipnet::IpNet::new(addr.into(), 32).unwrap());
+                    continue;
+                }
+                if let Ok(addr) = v.parse::<Ipv6Addr>() {
+                    cidrs.push(ipnet::IpNet::new(addr.into(), 128).unwrap());
+                    continue;
+                }
 
-        // Try parsing as plain IP
-        if let Ok(addr) = val.parse::<Ipv4Addr>() {
-            cidrs.push(ipnet::IpNet::new(addr.into(), 32).unwrap());
-            continue;
+                return Err(anyhow!("cannot parse CIDR or IP: {val}"));
+            }
         }
-        if let Ok(addr) = val.parse::<Ipv6Addr>() {
-            cidrs.push(ipnet::IpNet::new(addr.into(), 128).unwrap());
-            continue;
-        }
-
-        return Err(anyhow!("cannot parse CIDR or IP: {val}"));
     }
 
     Ok(cidrs)
@@ -1173,6 +1237,7 @@ pub fn compile_rules(
     routing: &config::RoutingConfig,
     outbounds: &config::OutboundsConfig,
     proxy_server_ips: &[std::net::IpAddr],
+    rule_set_cache: Option<&RuleSetCache>,
 ) -> Result<CompiledRouting> {
     let start = std::time::Instant::now();
     debug!(
@@ -1239,24 +1304,56 @@ pub fn compile_rules(
     // because build_match_set_for_function references domain sets by index).
     // LPM trie data is collected inline during the second pass via
     // find_or_create_lpm_trie, so no separate pass is needed for that.
+    //
+    // 规则集集成（设计 §6.3 / §9.1）：
+    // - `target_domain(geosite:<code>)` → 查缓存 GeoSite code 的 Domain 列表，
+    //   映射为带 key 前缀的模式条目（Suffix→`suffix:`、Full→`full:`、Regex→`regex:`、
+    //   `Domain`→`domain:`、Keyword→`keyword:`）；
+    // - `target_domain(set:<name>)`（domain_list）同理；
+    // - 普通 `domain(...)` / `target_domain(...)` 参数保留 key 前缀（不再降级为裸后缀，
+    //   修复"domain(geosite:cn) 被当作后缀 cn"的缺陷）。
+    //
+    // **注意**：每个 domain/target_domain 函数无条件 push 一个条目（即使为空），
+    // 与 build_match_set_for_function 中 `rule_domain_idx` 的递增严格对齐。
     for rule in &program.rules {
         for func in &rule.and_functions {
-            if func.name.as_str() == "domain" {
-                // Strip key: prefix from domain values (e.g. "suffix:baidu.com" → "baidu.com")
-                let values: Vec<String> = func
-                    .raw_params
-                    .iter()
-                    .map(|raw| {
-                        if let Some((_, v)) = raw.split_once(':') {
-                            v.trim().to_string()
-                        } else {
-                            raw.trim().to_string()
+            if func.name.as_str() == "domain" || func.name.as_str() == "target_domain" {
+                let mut patterns: Vec<String> = Vec::new();
+                for raw in &func.raw_params {
+                    match parse_ref(raw) {
+                        RuleSetRef::GeoSite(code) => {
+                            let cache = rule_set_cache.ok_or_else(|| {
+                                ruleset_data_missing(raw, "rule set memory cache not available")
+                            })?;
+                            let pats = cache.find_geosite_code(&code).ok_or_else(|| {
+                                ruleset_data_missing(raw, "geosite code not found in memory cache")
+                            })?;
+                            patterns.extend(pats.iter().map(domain_pattern_to_string));
                         }
-                    })
-                    .collect();
-                if !values.is_empty() {
-                    domain_sets.push(values);
+                        RuleSetRef::Set(name) => {
+                            let cache = rule_set_cache.ok_or_else(|| {
+                                ruleset_data_missing(raw, "rule set memory cache not available")
+                            })?;
+                            let pats = cache.get_set_domains(&name).ok_or_else(|| {
+                                ruleset_data_missing(
+                                    raw,
+                                    "domain_list rule set not found or rule set type mismatch",
+                                )
+                            })?;
+                            patterns.extend(pats.iter().map(domain_pattern_to_string));
+                        }
+                        RuleSetRef::GeoIp(code) => {
+                            return Err(anyhow!(
+                                "geoip: reference '{raw}' is not valid in a domain match function (code='{code}')"
+                            ));
+                        }
+                        RuleSetRef::Plain(v) => {
+                            // 普通Domain name模式：保留 key 前缀（suffix:/keyword:/full:/regex:/domain: 或裸值）
+                            patterns.push(v.to_string());
+                        }
+                    }
                 }
+                domain_sets.push(patterns);
             }
         }
     }
@@ -1302,6 +1399,7 @@ pub fn compile_rules(
                     &mut lpm_dedup,
                     &domain_sets,
                     &mut rule_domain_idx,
+                    rule_set_cache,
                 )?;
                 final_match_sets.extend(match_sets);
             }
@@ -1353,6 +1451,33 @@ pub fn compile_rules(
         fallback = %fallback_outbound,
         "Compiled routing rules",
     );
+
+    // ── Step 6: 容量检查（设计 §9.3）→ E2106 ──
+    // MatchSet 总数 / LPM trie 数 / Domain name集索引数 超限 → 拒绝编译。
+    if final_match_sets.len() > MAX_MATCH_SET_LEN {
+        return Err(anyhow::Error::new(ConfigError::RuleSetCapacityExceeded {
+            detail: format!(
+                "MatchSet count {} exceeds MAX_MATCH_SET_LEN {MAX_MATCH_SET_LEN}; reduce rules or merge rule set references",
+                final_match_sets.len()
+            ),
+        }));
+    }
+    if lpm_tries.len() > MAX_LPM_NUM {
+        return Err(anyhow::Error::new(ConfigError::RuleSetCapacityExceeded {
+            detail: format!(
+                "LPM trie count {} exceeds MAX_LPM_NUM {MAX_LPM_NUM}; reduce distinct IP rule sets",
+                lpm_tries.len()
+            ),
+        }));
+    }
+    if domain_sets.len() > MAX_MATCH_SET_LEN {
+        return Err(anyhow::Error::new(ConfigError::RuleSetCapacityExceeded {
+            detail: format!(
+                "domain set index {} exceeds MAX_MATCH_SET_LEN {MAX_MATCH_SET_LEN}; domain_routing_map bitmap has {MAX_MATCH_SET_LEN} bits",
+                domain_sets.len()
+            ),
+        }));
+    }
 
     debug!(
         "compile_rules completed: {}ms ({} match_sets, {} lpm_tries, {} domain_sets, fallback={})",
@@ -1618,35 +1743,43 @@ fn build_match_set_for_function(
     lpm_dedup: &mut HashMap<u64, usize>,
     #[allow(unused)] domain_sets: &[Vec<String>],
     rule_domain_idx: &mut usize,
+    rule_set_cache: Option<&RuleSetCache>,
 ) -> Result<Vec<MatchSet>> {
     let mut result = Vec::new();
 
+    // 归一化别名（设计 §6.2）：`dip`/`ip` → `target_ip`；`sip` → `source_ip`；
+    // `domain`（含 `geosite:` 前缀）→ `target_domain`。函数名分支统一处理，
+    // 解析阶段不再单独改名，行为等价。
     match func.name.as_str() {
-        "dip" | "ip" => {
-            if let Ok(cidrs) = parse_cidr_values(values) {
-                let lpm_index = find_or_create_lpm_trie(&cidrs, lpm_tries, lpm_dedup);
-                let mut ms = MatchSet::zeroed();
-                ms.r#type = match_type::IP_SET;
-                ms.value.index = lpm_index as u32;
-                ms.not = if func.not { 1 } else { 0 };
-                ms.outbound = outbound_id;
-                ms.must = if ov_outbound.must { 1 } else { 0 };
-                ms.mark = ov_outbound.mark;
-                result.push(ms);
-            }
+        "dip" | "ip" | "target_ip" => {
+            // 使用原始参数（func.raw_params）：`group_params_by_key` 会把
+            // `geoip:cn` / `set:chinaip` 拆成 key/value，导致 `parse_cidr_values`
+            // 只收到 `cn`/`chinaip` 而无法识别规则集前缀（缺陷 3 相关）。
+            //
+            // 修复缺陷 2：解析失败（数据缺失 E2103 / 语法错误）不再静默丢弃，
+            // 直接传播错误。
+            let cidrs = parse_cidr_values(&func.raw_params, rule_set_cache)?;
+            let lpm_index = find_or_create_lpm_trie(&cidrs, lpm_tries, lpm_dedup);
+            let mut ms = MatchSet::zeroed();
+            ms.r#type = match_type::IP_SET;
+            ms.value.index = lpm_index as u32;
+            ms.not = if func.not { 1 } else { 0 };
+            ms.outbound = outbound_id;
+            ms.must = if ov_outbound.must { 1 } else { 0 };
+            ms.mark = ov_outbound.mark;
+            result.push(ms);
         }
         "sip" | "source_ip" => {
-            if let Ok(cidrs) = parse_cidr_values(values) {
-                let lpm_index = find_or_create_lpm_trie(&cidrs, lpm_tries, lpm_dedup);
-                let mut ms = MatchSet::zeroed();
-                ms.r#type = match_type::SOURCE_IP_SET;
-                ms.value.index = lpm_index as u32;
-                ms.not = if func.not { 1 } else { 0 };
-                ms.outbound = outbound_id;
-                ms.must = if ov_outbound.must { 1 } else { 0 };
-                ms.mark = ov_outbound.mark;
-                result.push(ms);
-            }
+            let cidrs = parse_cidr_values(&func.raw_params, rule_set_cache)?;
+            let lpm_index = find_or_create_lpm_trie(&cidrs, lpm_tries, lpm_dedup);
+            let mut ms = MatchSet::zeroed();
+            ms.r#type = match_type::SOURCE_IP_SET;
+            ms.value.index = lpm_index as u32;
+            ms.not = if func.not { 1 } else { 0 };
+            ms.outbound = outbound_id;
+            ms.must = if ov_outbound.must { 1 } else { 0 };
+            ms.mark = ov_outbound.mark;
+            result.push(ms);
         }
         "mac" => {
             // For MAC, use raw params directly (key:value splitting on colons corrupts MAC addresses).
@@ -1792,7 +1925,9 @@ fn build_match_set_for_function(
             ms.mark = ov_outbound.mark;
             result.push(ms);
         }
-        "domain" => {
+        "domain" | "target_domain" => {
+            // 与 compile_rules 收集阶段严格对齐：每个 domain/target_domain 函数
+            // 恰好对应一个 domain_sets 条目（索引由 rule_domain_idx 给出）。
             let idx = *rule_domain_idx;
             *rule_domain_idx += 1;
             let mut ms = MatchSet::zeroed();
@@ -1864,21 +1999,21 @@ fn build_match_set_for_function(
     Ok(result)
 }
 
-/// 用户空间路由回退选择。
+/// 用户空间Routing回退选择。
 ///
-/// 当 eBPF 路由无法决策时（outbound == [`outbound::CONTROL_PLANE_ROUTING`]），
-/// 由用户空间根据 [`RoutingParams`] 做出路由选择。
+/// 当 eBPF Routing无法决策时（outbound == [`outbound::CONTROL_PLANE_ROUTING`]），
+/// 由用户空间根据 [`RoutingParams`] 做出Routing选择。
 ///
 /// 这对应原始 dae Go 中 `control_plane.go` 的 `ChooseDialTarget()` 函数。
-/// eBPF 程序 `tproxy.c` 中定义了 `OUTBOUND_CONTROL_PLANE_ROUTING` 常量（0xFD），
-/// 当 eBPF 中的路由规则无法匹配时（例如域名尚未解析），流量回退到用户空间进行决策。
+/// eBPF program `tproxy.c` 中定义了 `OUTBOUND_CONTROL_PLANE_ROUTING` 常量（0xFD），
+/// 当 eBPF 中的Routing规则无法匹配时（例如Domain name尚未解析），流量回退到用户空间进行决策。
 ///
-/// # 参数
+/// # Parameters
 ///
 /// * `routing` — 编译好的 [`RoutingMatcher`]，包含 MatchSet 规则和 LPM/domain 数据
-/// * `ctx` — 连接的 [`RoutingParams`]，包含源/目标 IP、端口、协议、域名等信息
+/// * `ctx` — 连接的 [`RoutingParams`]，包含源/目标 IP、端口、协议、Domain name等信息
 ///
-/// # 返回值
+/// # Returns值
 ///
 /// 返回 [`RoutingResult`]，包含最终的 outbound 选择、mark 值和 must 标志。
 pub fn choose_dial_target(routing: &RoutingMatcher, ctx: &RoutingParams) -> RoutingResult {
@@ -2085,7 +2220,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
 
         // Should have 1 match set + 1 fallback
         assert_eq!(compiled.match_sets.len(), 2);
@@ -2110,7 +2245,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
 
         // Should have: PORT(LOGICAL_AND) + L4PROTO(proxy_id) + FALLBACK
         // The LOGICAL_AND separates the dport and l4proto subrules
@@ -2142,12 +2277,13 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
 
         assert_eq!(compiled.match_sets.len(), 2);
         assert_eq!(compiled.match_sets[0].r#type, match_type::DOMAIN_SET);
         assert_eq!(compiled.domain_sets.len(), 1);
-        assert_eq!(compiled.domain_sets[0], vec!["baidu.com"]);
+        // 保留 key 前缀以支持 suffix/full/regex/domain 语义（不再降级为裸后缀）
+        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com"]);
     }
 
     #[test]
@@ -2163,7 +2299,7 @@ mod tests {
         });
 
         let outbounds = config::OutboundsConfig::default();
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
 
         // dport(22) -> direct, dport(25) -> block, + fallback
         assert_eq!(compiled.match_sets[0].r#type, match_type::PORT);
@@ -2215,7 +2351,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         assert_eq!(compiled.match_sets[0].not, 1);
     }
 
@@ -2252,7 +2388,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
 
         // Should have: DIP + SIP + IPVERSION + DSCP + MAC + FALLBACK
         assert_eq!(compiled.match_sets.len(), 6);
@@ -2286,7 +2422,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         assert_eq!(compiled.match_sets.len(), 1); // just fallback
         assert_eq!(compiled.match_sets[0].r#type, match_type::FALLBACK);
         assert_eq!(
@@ -2305,7 +2441,7 @@ mod tests {
         });
 
         let outbounds = config::OutboundsConfig::default();
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
 
         // The "empty" rule creates a FALLBACK match set, plus the program fallback
         // So we should have 2 fallbacks
@@ -2330,7 +2466,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // Should match dport 80
@@ -2357,7 +2493,7 @@ mod tests {
         });
 
         let outbounds = config::OutboundsConfig::default();
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // Should match www.baidu.com
@@ -2392,7 +2528,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // TCP port 443 should match
@@ -2441,7 +2577,7 @@ mod tests {
             selectors: vec![],
         });
 
-        let compiled = compile_rules(&routing, &outbounds, &[]).unwrap();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
         // 10.x.x.x should match direct
@@ -2466,5 +2602,235 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(result.outbound, compiled.fallback_outbound);
+    }
+
+    // ── 规则集集成测试（设计 §6.3 / §9）──
+
+    /// 构造含 geoip/geosite/ip_list/domain_list 的内存缓存。
+    fn make_rule_set_cache() -> RuleSetCache {
+        use crate::ruleset::types::{DomainPattern, DomainPatternType, RuleSetData};
+        use std::collections::HashMap;
+
+        let cache = RuleSetCache::new();
+        let mut geoip = HashMap::new();
+        geoip.insert(
+            "cn".to_string(),
+            vec![
+                "1.0.1.0/24".parse::<ipnet::IpNet>().unwrap(),
+                "223.5.5.0/24".parse::<ipnet::IpNet>().unwrap(),
+            ],
+        );
+        cache.insert("geoip_main".into(), RuleSetData::GeoIp { entries: geoip });
+
+        let mut geosite = HashMap::new();
+        geosite.insert(
+            "cn".to_string(),
+            vec![
+                DomainPattern { pattern_type: DomainPatternType::Suffix, value: "baidu.com".into() },
+                DomainPattern { pattern_type: DomainPatternType::Full, value: "google.cn".into() },
+            ],
+        );
+        cache.insert("geosite_main".into(), RuleSetData::GeoSite { entries: geosite });
+
+        cache.insert(
+            "chinaip".into(),
+            RuleSetData::IpList(vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "192.168.0.0/16".parse().unwrap(),
+            ]),
+        );
+        cache.insert(
+            "chinadom".into(),
+            RuleSetData::DomainList(vec![DomainPattern {
+                pattern_type: DomainPatternType::Suffix,
+                value: "example.cn".into(),
+            }]),
+        );
+        cache
+    }
+
+    #[test]
+    fn test_compile_ruleset_geoip_and_set_ip() {
+        let mut routing = config::RoutingConfig::default();
+        // 新语法：target_ip(geoip:cn) / source_ip(set:chinaip)
+        routing.rules.push(config::RouteRule {
+            r#match: "target_ip(geoip:cn)".to_string(),
+            action: "direct".to_string(),
+        });
+        routing.rules.push(config::RouteRule {
+            r#match: "source_ip(set:chinaip)".to_string(),
+            action: "block".to_string(),
+        });
+        let outbounds = config::OutboundsConfig::default();
+
+        let cache = make_rule_set_cache();
+        let compiled = compile_rules(&routing, &outbounds, &[], Some(&cache)).unwrap();
+
+        assert_eq!(compiled.match_sets.len(), 3); // IP_SET + SOURCE_IP_SET + FALLBACK
+        assert_eq!(compiled.match_sets[0].r#type, match_type::IP_SET);
+        assert_eq!(compiled.match_sets[0].outbound, outbound::DIRECT);
+        assert_eq!(compiled.match_sets[1].r#type, match_type::SOURCE_IP_SET);
+        assert_eq!(compiled.match_sets[1].outbound, outbound::BLOCK);
+        // geoip:cn(2 网段) 与 set:chinaip(2 网段) → 2 个 LPM trie
+        assert_eq!(compiled.lpm_tries.len(), 2);
+
+        // Userspace evaluation verification
+        let matcher = RoutingMatcher::from_compiled(&compiled);
+        let r = matcher.match_routing(&RoutingParams {
+            dst_ip: Some("1.0.1.5".parse().unwrap()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, outbound::DIRECT, "geoip:cn 命中");
+
+        let r = matcher.match_routing(&RoutingParams {
+            src_ip: Some("10.1.1.1".parse().unwrap()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, outbound::BLOCK, "set:chinaip 命中");
+
+        let r = matcher.match_routing(&RoutingParams {
+            dst_ip: Some("8.8.8.8".parse().unwrap()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, compiled.fallback_outbound);
+    }
+
+    #[test]
+    fn test_compile_ruleset_geosite_and_domain_list() {
+        let mut routing = config::RoutingConfig::default();
+        // 新语法：target_domain(geosite:cn) / target_domain(set:chinadom)
+        routing.rules.push(config::RouteRule {
+            r#match: "target_domain(geosite:cn)".to_string(),
+            action: "direct".to_string(),
+        });
+        routing.rules.push(config::RouteRule {
+            r#match: "target_domain(set:chinadom)".to_string(),
+            action: "block".to_string(),
+        });
+        let outbounds = config::OutboundsConfig::default();
+
+        let cache = make_rule_set_cache();
+        let compiled = compile_rules(&routing, &outbounds, &[], Some(&cache)).unwrap();
+
+        assert_eq!(compiled.domain_sets.len(), 2);
+        // geosite:cn → suffix:baidu.com + full:google.cn（不再是降级后的 "cn"）
+        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com", "full:google.cn"]);
+        // set:chinadom → suffix:example.cn
+        assert_eq!(compiled.domain_sets[1], vec!["suffix:example.cn"]);
+
+        // Userspace evaluation verification
+        let matcher = RoutingMatcher::from_compiled(&compiled);
+        let r = matcher.match_routing(&RoutingParams {
+            domain: Some("www.baidu.com".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, outbound::DIRECT, "geosite:cn 命中子域");
+
+        let r = matcher.match_routing(&RoutingParams {
+            domain: Some("google.cn".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, outbound::DIRECT, "geosite:cn full 命中");
+
+        let r = matcher.match_routing(&RoutingParams {
+            domain: Some("api.example.cn".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, outbound::BLOCK, "set:chinadom 命中");
+
+        let r = matcher.match_routing(&RoutingParams {
+            domain: Some("www.google.com".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, compiled.fallback_outbound);
+    }
+
+    #[test]
+    fn test_domain_geosite_not_degraded_to_suffix() {
+        // 旧语法 `domain(geosite:cn)` 必须展开为 geosite 模式，而非降级为后缀 "cn"
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "domain(geosite:cn)".to_string(),
+            action: "direct".to_string(),
+        });
+        let outbounds = config::OutboundsConfig::default();
+        let cache = make_rule_set_cache();
+        let compiled = compile_rules(&routing, &outbounds, &[], Some(&cache)).unwrap();
+
+        assert_eq!(compiled.domain_sets.len(), 1);
+        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com", "full:google.cn"]);
+    }
+
+    #[test]
+    fn test_compile_ruleset_missing_data_fails_e2103() {
+        // 数据缺失默认编译失败（E2103），不再静默丢弃（缺陷 2 修复）
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "target_ip(geoip:cn)".to_string(),
+            action: "direct".to_string(),
+        });
+        let outbounds = config::OutboundsConfig::default();
+        // 不提供缓存 → E2103
+        let err = match compile_rules(&routing, &outbounds, &[], None) {
+            Ok(_) => panic!("expected E2103 error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("E2103"), "expected E2103, got: {msg}");
+
+        // 提供缓存但 code 不存在 → E2103
+        let mut routing2 = config::RoutingConfig::default();
+        routing2.rules.push(config::RouteRule {
+            r#match: "target_ip(geoip:us)".to_string(),
+            action: "direct".to_string(),
+        });
+        let cache = make_rule_set_cache();
+        let err = match compile_rules(&routing2, &outbounds, &[], Some(&cache)) {
+            Ok(_) => panic!("expected E2103 error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("E2103"), "expected E2103 for unknown code, got: {msg}");
+    }
+
+    #[test]
+    fn test_geoip_private_falls_back_to_builtin() {
+        // geoip:private 无数据时回退内置网段（warn），编译成功
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "target_ip(geoip:private)".to_string(),
+            action: "direct".to_string(),
+        });
+        let outbounds = config::OutboundsConfig::default();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
+        assert_eq!(compiled.lpm_tries.len(), 1);
+        // 内置 4 网段
+        assert_eq!(compiled.lpm_tries[0].len(), 4);
+
+        let matcher = RoutingMatcher::from_compiled(&compiled);
+        let r = matcher.match_routing(&RoutingParams {
+            dst_ip: Some("10.0.0.1".parse().unwrap()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, outbound::DIRECT);
+    }
+
+    #[test]
+    fn test_compile_ruleset_capacity_exceeded_e2106() {
+        // 构造超过 MAX_MATCH_SET_LEN 的 MatchSet → E2106
+        let mut routing = config::RoutingConfig::default();
+        for i in 0..(MAX_MATCH_SET_LEN + 10) {
+            routing.rules.push(config::RouteRule {
+                r#match: format!("dport({})", 1000 + (i % 60000) as u16),
+                action: "direct".to_string(),
+            });
+        }
+        let outbounds = config::OutboundsConfig::default();
+        let err = match compile_rules(&routing, &outbounds, &[], None) {
+            Ok(_) => panic!("expected E2106 error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("E2106"), "expected E2106, got: {msg}");
     }
 }

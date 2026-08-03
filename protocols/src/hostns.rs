@@ -30,29 +30,29 @@ use tokio::net::TcpStream;
 
 // ── dae-rs 自身流量专用 socket（“必须直连”约定）──
 
-/// dae-rs 自身流量专用 socket 配置。
+/// dae-rs self-traffic dedicated socket configuration.
 ///
-/// 设计约定：**所有从 dae-rs 进程发出的流量都必须直连**——不能被 eBPF
+/// Design convention: **all traffic emitted from dae-rs process must direct connect** -- cannot be intercepted by eBPF
 /// 透明代理管道劫持，否则会形成“代理连接 → 又被劫持 → 再代理”的循环。
 ///
-/// 实现依赖两层机制：
+/// Implementation relies on two layers of mechanisms:
 /// 1. `self_mark = shared::DAE_SOCKET_MARK`（0x100）：eBPF
-///    `pid_is_control_plane()` 的 SO_MARK 兜底判断命中 → 直接放行；
-/// 2. `host_ns_fd`：在宿主网络命名空间创建 socket（kdae-aligned）。
+///    `pid_is_control_plane()` SO_MARK fallback check hit → direct pass;
+/// 2. `host_ns_fd`：在宿主Network namespace creation socket（kdae-aligned）。
 ///
-/// 所有 dae-rs 出站 socket（拨号器、DNS 上游、透明回包等）都应通过
-/// [`connect_tcp`] / [`create_udp`] / [`create_transparent_udp`] 创建，
-/// 并传入本结构，而不是手动拼 SO_MARK。
+/// 所有 dae-rs 出站 socket（Dialer、DNS upstream、透明回包等）都应通过
+/// [`connect_tcp`] / [`create_udp`] / [`create_transparent_udp`] created,
+/// passing this structure, not manually assembling SO_MARK.
 #[derive(Debug, Clone, Copy)]
 pub struct DirectSocket {
-    /// SO_MARK 用于 eBPF 自排除（0 = 不设置）
+    /// SO_MARK for eBPF self-exclusion (0 = not set)
     pub self_mark: u32,
-    /// 宿主网络命名空间 fd（None = 当前命名空间）
+    /// Host network namespace fd（None = 当前命名空间）
     pub host_ns_fd: Option<RawFd>,
 }
 
 impl DirectSocket {
-    /// 控制面默认：DAE_SOCKET_MARK + 宿主 NS。
+    /// Control plane default: DAE_SOCKET_MARK + host NS.
     pub fn control_plane(host_ns_fd: Option<RawFd>) -> Self {
         Self {
             self_mark: shared::DAE_SOCKET_MARK,
@@ -60,7 +60,7 @@ impl DirectSocket {
         }
     }
 
-    /// 无标记（测试 / 无需自排除的场景）。
+    /// No mark (testing / scenarios without self-exclusion needed).
     pub fn plain() -> Self {
         Self {
             self_mark: 0,
@@ -206,8 +206,8 @@ pub async fn connect_tcp(
             }
 
             // Non-blocking connect: EINPROGRESS (and EAGAIN) is expected.
-            // 注意：Rust 将 EINPROGRESS(115) 映射为 ErrorKind::Other，
-            // 不能只用 kind() == WouldBlock 判断，必须检查原始 errno。
+            // Note: Rust maps EINPROGRESS(115) to ErrorKind::Other,
+            // cannot just use kind() == WouldBlock to judge, must check raw errno.
             let sockaddr = socket2::SockAddr::from(addr);
             let ret = unsafe {
                 libc::connect(
@@ -236,8 +236,8 @@ pub async fn connect_tcp(
         // Wait for the connection to complete (or fail, e.g. ECONNREFUSED).
         // Bounded by the outer dial_timeout.
         // Wait for the connection to complete (or fail, e.g. ECONNREFUSED).
-        // Bounded by the outer dial_timeout. EPOLLOUT 可能先于连接完成触发
-        // （此时 SO_ERROR 仍为 EINPROGRESS），需要继续等待而非报错。
+        // Bounded by the outer dial_timeout. EPOLLOUT may trigger before connection completes
+        // (at which point SO_ERROR is still EINPROGRESS), need to continue waiting rather than error.
         loop {
             stream.writable().await?;
             match stream.take_error() {
@@ -371,7 +371,7 @@ pub fn create_transparent_udp(
                 }
             }
 
-            // SO_REUSEADDR + SO_REUSEPORT: 并发查询同一目标地址时不 EADDRINUSE。
+            // SO_REUSEADDR + SO_REUSEPORT: no EADDRINUSE when concurrently querying the same target address.
             libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,

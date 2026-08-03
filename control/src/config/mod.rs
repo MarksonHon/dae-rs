@@ -32,6 +32,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use crate::ruleset::types::{RuleSetConfig, RuleSetType, RuleSetUpdate};
+
 // ============================================================================
 // Error Types & Diagnostic Codes
 // ============================================================================
@@ -202,6 +204,44 @@ pub enum ConfigError {
     #[error("[E2007] DNS routing fallback references unknown DNS group: '{group}'")]
     DnsFallbackUnknownGroup {
         group: String,
+    },
+
+    // ── Rule Set Errors ──
+    /// E2101: Duplicate rule set name (including default = block name)
+    #[error("[E2101] Duplicate rule set name: '{name}'")]
+    DuplicateRuleSet {
+        name: String,
+    },
+    /// E2102: Routing/DNS references unknown rule set
+    /// (Phase 3 enabled: this variant is reserved, not triggered in validator)
+    #[error("[E2102] Unknown rule set reference: '{reference}'")]
+    UnknownRuleSetRef {
+        reference: String,
+    },
+    /// E2103: Rule set data missing at compile time
+    /// (Phase 3 enabled: this variant is reserved, not triggered in validator)
+    #[error("[E2103] Rule set data missing for '{reference}': {reason}")]
+    RuleSetDataMissing {
+        reference: String,
+        reason: String,
+    },
+    /// E2104: Invalid rule set update expression (missing / conflict / bad time / bad period)
+    #[error("[E2104] Rule set '{name}' invalid update expression: {message}")]
+    InvalidRuleSetUpdate {
+        name: String,
+        message: String,
+    },
+    /// E2105: Invalid rule set URL (not http(s) or bad `#sha256=` fragment)
+    #[error("[E2105] Rule set '{name}' invalid URL: {message}")]
+    InvalidRuleSetUrl {
+        name: String,
+        message: String,
+    },
+    /// E2106: Rule set capacity exceeded at compile time (design §9.3)
+    /// MatchSet / LPM trie / domain set index exceeded → reject compilation.
+    #[error("[E2106] Rule set capacity exceeded: {detail}")]
+    RuleSetCapacityExceeded {
+        detail: String,
     },
 
     // ── Other ──
@@ -480,6 +520,15 @@ pub struct DaefileConfig {
     /// DNS configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsConfig>,
+    /// Rule set configuration (design §5).
+    ///
+    /// - daefile: top-level `rule_set { <name> { ... } }` block;
+    /// - JSON: object (key = ruleset name, value = entry object).
+    ///
+    /// Internally unified as `Vec<RuleSetConfig>`, JSON object↔array mapping by
+    /// [`rule_set_serde`] adapts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "rule_set_serde")]
+    pub rule_set: Vec<RuleSetConfig>,
 }
 
 impl Default for DaefileConfig {
@@ -493,7 +542,71 @@ impl Default for DaefileConfig {
             routing: RoutingConfig::default(),
             api: None,
             dns: None,
+            rule_set: Vec::new(),
         }
+    }
+}
+
+/// serde adaptation: `rule_set` in JSON is an **object** (key = ruleset name, value = entry),
+/// in memory (daefile parse result / scheduler input) is `Vec<RuleSetConfig>`.
+///
+/// When deserializing, the object key serves as the entry's default `name` (if not explicitly provided in value), and from
+/// `url#sha256=` extracts `expected_sha256` (if not explicitly provided), consistent with daefile path.
+pub mod rule_set_serde {
+    // Note: do not `use super::*` — it would introduce `super::Result` (`ConfigError` alias),
+    // conflicting with `Result<_, D::Error>` here.
+    use crate::ruleset::types::RuleSetConfig;
+    use serde::Deserialize;
+
+    /// `Vec<RuleSetConfig>` → JSON object `{ "<name>": <entry>, ... }`.
+    pub fn serialize<S>(
+        entries: &[RuleSetConfig],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for entry in entries {
+            map.serialize_entry(&entry.name, entry)?;
+        }
+        map.end()
+    }
+
+    /// JSON object → `Vec<RuleSetConfig>`.
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Vec<RuleSetConfig>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let map = std::collections::HashMap::<String, serde_json::Value>::deserialize(
+            deserializer,
+        )?;
+        let mut entries = Vec::with_capacity(map.len());
+        for (key, value) in map {
+            let mut obj = match value {
+                serde_json::Value::Object(o) => o,
+                _ => {
+                    return Err(D::Error::custom(format!(
+                        "rule_set entry '{key}' must be an object"
+                    )));
+                }
+            };
+            // default name = object key
+            if !obj.contains_key("name") {
+                obj.insert("name".to_string(), serde_json::Value::String(key));
+            }
+            let mut cfg: RuleSetConfig = RuleSetConfig::deserialize(serde_json::Value::Object(obj))
+                .map_err(D::Error::custom)?;
+            if cfg.expected_sha256.is_none() {
+                cfg.expected_sha256 = RuleSetConfig::expected_sha256_from_url(&cfg.url);
+            }
+            entries.push(cfg);
+        }
+        // Deterministic order (JSON objects are inherently unordered)
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
     }
 }
 

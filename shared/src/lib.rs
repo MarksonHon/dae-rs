@@ -1,58 +1,58 @@
 #![allow(dead_code)]
 
-//! 共享数据结构
+//! Shared data structures
 //!
-//! 本项目中共用的数据类型定义，用于跨模块（控制面、eBPF、协议层）通信。
-//! 所有类型均派生 `Serialize`/`Deserialize`，支持序列化传输。
+//! Common data type definitions used across modules (control plane, eBPF, protocol layer) for inter-module communication.
+//! All types derive `Serialize`/`Deserialize` for serialization support.
 
 use serde::{Deserialize, Serialize};
 
-/// dae-rs 内部 socket 的 fwmark 值。
+/// The fwmark value for dae-rs internal sockets.
 ///
-/// eBPF 程序通过 `pid_is_control_plane()` 和该 mark 识别代理自身发出的
-/// socket 流量并跳过（防止自我转发死循环）。必须与 TProxy（`SO_MARK`）和
-/// SOCKS5 拨号器使用的 mark 值保持一致。原版 dae 使用 `0x100`。
+/// eBPF programs identify proxy self-originated traffic via `pid_is_control_plane()` and this mark
+/// socket traffic and skip it (preventing self-forwarding dead loops). Must be consistent with TProxy (`SO_MARK`) and
+/// the SOCKS5 dialer's mark value. The original dae uses `0x100`.
 pub const DAE_SOCKET_MARK: u32 = 0x100;
 
-/// 分流动作
+/// Split/flow action
 ///
-/// 规则匹配后的执行动作，决定流量去向。
+/// The action to take after a rule matches, determining traffic direction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Action {
-    /// 直连：放行走系统路由
+    /// Direct: let traffic pass through the system routing
     Direct,
-    /// 代理：通过指定出站组转发
+    /// Proxy: forward through the specified outbound group
     Proxy(String),
 }
 
-/// 规则条目
+/// Rule entry
 ///
-/// 表示一条分流规则，由匹配条件和执行动作组成。
+/// Represents a split/flow rule consisting of a match condition and an action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
-    /// 目的 IP 或 CIDR
+    /// Destination IP or CIDR
     pub dip: Option<String>,
-    /// 目的端口
+    /// Destination port
     pub dport: Option<u16>,
-    /// L4 协议类型
+    /// L4 protocol type
     pub l4proto: Option<L4Proto>,
-    /// 匹配后的执行动作
+    /// Action to take after a match
     pub action: Action,
 }
 
-/// 网络端点
+/// Network endpoint
 ///
-/// 表示一个 IP 地址和端口的组合。
+/// Represents a combination of an IP address and port.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Endpoint {
-    /// IP 地址（IPv4 或 IPv6 字符串形式）
+    /// IP address (IPv4 or IPv6 string form)
     pub ip: String,
-    /// 端口号
+    /// Port number
     pub port: u16,
 }
 
 impl Endpoint {
-    /// 创建新的端点
+    /// Create a new endpoint
     pub fn new(ip: impl Into<String>, port: u16) -> Self {
         Self {
             ip: ip.into(),
@@ -61,17 +61,17 @@ impl Endpoint {
     }
 }
 
-/// L4 协议类型
+/// L4 protocol type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum L4Proto {
-    /// TCP 协议
+    /// TCP protocol
     Tcp,
-    /// UDP 协议
+    /// UDP protocol
     Udp,
 }
 
 impl L4Proto {
-    /// 将协议类型转换为 eBPF map 中使用的数值表示
+    /// Convert protocol type to the numeric representation used in eBPF maps
     pub fn to_u8(&self) -> u8 {
         match self {
             L4Proto::Tcp => 1,
@@ -79,7 +79,7 @@ impl L4Proto {
         }
     }
 
-    /// 从 IP 协议号创建 L4Proto
+    /// Create L4Proto from IP protocol number
     pub fn from_ip_protocol(protocol: u8) -> Option<Self> {
         match protocol {
             6 => Some(L4Proto::Tcp),
@@ -89,40 +89,40 @@ impl L4Proto {
     }
 }
 
-/// 分流决策结果
+/// Split/flow decision result
 ///
-/// eBPF 程序对每个数据包作出的分流决策。
+/// The split/flow decision made by the eBPF program for each packet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProxyDecision {
-    /// 直连
+    /// Direct
     Direct,
-    /// 代理（包含出站组名）
+    /// Proxy (includes outbound group name)
     Proxy(String),
-    /// 阻断（预留，第一阶段未实现）
+    /// Block (reserved, not implemented in phase 1)
     Block,
 }
 
-/// 连接四元组（用于 conntrack）
+/// Connection quadruplet (for conntrack)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct FlowKey {
-    /// 源 IP
+    /// Source IP
     pub src_ip: [u8; 16],
-    /// 目的 IP
+    /// Destination IP
     pub dst_ip: [u8; 16],
-    /// 源端口
+    /// Source port
     pub src_port: u16,
-    /// 目的端口
+    /// Destination port
     pub dst_port: u16,
-    /// 协议类型
+    /// Protocol type
     pub protocol: u8,
 }
 
-/// 配置版本信息
+/// Configuration version info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigMeta {
-    /// 配置版本号
+    /// Configuration version number
     pub version: u32,
-    /// 配置生成时间戳
+    /// Configuration generation timestamp
     pub generated_at: u64,
 }
 

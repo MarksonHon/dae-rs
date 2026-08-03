@@ -1,6 +1,11 @@
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::warn;
+
 use crate::config::{DnsConfig, DnsGroupConfig};
+use crate::ruleset::cache::RuleSetCache;
+use crate::ruleset::refparse::{match_domain_patterns, match_qname_value, parse_ref, RuleSetRef};
 
 /// Result of matching a DNS query to a group and upstream
 #[derive(Debug, Clone)]
@@ -46,6 +51,8 @@ pub struct DnsRouter {
     fallback_group: String,
     /// Top-level DNS routing rules
     rules: Vec<DnsRouteRule>,
+    /// Ruleset in-memory cache (for `qname(geosite:...)` / `qname(set:...)` runtime matching).
+    rule_set_cache: RuleSetCache,
 }
 
 /// Compiled DNS routing rule
@@ -68,12 +75,25 @@ enum DnsMatchType {
     QName,
     /// Match by query type (A, AAAA, etc.)
     QType,
+    /// Match by geosite dat code (Domain name pattern, `qname(geosite:<code>)`).
+    /// code stored in `match_value`.
+    GeoSite,
+    /// Match by `set:<name>`（domain_list）。
+    /// name stored in `match_value`.
+    Set,
     /// Always matches
     Any,
 }
 
 impl DnsRouter {
-    pub fn new(config: &DnsConfig) -> Self {
+    /// Construct DNS router.
+    ///
+    /// * `config` — DNS configuration;
+    /// * `rule_set_cache` — ruleset in-memory cache (`qname(geosite:...)` / `qname(set:...)`
+    ///   for runtime matching).
+    ///
+    /// Compile Routing rules; unknown/invalid match expressions no longer silently discarded, returns error.
+    pub fn new(config: &DnsConfig, rule_set_cache: RuleSetCache) -> Result<Self> {
         let mut groups = HashMap::new();
         for group in &config.groups {
             groups.insert(group.name.clone(), group.clone());
@@ -83,8 +103,8 @@ impl DnsRouter {
             .routing
             .rules
             .iter()
-            .filter_map(compile_route_rule)
-            .collect();
+            .map(compile_route_rule)
+            .collect::<Result<Vec<_>>>()?;
 
         let fallback_group = if config.routing.fallback.is_empty() {
             config
@@ -104,8 +124,8 @@ impl DnsRouter {
                 let compiled: Vec<CompiledRequestRule> = routing
                     .rules
                     .iter()
-                    .filter_map(compile_request_rule)
-                    .collect();
+                    .map(compile_request_rule)
+                    .collect::<Result<Vec<_>>>()?;
                 request_rules.insert(group.name.clone(), compiled);
                 request_fallback.insert(group.name.clone(), routing.fallback.clone());
             } else {
@@ -115,13 +135,14 @@ impl DnsRouter {
             }
         }
 
-        Self {
+        Ok(Self {
             groups: Arc::new(groups),
             request_rules,
             request_fallback,
             fallback_group,
             rules,
-        }
+            rule_set_cache,
+        })
     }
 
     /// Match a DNS query to a group and upstream
@@ -170,23 +191,8 @@ impl DnsRouter {
         let upstream_label = if let Some(rules) = self.request_rules.get(&group.name) {
             let mut matched_label = None;
             for rule in rules {
-                let matched = match rule.match_type {
-                    DnsMatchType::QName => {
-                        let value = rule.match_value.trim_start_matches("suffix:");
-                        let value = value.trim_start_matches('.');
-                        qname == value || qname.ends_with(&format!(".{}", value))
-                    }
-                    DnsMatchType::QType => {
-                        let type_str = rule.match_value.to_uppercase();
-                        match type_str.as_str() {
-                            "A" => qtype == 1,
-                            "AAAA" => qtype == 28,
-                            "ANY" => qtype == 255,
-                            _ => false,
-                        }
-                    }
-                    DnsMatchType::Any => true,
-                };
+                let matched =
+                    self.eval_match_type(&rule.match_type, &rule.match_value, qname, qtype);
                 let matched = if rule.negated { !matched } else { matched };
                 if matched {
                     matched_label = Some(rule.upstream_label.clone());
@@ -211,17 +217,38 @@ impl DnsRouter {
         }
     }
 
-    /// Evaluate a single rule against query parameters
-    fn evaluate_match(&self, rule: &DnsRouteRule, qname: &str, qtype: u16) -> bool {
-        let matched = match rule.match_type {
-            DnsMatchType::QName => {
-                // Simple suffix match
-                let value = rule.match_value.trim_start_matches("suffix:");
-                let value = value.trim_start_matches('.');
-                qname == value || qname.ends_with(&format!(".{}", value))
-            }
+    /// Evaluate a match type (**without** NOT negation).
+    ///
+    /// - `QName`: normal suffix/pattern matching (`suffix:`/`full:`/`keyword:`/`regex:`/bare value),
+    ///   **case insensitive** (fixes defect).
+    /// - `GeoSite`: look up Ruleset cache geosite code → Domain name pattern match;
+    /// - `Set`: look up Ruleset cache domain_list → Domain name pattern match;
+    /// - `QType` / `Any`: original logic.
+    fn eval_match_type(&self, mt: &DnsMatchType, value: &str, qname: &str, qtype: u16) -> bool {
+        match mt {
+            DnsMatchType::QName => match_qname_value(qname, value),
+            DnsMatchType::GeoSite => match self.rule_set_cache.find_geosite_code(value) {
+                Some(patterns) => match_domain_patterns(qname, &patterns),
+                None => {
+                    warn!(
+                        code = %value,
+                        "DNS qname(geosite:...) code not found in rule set cache; no match"
+                    );
+                    false
+                }
+            },
+            DnsMatchType::Set => match self.rule_set_cache.get_set_domains(value) {
+                Some(patterns) => match_domain_patterns(qname, &patterns),
+                None => {
+                    warn!(
+                        name = %value,
+                        "DNS qname(set:...) not found or not a domain_list; no match"
+                    );
+                    false
+                }
+            },
             DnsMatchType::QType => {
-                let type_str = rule.match_value.to_uppercase();
+                let type_str = value.to_uppercase();
                 match type_str.as_str() {
                     "A" => qtype == 1,
                     "NS" => qtype == 2,
@@ -247,19 +274,38 @@ impl DnsRouter {
                 }
             }
             DnsMatchType::Any => true,
-        };
+        }
+    }
 
+    /// Evaluate a single rule against query parameters
+    fn evaluate_match(&self, rule: &DnsRouteRule, qname: &str, qtype: u16) -> bool {
+        let matched = self.eval_match_type(&rule.match_type, &rule.match_value, qname, qtype);
         if rule.negated { !matched } else { matched }
     }
 }
 
+/// Compile the qname/qtype inner part of a match expression (`geosite:`/`set:`/bare value),
+/// returns `(match_type, match_value)`.
+fn compile_qname_value(value: &str, raw: &str) -> Result<(DnsMatchType, String)> {
+    match parse_ref(value) {
+        RuleSetRef::GeoSite(code) => Ok((DnsMatchType::GeoSite, code)),
+        RuleSetRef::Set(name) => Ok((DnsMatchType::Set, name)),
+        RuleSetRef::GeoIp(code) => Err(anyhow!(
+            "qname does not support geoip: reference '{raw}' (code='{code}')"
+        )),
+        RuleSetRef::Plain(v) => Ok((DnsMatchType::QName, v.to_string())),
+    }
+}
+
 /// Compile a routing rule string into a DnsRouteRule
-fn compile_route_rule(rule: &crate::config::DnsRouteRule) -> Option<DnsRouteRule> {
+///
+/// Unknown/invalid match expressions no longer silently discarded, returns error (design §6.4).
+fn compile_route_rule(rule: &crate::config::DnsRouteRule) -> Result<DnsRouteRule> {
     let raw = rule.r#match.trim();
     let target_group = rule.action.clone();
 
     if raw == "any" {
-        return Some(DnsRouteRule {
+        return Ok(DnsRouteRule {
             match_type: DnsMatchType::Any,
             match_value: String::new(),
             negated: false,
@@ -268,22 +314,27 @@ fn compile_route_rule(rule: &crate::config::DnsRouteRule) -> Option<DnsRouteRule
     }
 
     if let Some(value) = raw.strip_prefix("qname(") {
-        let value = value.strip_suffix(')')?;
+        let value = value
+            .strip_suffix(')')
+            .ok_or_else(|| anyhow!("invalid qname rule: '{raw}'"))?;
         let negated = value.starts_with('!');
         let value = if negated { &value[1..] } else { value };
-        return Some(DnsRouteRule {
-            match_type: DnsMatchType::QName,
-            match_value: value.to_string(),
+        let (match_type, match_value) = compile_qname_value(value, raw)?;
+        return Ok(DnsRouteRule {
+            match_type,
+            match_value,
             negated,
             target_group,
         });
     }
 
     if let Some(value) = raw.strip_prefix("qtype(") {
-        let value = value.strip_suffix(')')?;
+        let value = value
+            .strip_suffix(')')
+            .ok_or_else(|| anyhow!("invalid qtype rule: '{raw}'"))?;
         let negated = value.starts_with('!');
         let value = if negated { &value[1..] } else { value };
-        return Some(DnsRouteRule {
+        return Ok(DnsRouteRule {
             match_type: DnsMatchType::QType,
             match_value: value.to_string(),
             negated,
@@ -291,16 +342,16 @@ fn compile_route_rule(rule: &crate::config::DnsRouteRule) -> Option<DnsRouteRule
         });
     }
 
-    None
+    Err(anyhow!("unsupported DNS routing match expression: '{raw}'"))
 }
 
 /// Compile a per-group request routing rule into a CompiledRequestRule
-fn compile_request_rule(rule: &crate::config::DnsRouteRule) -> Option<CompiledRequestRule> {
+fn compile_request_rule(rule: &crate::config::DnsRouteRule) -> Result<CompiledRequestRule> {
     let raw = rule.r#match.trim();
     let upstream_label = rule.action.clone();
 
     if raw == "any" {
-        return Some(CompiledRequestRule {
+        return Ok(CompiledRequestRule {
             match_type: DnsMatchType::Any,
             match_value: String::new(),
             negated: false,
@@ -309,22 +360,27 @@ fn compile_request_rule(rule: &crate::config::DnsRouteRule) -> Option<CompiledRe
     }
 
     if let Some(value) = raw.strip_prefix("qname(") {
-        let value = value.strip_suffix(')')?;
+        let value = value
+            .strip_suffix(')')
+            .ok_or_else(|| anyhow!("invalid qname rule: '{raw}'"))?;
         let negated = value.starts_with('!');
         let value = if negated { &value[1..] } else { value };
-        return Some(CompiledRequestRule {
-            match_type: DnsMatchType::QName,
-            match_value: value.to_string(),
+        let (match_type, match_value) = compile_qname_value(value, raw)?;
+        return Ok(CompiledRequestRule {
+            match_type,
+            match_value,
             negated,
             upstream_label,
         });
     }
 
     if let Some(value) = raw.strip_prefix("qtype(") {
-        let value = value.strip_suffix(')')?;
+        let value = value
+            .strip_suffix(')')
+            .ok_or_else(|| anyhow!("invalid qtype rule: '{raw}'"))?;
         let negated = value.starts_with('!');
         let value = if negated { &value[1..] } else { value };
-        return Some(CompiledRequestRule {
+        return Ok(CompiledRequestRule {
             match_type: DnsMatchType::QType,
             match_value: value.to_string(),
             negated,
@@ -332,7 +388,7 @@ fn compile_request_rule(rule: &crate::config::DnsRouteRule) -> Option<CompiledRe
         });
     }
 
-    None
+    Err(anyhow!("unsupported DNS request routing match expression: '{raw}'"))
 }
 
 #[cfg(test)]
@@ -386,7 +442,7 @@ mod tests {
             vec![],
             "g1",
         );
-        let router = DnsRouter::new(&config);
+        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
         let result = router.match_query("example.com", 1);
         assert_eq!(result.upstream_label, "a");
     }
@@ -408,7 +464,7 @@ mod tests {
             vec![],
             "g1",
         );
-        let router = DnsRouter::new(&config);
+        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
 
         // google.com matches the rule → fast
         let result = router.match_query("google.com", 1);
@@ -436,7 +492,7 @@ mod tests {
             vec![],
             "g1",
         );
-        let router = DnsRouter::new(&config);
+        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
 
         // AAAA query → ipv6
         let result = router.match_query("example.com", 28);
@@ -464,7 +520,7 @@ mod tests {
             vec![],
             "g1",
         );
-        let router = DnsRouter::new(&config);
+        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
 
         // sub.example.cn matches suffix:cn → cn
         let result = router.match_query("sub.example.cn", 1);
@@ -492,7 +548,7 @@ mod tests {
             vec![],
             "g1",
         );
-        let router = DnsRouter::new(&config);
+        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
 
         // any matches everything
         let result = router.match_query("anything.xyz", 1);
@@ -512,7 +568,7 @@ mod tests {
             }],
             "trusted",
         );
-        let router = DnsRouter::new(&config);
+        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
 
         // .cn → cn_dns group → alidns
         let result = router.match_query("example.cn", 1);
@@ -523,5 +579,118 @@ mod tests {
         let result = router.match_query("example.com", 1);
         assert_eq!(result.upstream_label, "cloudflare");
         assert_eq!(result.group.name, "trusted");
+    }
+
+    /// Construct Ruleset cache with geosite/domain_list data.
+    fn make_geosite_cache() -> RuleSetCache {
+        use crate::ruleset::types::{DomainPattern, DomainPatternType, RuleSetData};
+        let cache = RuleSetCache::new();
+        let mut geosite = std::collections::HashMap::new();
+        geosite.insert(
+            "cn".to_string(),
+            vec![DomainPattern {
+                pattern_type: DomainPatternType::Suffix,
+                value: "baidu.com".into(),
+            }],
+        );
+        cache.insert("geosite_main".into(), RuleSetData::GeoSite { entries: geosite });
+        cache.insert(
+            "chinadom".into(),
+            RuleSetData::DomainList(vec![DomainPattern {
+                pattern_type: DomainPatternType::Full,
+                value: "example.cn".into(),
+            }]),
+        );
+        cache
+    }
+
+    #[test]
+    fn test_top_level_qname_geosite_routing() {
+        let config = make_config(
+            vec![
+                make_group("cn_dns", &[("alidns", "223.5.5.5")], None),
+                make_group("trusted", &[("cloudflare", "1.1.1.1")], None),
+            ],
+            vec![config::DnsRouteRule {
+                r#match: "qname(geosite:cn)".into(),
+                action: "cn_dns".into(),
+            }],
+            "trusted",
+        );
+        let router = DnsRouter::new(&config, make_geosite_cache()).unwrap();
+
+        // baidu.com hits geosite:cn → cn_dns
+        let result = router.match_query("www.baidu.com", 1);
+        assert_eq!(result.group.name, "cn_dns");
+        // Case insensitive
+        let result = router.match_query("WWW.BAIDU.COM", 1);
+        assert_eq!(result.group.name, "cn_dns");
+        // Others → trusted
+        let result = router.match_query("www.google.com", 1);
+        assert_eq!(result.group.name, "trusted");
+    }
+
+    #[test]
+    fn test_top_level_qname_set_routing() {
+        let config = make_config(
+            vec![
+                make_group("cn_dns", &[("alidns", "223.5.5.5")], None),
+                make_group("trusted", &[("cloudflare", "1.1.1.1")], None),
+            ],
+            vec![config::DnsRouteRule {
+                r#match: "qname(set:chinadom)".into(),
+                action: "cn_dns".into(),
+            }],
+            "trusted",
+        );
+        let router = DnsRouter::new(&config, make_geosite_cache()).unwrap();
+
+        // example.cn full hit
+        let result = router.match_query("example.cn", 1);
+        assert_eq!(result.group.name, "cn_dns");
+        // Others → trusted
+        let result = router.match_query("www.google.com", 1);
+        assert_eq!(result.group.name, "trusted");
+    }
+
+    #[test]
+    fn test_request_routing_qname_geosite() {
+        let config = make_config(
+            vec![make_group(
+                "g1",
+                &[("cn_up", "1.1.1.1"), ("intl", "2.2.2.2")],
+                Some(config::DnsGroupRequestRouting {
+                    rules: vec![config::DnsRouteRule {
+                        r#match: "qname(geosite:cn)".into(),
+                        action: "cn_up".into(),
+                    }],
+                    fallback: "intl".into(),
+                }),
+            )],
+            vec![],
+            "g1",
+        );
+        let router = DnsRouter::new(&config, make_geosite_cache()).unwrap();
+
+        let result = router.match_query("www.baidu.com", 1);
+        assert_eq!(result.upstream_label, "cn_up");
+        let result = router.match_query("www.google.com", 1);
+        assert_eq!(result.upstream_label, "intl");
+    }
+
+    #[test]
+    fn test_compile_route_rule_unknown_expression_errors() {
+        // Unknown conditions no longer silently discarded, changed to compilation error
+        let rule = config::DnsRouteRule {
+            r#match: "bogus(foo)".into(),
+            action: "g".into(),
+        };
+        assert!(compile_route_rule(&rule).is_err());
+        // qname(geoip:...) invalid reference
+        let rule = config::DnsRouteRule {
+            r#match: "qname(geoip:cn)".into(),
+            action: "g".into(),
+        };
+        assert!(compile_route_rule(&rule).is_err());
     }
 }

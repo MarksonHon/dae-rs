@@ -27,6 +27,10 @@ socket2 = { version = "0.5", features = ["all"] }
 ipnet = "2"
 libc = "0.2"
 regex = "1"
+# 规则集下载：HTTP 客户端（SOCKS5 代理 + rustls TLS，与现有 rustls 栈一致；关闭默认 TLS 避免 openssl）
+reqwest = { version = "0.12", default-features = false, features = ["socks", "rustls-tls-native-roots"] }
+# 规则集文件 sha256 校验
+sha2 = "0.10"
 rtnetlink = "0.21"
 netlink-packet-route = "0.21"
 
@@ -44,3 +48,7 @@ libbpf-cargo = "0.24"
 
 [dev-dependencies]
 tower = "0.5"
+# 规则集存储/下载单元测试使用临时目录
+tempfile = "3"
+# 规则集调度器测试：paused 时间（start_paused / tokio::time::advance）
+tokio = { version = "1", features = ["test-util"] }

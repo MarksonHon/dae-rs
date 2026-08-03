@@ -5,11 +5,11 @@
 //! # 数据流
 //!
 //! ```text
-//! 客户端 → eBPF/策略路由 → veth pair → 代理命名空间
+//! 客户端 → eBPF/策略Routing → veth pair → 代理命名空间
 //!                                         ↓
 //!                                    TProxy 监听器
 //!                                         ↓
-//!                                  SOCKS5 出站拨号器
+//!                                  SOCKS5 出站Dialer
 //!                                         ↓
 //!                                    上游代理服务器
 //!                                         ↓
@@ -20,7 +20,7 @@
 //!
 //! * [`TproxyListener`] — TProxy 监听器，在代理命名空间内监听端口
 //! * [`handle_connection`] — TCP 双向中继函数
-//! * [`get_original_dst`] — 获取 TProxy 透明代理的原始目标地址
+//! * [`get_original_dst`] — 获取 TProxy transparent proxy的原始目标地址
 //!
 //! # 依赖
 //!
@@ -115,8 +115,8 @@ const SO_REUSEPORT: libc::c_int = 15;
 
 /// `SO_MARK` socket 选项值（Linux）
 ///
-/// 设置 socket 的 fwmark，用于策略路由和 eBPF 程序识别自身流量。
-/// 原版 dae 使用 0x100 作为内部 socket 标记。
+/// 设置 socket 的 fwmark，用于策略Routing和 eBPF program识别自身流量。
+/// original dae uses 0x100 as internal socket mark。
 const SO_MARK: libc::c_int = 36;
 
 // ============================================================================
@@ -125,10 +125,10 @@ const SO_MARK: libc::c_int = 36;
 
 /// TProxy 监听器
 ///
-/// 透明代理监听器，接收从内核（通过 eBPF + 策略路由）重定向到代理命名空间的
-/// TCP 连接，通过 SOCKS5 出站拨号器转发到上游代理。
+/// 透明代理监听器，接收从内核（通过 eBPF + 策略Routing）重定向到代理命名空间的
+/// TCP 连接，通过 SOCKS5 出站Dialer转发到上游代理。
 ///
-/// # 示例
+/// # Examples
 ///
 /// ```no_run
 /// use control::net::tproxy::TproxyListener;
@@ -148,13 +148,13 @@ const SO_MARK: libc::c_int = 36;
 /// # }
 /// ```
 pub struct TproxyListener {
-    /// 监听地址（在代理命名空间内，如 `0.0.0.0:15080`）
+    /// Listen address（在代理命名空间内，如 `0.0.0.0:15080`）
     listen_addr: SocketAddr,
-    /// 出站拨号器（按配置的协议构造）
+    /// 出站Dialer（按配置的协议构造）
     dialer: Arc<dyn OutboundDialer>,
-    /// 运行标记
+    /// Running flag
     running: Arc<AtomicBool>,
-    /// socket 标记值（用于 eBPF 自排除，默认 0x100）
+    /// Socket mark value (for eBPF self-exclusion, default 0x100)
     socket_mark: u32,
     /// 停止信号（通知 accept 循环退出，无需轮询）
     stop_signal: Arc<Notify>,
@@ -163,10 +163,10 @@ pub struct TproxyListener {
 impl TproxyListener {
     /// 创建新的 TProxy 监听器
     ///
-    /// # 参数
+    /// # Parameters
     ///
     /// * `listen_addr` — 监听地址（如 `0.0.0.0:15080`）
-    /// * `dialer` — 出站拨号器
+    /// * `dialer` — 出站Dialer
     pub fn new(listen_addr: SocketAddr, dialer: Arc<dyn OutboundDialer>) -> Self {
         Self {
             listen_addr,
@@ -192,17 +192,17 @@ impl TproxyListener {
         }
     }
 
-    /// 获取监听地址
+    /// Get listen address
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
 
-    /// 获取出站拨号器的引用
+    /// 获取出站Dialer的引用
     pub fn dialer(&self) -> &Arc<dyn OutboundDialer> {
         &self.dialer
     }
 
-    /// 检查监听器是否正在运行
+    /// Check if listener is running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -502,15 +502,15 @@ impl std::fmt::Debug for TproxyListener {
 ///
 /// 1. **获取原始目标地址** — 从 `TcpStream` 中获取原始目标地址
 ///    （利用 TProxy 的 `IP_TRANSPARENT` 特性，`getsockname()` 返回原始目标地址）
-/// 2. **SOCKS5 拨号** — 创建一个 SOCKS5 拨号器实例并调用 `dial(target_addr)` 建立到上游的连接
+/// 2. **SOCKS5 拨号** — 创建一个 SOCKS5 Dialer实例并调用 `dial(target_addr)` 建立到上游的连接
 /// 3. **获取 `ProxyConn`** — 获取实现了 `AsyncRead + AsyncWrite` 的代理连接
 /// 4. **双向数据拷贝** — 使用 `tokio::io::copy_bidirectional` 进行双向数据拷贝
 /// 5. **连接关闭** — 等待双向拷贝完成，确保干净关闭连接
 ///
-/// # 参数
+/// # Parameters
 ///
 /// * `inbound` — 从 TProxy 接收的客户端连接
-/// * `dialer` — SOCKS5 出站拨号器
+/// * `dialer` — SOCKS5 出站Dialer
 ///
 /// # 错误处理
 ///
@@ -538,10 +538,10 @@ async fn handle_connection(
     debug!(orig_dst = %orig_dst, "handle_connection: got original destination");
 
     // ---- 步骤 1.5：禁用 Nagle（TCP_NODELAY），降低交互式小包延迟 ----
-    // 入站连接由内核 accept 默认开启 Nagle；出站连接在 SOCKS5 拨号器中设置。
+    // 入站连接由内核 accept 默认开启 Nagle；出站连接在 SOCKS5 Dialer中设置。
     set_tcp_nodelay(&inbound);
 
-    // ---- 步骤 2：通过出站拨号器拨号到目标 ----
+    // ---- 步骤 2：通过出站Dialer拨号到目标 ----
     let protocol = dialer.protocol_name();
     let proxy_addr = dialer.proxy_addr();
     let dial_result = dialer.dial(&orig_dst.to_string()).await;
@@ -653,7 +653,7 @@ async fn handle_connection(
 }
 
 // ============================================================================
-// 辅助函数
+// Helper function
 // ============================================================================
 
 /// 获取 TProxy 连接的原始目标地址
@@ -670,11 +670,11 @@ async fn handle_connection(
 /// TProxy 模式：getsockname() → 原始目标地址（如 1.2.3.4:80）
 /// ```
 ///
-/// # 参数
+/// # Parameters
 ///
 /// * `stream` — TProxy 接收的 TCP 连接
 ///
-/// # 返回
+/// # Returns
 ///
 /// 返回原始目标地址（`SocketAddr`）。
 ///
@@ -1290,15 +1290,15 @@ mod tests {
 ///
 /// 透明代理 UDP 流量，通过 `IP_RECVORIGDSTADDR` 获取原始目标地址。
 /// 对于 DNS 流量（目标端口 53），使用 DNS 劫持：将查询转发到内部 DNS handler
-/// 进行处理，而不是通过 SOCKS5 代理。这样可以支持域名路由、缓存等功能。
+/// 进行处理，而不是通过 SOCKS5 代理。这样可以支持Domain nameRouting、缓存等功能。
 pub struct UdpTproxyListener {
-    /// 监听地址（如 `0.0.0.0:15080` 或 `[::]:15080`）
+    /// Listen address（如 `0.0.0.0:15080` 或 `[::]:15080`）
     listen_addr: SocketAddr,
-    /// 出站拨号器
+    /// 出站Dialer
     dialer: Arc<dyn OutboundDialer>,
-    /// 运行标记
+    /// Running flag
     running: Arc<AtomicBool>,
-    /// socket 标记值（用于 eBPF 自排除，默认 0x100）
+    /// Socket mark value (for eBPF self-exclusion, default 0x100)
     socket_mark: u32,
     /// 停止信号（通知接收循环立即退出）
     stop_signal: Arc<Notify>,
@@ -1306,11 +1306,11 @@ pub struct UdpTproxyListener {
     /// 当收到 DNS 查询时，将查询转发到此地址的 DNS handler 处理，
     /// 而不是通过 SOCKS5 代理。None 表示不使用 DNS 劫持（回退到 SOCKS5）。
     dns_forward_addr: Option<SocketAddr>,
-    /// 宿主网络命名空间 fd。
+    /// Host network namespace fd.
     ///
-    /// 设置后，所有上行 UDP socket（DNS 劫持查询 socket、UDP relay 响应
+    /// After setting, all upstream UDP sockets (DNS hijack query sockets, UDP relay responses
     /// socket）在宿主 NS 中创建并发出（与 kdae 对齐），源地址为宿主真实
-    /// WAN 地址而非 daens 内部地址。`None` 表示在当前命名空间中创建。
+    /// WAN address instead of daens internal address。`None` 表示在当前命名空间中创建。
     host_ns_fd: Option<RawFd>,
 }
 
@@ -1345,9 +1345,9 @@ impl UdpTproxyListener {
         }
     }
 
-    /// 设置宿主网络命名空间 fd。
+    /// Set host network namespace fd.
     ///
-    /// 设置后，所有上行 UDP socket（DNS 劫持查询 socket、UDP relay 响应
+    /// After setting, all upstream UDP sockets (DNS hijack query sockets, UDP relay responses
     /// socket）在宿主 NS 中创建（与 kdae 对齐）。
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
@@ -1364,12 +1364,12 @@ impl UdpTproxyListener {
         );
     }
 
-    /// 获取监听地址
+    /// Get listen address
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
 
-    /// 检查监听器是否正在运行
+    /// Check if listener is running
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -1833,7 +1833,7 @@ impl UdpFlowPool {
             }
         }
 
-        // 通过拨号器建立协议对应的 UDP 中继会话（宿主 NS 中创建）。
+        // 通过Dialer建立协议对应的 UDP 中继会话（宿主 NS 中创建）。
         let session: Arc<dyn UdpSession> = Arc::from(dialer.udp_dial().await?);
         info!(
             "UDP  {} -> {} [PROXY] outbound via {} -> proxy {}",
@@ -2071,11 +2071,11 @@ async fn create_marked_udp_socket(
 /// `cmsg_len` 的大小和对齐差异（64 位系统上 `cmsg_len` 为 8 字节，32 位系统上为 4 字节），
 /// 避免硬编码 `u64` 解析导致的跨架构兼容性问题。
 ///
-/// # 参数
+/// # Parameters
 ///
 /// * `cmsg_data` — 辅助数据（cmsg）缓冲区
 ///
-/// # 返回
+/// # Returns
 ///
 /// 如果成功解析到原始目标地址，返回 `Some(SocketAddr)`。
 pub fn parse_orig_dst_from_cmsg(cmsg_data: &[u8]) -> Option<SocketAddr> {

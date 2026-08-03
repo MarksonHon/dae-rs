@@ -5,9 +5,9 @@
 //! The `run()` function is the system's main entry point, orchestrating the full
 //! startup/shutdown lifecycle.
 
-// 全局内存分配器（dae-rs 仅支持 Linux）：
-// - gnu 目标：jemalloc，多线程性能好、内存碎片少，适合长时间运行的代理进程
-// - musl 目标：mimalloc，轻量、与 musl 完全兼容
+// Global memory allocator (dae-rs only supports Linux):
+// - gnu target: jemalloc, good multi-threaded performance, low memory fragmentation, suitable for long-running proxy processes
+// - musl target: mimalloc, lightweight, fully compatible with musl
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

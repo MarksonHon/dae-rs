@@ -64,7 +64,7 @@ pub use shadowsocks::ShadowsocksError;
 /// Trojan protocol support.
 ///
 /// - TLS-based proxy protocol
-/// -伪装成 HTTPS traffic
+/// -disguised as HTTPS traffic
 /// - Certificate verification mandatory
 #[cfg(feature = "trojan")]
 pub mod trojan;

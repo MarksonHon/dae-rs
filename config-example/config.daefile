@@ -205,10 +205,52 @@ outbounds {
   }
 }
 
+rule_set {
+  # ── v2ray .dat 类型（Loyalsoldier 发布，真实可靠数据源）──
+  geoip_main {
+    type: geoip                  # GeoIP dat：按 country_code（CN/PRIVATE/...）分组
+    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
+    name: geoip_main             # 唯一备注（缺省用块名）；供 geoip:<code> 引用
+    update: time: 21:47          # 每天 21:47 更新（HH:MM，无秒）
+    update_on_start: true        # 启动时无条件更新一次
+  }
+
+  geosite_main {
+    type: geosite                # GeoSite dat：按分类名（cn/geolocation-!cn/...）分组
+    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
+    name: geosite_main           # 供 geosite:<code> 引用
+    update: period: 3h2m         # 每 3 小时 2 分钟更新一次（d/h/m 组合，无秒）
+  }
+
+  # ── 文本列表类型（URL 为占位示例，可按需替换为真实源）──
+  chinadomain {
+    type: domain_list            # 每行一条域名/域名模式（支持 suffix:/full:/keyword:/regex:）
+    url: 'https://example.com/rules/chinadomain.txt'   # 占位 URL（可替换）
+    name: chinadomain            # 供 set:chinadomain 引用
+    update: time: 04:30          # 每天 04:30 更新
+    update_on_start: false
+  }
+
+  chinaip {
+    type: ip_list                # 每行一条 CIDR（a.b.c.d/nn）或裸 IP
+    url: 'https://example.com/rules/chinaip.txt'       # 占位 URL（可替换）
+    name: chinaip                # 供 set:chinaip 引用
+    update: period: 1d           # 每 1 天更新一次
+    proxy: proxy_primary         # 显式指定下载用代理组（缺省用第一个代理组）
+  }
+}
+
 routing {
-  dip(geoip:private) -> direct
-  dport(22) -> direct
-  l4proto(tcp) -> proxy(proxy_primary)
+  # ── 规则集引用（阶段 3 新语法）──
+  source_ip(set:chinaip) -> direct                    # 源 IP 命中文本 IP 列表 chinaip → 直连
+  target_ip(geoip:cn) -> direct                       # 目标 IP 命中 GeoIP CN → 直连
+  target_domain(geosite:cn) -> direct                 # 目标域名命中 GeoSite CN → 直连
+  target_domain(set:chinadomain) -> direct            # 目标域名命中文本域名列表 → 直连
+  # ── 原有示例（旧别名 dip/sip 与自由组合保留）──
+  dip(geoip:private) -> direct                        # 私有网段 → 直连（数据驱动，旧语法兼容）
+  dport(22) -> direct                                 # SSH 直连
+  dport(80,443) && !target_ip(geoip:private) -> proxy(proxy_primary)  # 逗号多值 + && + ! 组合
+  l4proto(tcp) -> proxy(proxy_primary)                # TCP 走代理
   fallback: proxy(proxy_primary)
 }
 
@@ -240,7 +282,8 @@ dns {
       }
       response_routing {
         upstream(googledns) -> accept
-        ip(geoip:private) && !qname(geosite:cn) -> googledns
+        ip(geoip:private) && !qname(geosite:cn) -> googledns   # && 与 ! 自由组合
+        ip(set:chinaip) -> googledns                           # 响应地址命中 chinaip → 换上游重查
         fallback: accept
       }
     }
@@ -257,6 +300,7 @@ dns {
   }
   routing {
     qname(geosite:cn) -> china_dns
+    qname(set:chinadomain) -> china_dns                       # 文本域名列表引用（DNS 查询路由）
     qname(geosite:geolocation-!cn) -> trusted_dns
     fallback: trusted_dns
   }

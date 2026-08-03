@@ -1,14 +1,14 @@
-//! Shadowsocks 协议拨号器
+//! Shadowsocks 协议Dialer
 //!
-//! 实现 Shadowsocks 出站代理协议（TCP），支持：
-//! - AEAD (Legacy) - EVP_BytesToKey 主密钥 + HKDF-SHA1 会话子密钥
-//! - 2022 Edition (SIP022) - BLAKE3 身份密钥 + 会话子密钥
+//! Implements Shadowsocks outbound proxy protocol (TCP), supporting:
+//! - AEAD (Legacy) - EVP_BytesToKey master key + HKDF-SHA1 session sub-key
+//! - 2022 Edition (SIP022) - BLAKE3 identity key + session sub-key
 //!
-//! 加密与分帧使用 `shadowsocks-crypto` crate 实现：
-//! - 客户端先发送随机 salt（`kind.salt_len()` 字节）
-//! - 之后每个数据包：`[加密的 2 字节长度][加密的负载]`，各带 16 字节 AEAD tag
-//! - 长度 0 表示 EOF
-//! 参考: https://shadowsocks.org/doc/sip022.html
+//! Encryption and framing implemented using `shadowsocks-crypto` crate:
+//! - Client sends random salt first (`kind.salt_len()` bytes)
+//! - Each subsequent packet: `[encrypted 2-byte length][encrypted payload]`, each with 16-byte AEAD tag
+//! - Length 0 indicates EOF
+//! Reference: https://shadowsocks.org/doc/sip022.html
 
 use async_trait::async_trait;
 use std::io;
@@ -29,7 +29,7 @@ use shadowsocks_crypto::CipherKind;
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// Shadowsocks 拨号器错误
+/// Shadowsocks Dialer错误
 #[derive(Debug, thiserror::Error)]
 pub enum ShadowsocksError {
     #[error("Shadowsocks dial timeout: {0}")]
@@ -46,30 +46,30 @@ pub enum ShadowsocksError {
     Other(String),
 }
 
-/// AEAD TCP 数据包最大负载长度（0x3FFF）
+/// AEAD TCP packet maximum payload length (0x3FFF)
 const MAX_PAYLOAD: usize = 0x3FFF;
 
 /// BLAKE3 derive-key context for the AEAD-2022 identity key (SIP022)
 const BLAKE3_IDENTITY_CONTEXT: &str = "shadowsocks 2022 identity";
 
-/// Shadowsocks 拨号器
+/// Shadowsocks Dialer
 pub struct ShadowsocksDialer {
-    /// 上游 Shadowsocks 代理服务器地址
+    /// Upstream Shadowsocks proxy server address
     pub proxy_addr: SocketAddr,
-    /// 拨号超时时间
+    /// Dial timeout duration
     pub dial_timeout: Duration,
-    /// 加密方式（如 `aes-256-gcm`、`2022-blake3-aes-256-gcm`）
+    /// Encryption method (e.g., `aes-256-gcm`, `2022-blake3-aes-256-gcm`)
     pub cipher: String,
-    /// 密码
+    /// Password
     pub password: String,
-    /// fwmark 用于 eBPF 自排除
+    /// fwmark for eBPF self-exclusion
     pub self_mark: u32,
-    /// 宿主网络命名空间 fd
+    /// Host network namespace fd
     pub host_ns_fd: Option<RawFd>,
 }
 
 impl ShadowsocksDialer {
-    /// 创建新的 Shadowsocks 拨号器
+    /// 创建新的 Shadowsocks Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         cipher: impl Into<String>,
@@ -86,7 +86,7 @@ impl ShadowsocksDialer {
         }
     }
 
-    /// 创建带 self-mark 的拨号器
+    /// Create dialer with self-mark
     pub fn new_with_mark(
         proxy_addr: SocketAddr,
         cipher: impl Into<String>,
@@ -104,7 +104,7 @@ impl ShadowsocksDialer {
         }
     }
 
-    /// 设置宿主网络命名空间 fd
+    /// Set host network namespace fd
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
@@ -131,13 +131,13 @@ impl ShadowsocksDialer {
         })
     }
 
-    /// 解析加密方式（kind）并派生主密钥。
+    /// Parse encryption method (kind) and derive master key.
     fn cipher_kind(&self) -> Result<CipherKind, ShadowsocksError> {
         CipherKind::from_str(&self.cipher)
             .map_err(|e| ShadowsocksError::InvalidCipher(format!("'{}': {}", self.cipher, e)))
     }
 
-    /// 派生主密钥：legacy = EVP_BytesToKey(password)，2022 = BLAKE3 derive-key。
+    /// Derive master key: legacy = EVP_BytesToKey(password), 2022 = BLAKE3 derive-key.
     fn master_key(kind: CipherKind, password: &str) -> Vec<u8> {
         let mut key = vec![0u8; kind.key_len()];
         match kind.category() {
@@ -153,9 +153,9 @@ impl ShadowsocksDialer {
         key
     }
 
-    /// 派生主密钥并构造加密器（每连接一次，携带客户端随机 salt）。
+    /// Derive master key and construct cipher (once per connection, carrying client random salt).
     ///
-    /// 解密器留空，待收到服务端 salt 后惰性初始化。
+    /// Ciphertext decryptor left empty, lazily initialized after receiving server salt.
     fn new_cipher_pair(&self) -> Result<SsCipherPair, ShadowsocksError> {
         let kind = self.cipher_kind()?;
         let mut salt = vec![0u8; kind.salt_len()];
@@ -180,14 +180,14 @@ impl ShadowsocksDialer {
         })
     }
 
-    /// 编码目标地址：ATYP + ADDR + PORT（1=IPv4, 3=域名, 4=IPv6）
+    /// 编码目标地址：ATYP + ADDR + PORT（1=IPv4, 3=Domain name, 4=IPv6）
     fn encode_address(target: &str) -> Result<Vec<u8>, ShadowsocksError> {
         let (host, port) = split_target(target)?;
         encode_addr(host, port)
     }
 }
 
-/// 拆分 `host:port` 目标字符串（支持 [ipv6]:port）
+/// Split `host:port` target string (supports [ipv6]:port)
 fn split_target(target: &str) -> Result<(&str, u16), ShadowsocksError> {
     let (mut host, port) = target
         .rsplit_once(':')
@@ -201,7 +201,7 @@ fn split_target(target: &str) -> Result<(&str, u16), ShadowsocksError> {
     Ok((host, port))
 }
 
-/// 编码 Shadowsocks 地址：ATYP + ADDR + PORT
+/// Encode Shadowsocks address: ATYP + ADDR + PORT
 fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, ShadowsocksError> {
     let mut addr = Vec::with_capacity(1 + 16 + 2);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
@@ -226,8 +226,8 @@ fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, ShadowsocksError> {
     Ok(addr)
 }
 
-/// 解码 Shadowsocks 地址，返回 `(SocketAddr, 消耗字节数)`。
-/// 域名为 0.0.0.0:port（无法在无 DNS 场景解析时保留端口）。
+/// Decode Shadowsocks address, return `(SocketAddr, bytes consumed)`.
+/// Domain name为 0.0.0.0:port（无法在无 DNS 场景解析时保留端口）。
 fn decode_addr(data: &[u8]) -> Result<(SocketAddr, usize), ShadowsocksError> {
     if data.is_empty() {
         return Err(ShadowsocksError::ProtocolError("empty address".into()));
@@ -274,24 +274,24 @@ impl OutboundDialer for ShadowsocksDialer {
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
         let mut stream = self.connect_with_mark().await?;
 
-        // 1. 构造加密器并发送随机 salt
+        // 1. Construct cipher and send random salt
         let mut cipher = self.new_cipher_pair()?;
         stream.write_all(&cipher.salt).await.map_err(ShadowsocksError::Io)?;
 
-        // 2. 发送加密的目标地址
+        // 2. Send encrypted target address
         let target_addr = Self::encode_address(target)?;
         let framed = cipher.frame_packet(&target_addr)?;
         stream.write_all(&framed).await.map_err(ShadowsocksError::Io)?;
 
-        // 3. 包装成加密流返回
+        // 3. Wrap into encrypted stream and return
         let ss_stream = SsStream::new(stream, cipher);
         Ok(ProxyConn::new_boxed(Box::new(ss_stream)))
     }
 
-    /// 建立 Shadowsocks UDP 中继会话。
+    /// Establish Shadowsocks UDP relay session.
     ///
-    /// 每个数据报独立加盐加密：`[salt][AEAD(addr + payload)]`，
-    /// 无需握手，直接发往代理服务器。
+    /// Each datagram independently salted encrypted: `[salt][AEAD(addr + payload)]`,
+    /// no handshake needed, sent directly to proxy server.
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
         let kind = self.cipher_kind()?;
         let key = Self::master_key(kind, &self.password);
@@ -324,10 +324,10 @@ impl OutboundDialer for ShadowsocksDialer {
     }
 }
 
-/// Shadowsocks UDP 中继会话。
+/// Shadowsocks UDP relay session.
 ///
-/// 每个数据报 = `[salt][AEAD(addr + payload)]`；legacy 用 HKDF-SHA1 派生
-/// 会话子密钥，2022 用 BLAKE3（session_id = 0）。
+/// Each datagram = `[salt][AEAD(addr + payload)]`; legacy uses HKDF-SHA1 to derive
+/// session sub-key, 2022 uses BLAKE3 (session_id = 0).
 struct SsUdpSession {
     socket: tokio::net::UdpSocket,
     kind: CipherKind,
@@ -383,7 +383,7 @@ impl crate::UdpSession for SsUdpSession {
         let mut salt = vec![0u8; self.salt_len()];
         random_iv_or_salt(&mut salt);
 
-        // [addr][payload] 整体加密
+        // [addr][payload] encrypted as a whole
         let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
         let mut pkt = vec![0u8; addr.len() + payload.len() + 16];
         pkt[..addr.len()].copy_from_slice(&addr);
@@ -414,10 +414,10 @@ impl crate::UdpSession for SsUdpSession {
 }
 
 // ============================================================================
-// AEAD 分帧
+// AEAD framing
 // ============================================================================
 
-/// 加/解密器对（legacy 与 2022 统一接口）
+/// Encrypt/decryptor pair (unified interface for legacy and 2022)
 enum SsCipher {
     Legacy(V1Cipher),
     V2022(V2TcpCipher),
@@ -446,27 +446,27 @@ impl SsCipher {
     }
 }
 
-/// 一次连接使用的加密器 + 已发送的客户端 salt。
+/// Cipher for one connection + client salt already sent.
 ///
-/// 解密器必须用**服务端**的 salt 派生（服务端响应的首段是它自己的随机
-/// salt），因此初始为 None，在 SsStream 首次读数据时惰性初始化。
+/// Decryptor must derive using **server**'s salt (the first segment of server response is its own random
+/// salt), so initially None, lazily initialized when SsStream first reads data.
 struct SsCipherPair {
-    /// 客户端 salt（已发送给服务端）
+    /// Client salt (already sent to server)
     salt: Vec<u8>,
-    /// 加密器（客户端 salt 派生）
+    /// Encryptor (derived from client salt)
     enc: SsCipher,
-    /// 加密方式与主密钥（用于派生服务端子密钥）
+    /// Encryption method and master key (for deriving server sub-key)
     kind: CipherKind,
     master_key: Vec<u8>,
 }
 
 impl SsCipherPair {
-    /// 将一段明文编码为分帧密文（2 字节长度 + 负载，各带 tag）
+    /// Encode a plaintext segment into framed ciphertext (2-byte length + payload, each with tag)
     fn frame_packet(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, ShadowsocksError> {
         let tag = self.enc.tag_len();
         let mut out = Vec::with_capacity(2 + tag + plaintext.len() + tag);
 
-        // AEAD 就地加密：缓冲区必须预留 tag 空间（len(2) + tag(16)）
+        // AEAD in-place encryption: buffer must reserve tag space (len(2) + tag(16))
         let mut len_buf = vec![0u8; 2 + tag];
         len_buf[..2].copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
         self.enc.encrypt_packet(&mut len_buf);
@@ -480,29 +480,29 @@ impl SsCipherPair {
     }
 }
 
-/// 带 AEAD 分帧的 Shadowsocks TCP 流。
+/// 带 AEAD framing的 Shadowsocks TCP 流。
 ///
-/// 写路径：按 0x3FFF 分块 + 2 字节长度前缀加密。
-/// 读路径：先解密长度帧（2+tag 字节），再读解密负载（len+tag 字节）；
-/// 长度 0 表示对端关闭。
+/// Write path: chunk by 0x3FFF + 2-byte length prefix encryption.
+/// Read path: decrypt length frame (2+tag bytes) first, then read decrypted payload (len+tag bytes);
+/// Length 0 indicates peer closed.
 pub struct SsStream {
     inner: TcpStream,
     enc: SsCipher,
-    /// 解密器（服务端 salt 收到后惰性初始化）
+    /// Decryptor (lazily initialized after server salt received)
     dec: Option<SsCipher>,
-    /// 服务端 salt 长度（解密器初始化前需要先读这么多字节）
+    /// Server salt length (need to read this many bytes before decryptor initialization)
     salt_len: usize,
     kind: CipherKind,
     master_key: Vec<u8>,
     tag: usize,
-    /// 写路径输出缓冲（分帧后的密文）
+    /// Write path output buffer (framed ciphertext)
     write_out: Vec<u8>,
     write_pos: usize,
-    /// 读路径：累积的帧字节
+    /// Read path: accumulated frame bytes
     read_frame: Vec<u8>,
-    /// 待读取的负载长度（None = 正在读长度帧）
+    /// Payload length to read (None = currently reading length frame)
     read_payload_len: Option<usize>,
-    /// 已解密但未消费的字节
+    /// Decrypted but unconsumed bytes
     read_decoded: Vec<u8>,
     read_decoded_pos: usize,
     eof: bool,
@@ -532,7 +532,7 @@ impl SsStream {
         }
     }
 
-    /// 尝试从 inner 读取 n 字节到 read_frame（已满则返回 Ok(0)）
+    /// Try to read n bytes from inner into read_frame (returns Ok(0) if full)
     fn poll_fill_frame(&mut self, cx: &mut Context<'_>, need: usize) -> Poll<io::Result<()>> {
         while self.read_frame.len() < need {
             let mut buf = vec![0u8; need - self.read_frame.len()];
@@ -558,7 +558,7 @@ impl AsyncRead for SsStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // 先消费已解密的剩余字节
+        // Consume remaining decrypted bytes first
         if self.read_decoded_pos < self.read_decoded.len() {
             let remaining = &self.read_decoded[self.read_decoded_pos..];
             let n = remaining.len().min(buf.remaining());
@@ -575,7 +575,7 @@ impl AsyncRead for SsStream {
             return Poll::Ready(Ok(()));
         }
 
-        // 首次读取：先消费服务端 salt（响应流首段），再派生解密器。
+        // First read: consume server salt (first segment of response stream) first, then derive decryptor.
         if self.dec.is_none() {
             let salt_len = self.salt_len;
             match self.poll_fill_frame(cx, salt_len) {
@@ -603,7 +603,7 @@ impl AsyncRead for SsStream {
             });
         }
 
-        // 需要读取完整的一帧：长度帧（2+tag）+ 负载帧（len+tag）
+        // Need to read a complete frame: length frame (2+tag) + payload frame (len+tag)
         loop {
             let need_len_frame = 2 + self.tag;
             match self.poll_fill_frame(cx, need_len_frame) {
@@ -612,12 +612,12 @@ impl AsyncRead for SsStream {
                 Poll::Ready(Ok(())) => {}
             }
             if self.read_frame.len() < need_len_frame {
-                // EOF：长度帧不完整
+                // EOF: incomplete length frame
                 self.eof = true;
                 return Poll::Ready(Ok(()));
             }
 
-            // 解密长度帧：完整密文 = 2 字节长度 + tag（就地解密要求整帧输入）
+            // Decrypt length frame: complete ciphertext = 2-byte length + tag (in-place decryption requires full frame input)
             let mut len_buf = vec![0u8; need_len_frame];
             len_buf.copy_from_slice(&self.read_frame[..need_len_frame]);
             if !self
@@ -635,7 +635,7 @@ impl AsyncRead for SsStream {
                 return Poll::Ready(Ok(()));
             }
 
-            // 读取并解密负载帧
+            // Read and decrypt payload frame
             let need_payload = payload_len + self.tag;
             match self.poll_fill_frame(cx, need_payload) {
                 Poll::Pending => {
@@ -667,7 +667,7 @@ impl AsyncRead for SsStream {
                 buf.put_slice(&payload);
                 return Poll::Ready(Ok(()));
             }
-            // 用户缓冲区放不下，暂存剩余
+            // User buffer too small, store remaining temporarily
             self.read_decoded = payload;
             self.read_decoded_pos = 0;
             let n = buf.remaining();
@@ -684,7 +684,7 @@ impl AsyncWrite for SsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // 若还有未发送完的分帧输出，先发送
+        // If there's unfinished framed output still to send, send it first
         if self.write_pos < self.write_out.len() {
             return match self.poll_flush(cx) {
                 Poll::Ready(Ok(())) => Poll::Ready(Ok(0)),
@@ -696,7 +696,7 @@ impl AsyncWrite for SsStream {
             return Poll::Ready(Ok(0));
         }
 
-        // 分块：每块 ≤ 0x3FFF（AEAD 就地加密需预留 tag 空间）
+        // Chunking: each chunk ≤ 0x3FFF (AEAD in-place encryption needs to reserve tag space)
         let chunk_len = buf.len().min(MAX_PAYLOAD);
         let mut len_buf = vec![0u8; 2 + self.tag];
         len_buf[..2].copy_from_slice(&(chunk_len as u16).to_be_bytes());
@@ -746,7 +746,7 @@ impl AsyncWrite for SsStream {
     }
 }
 
-// AsyncDuplex 标记：SsStream 同时实现 AsyncRead + AsyncWrite
+// AsyncDuplex marker: SsStream implements both AsyncRead + AsyncWrite
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,7 +797,7 @@ mod tests {
             );
             let kind = d.cipher_kind().unwrap();
             let key = ShadowsocksDialer::master_key(kind, "password");
-            // 加/解密必须共享同一 salt（new_cipher_pair 每次生成随机 salt）
+            // Encrypt/decrypt must share the same salt (new_cipher_pair generates random salt each time)
             let mut salt = vec![0u8; kind.salt_len()];
             random_iv_or_salt(&mut salt);
             let enc = match kind.category() {
@@ -815,10 +815,10 @@ mod tests {
 
             let plain = b"hello shadowsocks world";
             let framed = pair.frame_packet(plain).unwrap();
-            // 帧 = [长度(2+tag)][负载(len+tag)]
+            // Frame = [length(2+tag)][payload(len+tag)]
             assert_eq!(framed.len(), 2 + tag + plain.len() + tag, "{}", cipher);
 
-            // 模拟服务端：用客户端 salt 派生解密器（客户端 salt 随流发出）
+            // Simulate server: derive decryptor using client salt (client salt sent with the stream)
             let mut dec = match kind.category() {
                 CipherCategory::Aead => SsCipher::Legacy(V1Cipher::new(kind, &key, &salt)),
                 CipherCategory::Aead2022 => SsCipher::V2022(V2TcpCipher::new(kind, &key, &salt)),
@@ -826,7 +826,7 @@ mod tests {
             };
 
             // 验证：用“服务端自己的 salt”派生解密器无法解开客户端帧
-            // （证明惰性初始化必须用服务端 salt，而非客户端 salt —— 修复的回归测试）
+            // (proves lazy initialization must use server salt, not client salt --- regression test for the fix)
             let mut server_salt = vec![0u8; kind.salt_len()];
             random_iv_or_salt(&mut server_salt);
             let mut wrong_dec = match kind.category() {
@@ -841,13 +841,13 @@ mod tests {
             let mut wrong_len = framed[..2 + tag].to_vec();
             assert!(!wrong_dec.decrypt_packet(&mut wrong_len), "{}", cipher);
 
-            // 解密长度帧
+            // Decrypt length frame
             let mut len_buf = framed[..2 + tag].to_vec();
             assert!(dec.decrypt_packet(&mut len_buf), "{}", cipher);
             let plen = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
             assert_eq!(plen, plain.len(), "{}", cipher);
 
-            // 解密负载帧
+            // Decrypt payload frame
             let mut payload = framed[2 + tag..].to_vec();
             assert!(dec.decrypt_packet(&mut payload), "{}", cipher);
             assert_eq!(&payload[..plain.len()], plain, "{}", cipher);

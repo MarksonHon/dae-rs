@@ -74,7 +74,7 @@ impl DnsUpstreamPool {
     /// SO_MARK=DAE_SOCKET_MARK for eBPF self-exclusion.
     ///
     /// 通过 [`protocols::hostns::create_udp`] 统一实现“dae-rs 自身流量必须直连”
-    /// 的约定（控制面标记 + 宿主 NS），确保 DNS 查询绕过透明代理管道。
+    /// convention (control plane mark + host NS), ensuring DNS queries bypass the transparent proxy pipeline.
     fn create_marked_udp_socket(addr: &SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
         protocols::hostns::create_udp(*addr, &protocols::hostns::DirectSocket::control_plane(None))
             .context("Failed to create marked UDP socket")
@@ -119,7 +119,7 @@ impl DnsUpstreamPool {
     async fn query_tcp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // TCP 查询 socket：统一走 hostns::connect_tcp（控制面标记 → 直连）
+        // TCP query socket: uniformly uses hostns::connect_tcp (control plane mark → direct)
         let mut stream = protocols::hostns::connect_tcp(
             self.address,
             &protocols::hostns::DirectSocket::control_plane(None),

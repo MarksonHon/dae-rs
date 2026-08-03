@@ -58,6 +58,7 @@ pub mod config;
 pub mod dns;
 pub mod net;
 pub mod routing;
+pub mod ruleset;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -340,6 +341,20 @@ pub struct ControlPlane {
     /// Datapath generation counter. Incremented on each reload so the
     /// eBPF datapath can detect stale conn_state entries.
     datapath_generation: u16,
+    /// Rule set scheduler background task (Phase 2). `None` means no `rule_set` configured.
+    rule_set_scheduler: Option<ruleset::scheduler::SchedulerHandle>,
+    /// Rule set update completion notification receiver (value increments on successful update).
+    /// Used for Phase 3 hot-reload wiring (Routing recompilation / eBPF double-buffer switch).
+    pub rule_set_notifier: Option<tokio::sync::watch::Receiver<u64>>,
+    /// Ruleset in-memory cache (shared by matcher compilation / DNS routing / DNS response Routing).
+    ///
+    /// Scanned and populated from `/var/dae-rs/` at startup; refreshed by background watcher after scheduler updates complete.
+    pub rule_set_cache: ruleset::cache::RuleSetCache,
+    /// Ruleset update → hot-reload signal receiver (filled by background watcher).
+    ///
+    /// Consumed by the external main loop (or [`ControlPlane::handle_rule_set_reloads`]),
+    /// to execute Routing recompilation + eBPF double-buffer hot-reload.
+    rule_set_reload_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
 }
 
 impl ControlPlane {
@@ -394,6 +409,10 @@ impl ControlPlane {
             routing_matcher: None,
             current_epoch_slot: 0,
             datapath_generation: 0,
+            rule_set_scheduler: None,
+            rule_set_notifier: None,
+            rule_set_cache: ruleset::cache::RuleSetCache::new(),
+            rule_set_reload_rx: None,
         }
     }
 
@@ -442,7 +461,7 @@ impl ControlPlane {
         })?;
         debug!("Step 1 completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 1.25: 诊断：记录 link pair 类型 ----
+        // ---- Step 1.25: Diagnostic: record link pair type ----
         info!(
             "Netns create completed, use_netkit={}, host_if={}, peer_if={}",
             self.netns_mgr.is_netkit(),
@@ -510,9 +529,9 @@ impl ControlPlane {
         debug!("Step 1.5 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 1.75: Initialize flip bit for TC handle ----
-        // 检查是否有 pinned maps 来判断是否是热重载/重启恢复
-        // 如果有 pinned maps，说明之前有过运行实例，需要翻转 flip 位
-        // 以避免与旧 filter 的 handle 冲突
+        // Check for pinned maps to determine if hot-reload/restart recovery
+        // If pinned maps exist, it means there was a previous running instance, need to flip the flip bit
+        // to avoid conflicts with old filter handles
         let flip = if crate::net::ebpf::EbpfManager::pinned_maps_exist(crate::net::ebpf::BPFFS_PATH) {
             info!("Pinned maps detected — setting flip=1 for TC handle rotation");
             1u32
@@ -531,8 +550,8 @@ impl ControlPlane {
             debug!("eBPF PARAM configured: full struct {:?}", param);
         }
 
-        // 设置 eBPF map pinning 路径，使 maps 在 load 后自动 pin 到 bpffs
-        // 这样 dae-rs 重启后连接状态可以持久化
+        // Set eBPF map pinning path so maps are automatically pinned to bpffs after load
+        // This way connection state can be persisted after dae-rs restart
         self.ebpf()
             .set_pin_path(crate::net::ebpf::BPFFS_PATH.to_string());
         info!("eBPF map pinning enabled: {}", crate::net::ebpf::BPFFS_PATH);
@@ -772,8 +791,8 @@ impl ControlPlane {
         //   2. SO_MARK=0x100 fallback on dae-rs's outgoing sockets
 
         // 3.5b. Compile routing rules into MatchSet and write to eBPF maps
-        // NOTE: 即使配置没有任何显式规则，也必须编译并写入 fallback match set，
-        // 否则 eBPF route() 的 active_rules_len=0 → bpf_loop 不迭代 → 全部 SHOT。
+        // NOTE: Even if the configuration has no explicit rules, the fallback match set must be compiled and written,
+        // otherwise eBPF route() active_rules_len=0 → bpf_loop doesn't iterate → all SHOT.
         if let Some(ref dc) = self.daefile_config {
             debug!(
                 n_rules = dc.routing.rules.len(),
@@ -781,6 +800,18 @@ impl ControlPlane {
                 fallback = %dc.routing.fallback,
                 "Processing routing rules"
             );
+            // 3.5b-0. Load ruleset in-memory cache (scan from /var/dae-rs/).
+            // matcher compilation needs geoip/geosite/set data; missing data causes E2103 compilation error.
+            if !dc.rule_set.is_empty() && self.rule_set_cache.is_empty() {
+                let dir = ruleset::DataDir::default_dir();
+                let map = ruleset::load_cache_from_dir(&dir, &dc.rule_set).await;
+                info!(
+                    n = map.len(),
+                    n_configured = dc.rule_set.len(),
+                    "Loaded rule set memory cache from disk"
+                );
+                self.rule_set_cache.replace_all(map);
+            }
             {
                 // Collect proxy server IPs from all outbound nodes for auto-direct rules.
                 // This prevents traffic destined for proxy servers from being re-proxied (loop prevention).
@@ -795,9 +826,13 @@ impl ControlPlane {
                     debug!("No proxy server IPs collected (no auto-direct rules needed)");
                 }
                 let compile_start = std::time::Instant::now();
-                let compiled =
-                    routing::matcher::compile_rules(&dc.routing, &dc.outbounds, &proxy_server_ips)
-                        .context("Failed to compile routing rules")?;
+                let compiled = routing::matcher::compile_rules(
+                    &dc.routing,
+                    &dc.outbounds,
+                    &proxy_server_ips,
+                    Some(&self.rule_set_cache),
+                )
+                .context("Failed to compile routing rules")?;
                 debug!(
                     compile_ms = compile_start.elapsed().as_millis(),
                     match_sets = compiled.match_sets.len(),
@@ -973,7 +1008,7 @@ impl ControlPlane {
         if let Some(ref dns_cfg) = self.config.dns_config {
             info!("Step 4.5/5: Starting DNS manager");
             debug!(dns_bind = %dns_cfg.bind, dns_cache_max_size = dns_cfg.cache.max_size, "DNS config details");
-            let mut dns_mgr = crate::dns::DnsManager::new(dns_cfg.clone());
+            let mut dns_mgr = crate::dns::DnsManager::new(dns_cfg.clone(), self.rule_set_cache.clone())?;
             // Wire DNS resolutions into the domain routing tracker so the eBPF
             // domain_routing_map is populated for domain-based routing rules.
             let domain_routing = self.domain_routing.clone();
@@ -1028,6 +1063,70 @@ impl ControlPlane {
             info!("Routing handoff consumer started");
         } else {
             warn!("No RoutingMatcher available — routing handoff consumer NOT started");
+        }
+
+        // ---- Step 4.7: Start rule set scheduler ----
+        if let Some(ref dc) = self.daefile_config {
+            if !dc.rule_set.is_empty() {
+                info!(
+                    "Step 4.7/5: Starting rule set scheduler ({} entries)",
+                    dc.rule_set.len()
+                );
+                let entries = dc.rule_set.clone();
+                let dir = std::sync::Arc::new(ruleset::DataDir::default_dir());
+                // Proxy resolution: "first outbound group" name → SOCKS5 address of the group's currently selected node.
+                // Current architecture only supports single node (Config takes the first node address as proxy),
+                // so only the first outbound group can be resolved; other groups fall back to direct (scheduler logs a warning).
+                // TODO(Phase 3): intra-group node selection / alive node fallback logic.
+                let first_node_addr = dc
+                    .outbounds
+                    .nodes
+                    .first()
+                    .and_then(|n| n.address.parse::<std::net::SocketAddr>().ok());
+                let default_proxy = dc.outbounds.groups.first().map(|g| g.name.clone());
+                let proxy_resolver: std::sync::Arc<dyn ruleset::scheduler::ProxyResolver> =
+                    std::sync::Arc::new(DefaultProxyResolver {
+                        addr: first_node_addr,
+                        default_group: default_proxy.clone(),
+                    });
+                let scheduler = ruleset::scheduler::RuleSetScheduler::spawn(
+                    entries.clone(),
+                    dir.clone(),
+                    proxy_resolver,
+                    default_proxy,
+                );
+                self.rule_set_notifier = Some(scheduler.notifier.clone());
+                self.rule_set_scheduler = Some(scheduler);
+                info!("Rule set scheduler spawned");
+
+                // Ruleset update → refresh in-memory cache + trigger Routing hot-reload signal.
+                //
+                // After each successful update, the watcher:
+                //   1. Re-scan disk data directory → refresh `RuleSetCache` (matcher / DNS shared);
+                //   2. Send signal via mpsc; main control plane via
+                //      [`ControlPlane::handle_rule_set_reloads`] consumes the signal and recompiles
+                //      Routing and performs eBPF double-buffer hot-reload (reuses `reload_config`).
+                if let Some(notifier) = self.rule_set_notifier.clone() {
+                    let cache = self.rule_set_cache.clone();
+                    let (reload_tx, reload_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    self.rule_set_reload_rx = Some(reload_rx);
+                    tokio::spawn(async move {
+                        let mut notifier = notifier;
+                        while notifier.changed().await.is_ok() {
+                            let map = ruleset::load_cache_from_dir(&dir, &entries).await;
+                            info!(
+                                n = map.len(),
+                                "Rule set update detected; refreshed memory cache"
+                            );
+                            cache.replace_all(map);
+                            // Notify main control plane to execute Routing hot-reload
+                            let _ = reload_tx.send(());
+                        }
+                    });
+                }
+            } else {
+                debug!("No rule_set entries — rule set scheduler not started");
+            }
         }
 
         // ---- Step 5: Start background tasks ----
@@ -1128,10 +1227,10 @@ impl ControlPlane {
         let start_time = std::time::Instant::now();
         debug!("start_tproxy: beginning TProxy setup");
 
-        // ---- 宿主网络命名空间 fd ----
-        // TProxy 监听 socket 保留在 daens，但所有上行连接（到代理的
-        // TCP、UDP ASSOCIATE、DNS 劫持/UDP relay 的响应 socket）在宿主 NS 中
-        // 创建并发出（与 kdae 对齐），源地址为宿主真实 WAN 地址。
+        // ---- Host network namespace fd ----
+        // TProxy listen socket remains in daens, but all upstream connections (to proxy,
+        // TCP, UDP ASSOCIATE, DNS hijack/UDP relay response sockets) are created in host NS
+        // and issued (aligned with kdae), source address is the host real WAN address.
         let host_ns_fd = self.netns_mgr.get_host_ns_fd();
         info!(
             host_ns_fd = host_ns_fd.map(|fd| fd.to_string()).unwrap_or_else(|| "none".to_string()),
@@ -1146,7 +1245,7 @@ impl ControlPlane {
             "TProxy listener socket mark for daens policy routing"
         );
 
-        // ---- 按配置的协议构造出站拨号器 ----
+        // ---- Construct outbound Dialer according to configured protocol ----
         let dialer: Arc<dyn OutboundDialer> = match self
             .config
             .daefile_config
@@ -1188,13 +1287,13 @@ impl ControlPlane {
         debug!("Outbound dialer created: {}", dialer.protocol_name());
 
         // ---- TProxy listener (in DAENS) ----
-        // eBPF 数据流：
-        // 1. WAN egress TC 拦截 SYN 包
-        // 2. 重定向到 dae0 → dae0peer（进入 daens）
-        // 3. dae0peer_ingress TC：设置 skb->mark = TPROXY_MARK
-        // 4. daens 中的策略路由：fwmark → table 2023 → local default dev lo
-        // 5. TProxy socket（在 daens 中）接受连接
-        // 6. TProxy 通过 dae0peer → dae0 转发到宿主 NS → 上游代理
+        // eBPF data flow:
+        // 1. WAN egress TC intercepts SYN packets
+        // 2. Redirect to dae0 → dae0peer (enter daens)
+        // 3. dae0peer_ingress TC: set skb->mark = TPROXY_MARK
+        // 4. Policy Routing in daens: fwmark → table 2023 → local default dev lo
+        // 5. TProxy socket (in daens) accepts connection
+        // 6. TProxy forwards via dae0peer → dae0 to host NS → upstream proxy
         let listen_addr: SocketAddr = format!("[::]:{}", self.config.tproxy_port)
             .parse()
             .map_err(|e| {
@@ -1247,8 +1346,8 @@ impl ControlPlane {
         };
 
         // ---- Add host namespace policy routing ----
-        // 宿主 NS 策略路由：标记包 → local default dev lo → TProxy socket
-        // （用于从 daens 通过 dae0peer → dae0 进入宿主 NS 的标记包）
+        // Host NS policy Routing: marked packet → local default dev lo → TProxy socket
+        // (for marked packets entering host NS via daens through dae0peer → dae0)
         debug!("Adding host namespace policy routing");
         let route_start = std::time::Instant::now();
         self.netns_mgr
@@ -1266,10 +1365,10 @@ impl ControlPlane {
         );
 
         // ---- Start TProxy INSIDE daens ----
-        // 原版 dae 在 daens 中启动 TProxy listener。
-        // 这样 eBPF 路由后的标记包通过 daens 的策略路由直接投递到 TProxy socket。
-        // TProxy 的上游连接（到 SOCKS5 代理）使用 SO_MARK=0x100，
-        // 被 eBPF 的 pid_is_control_plane() 识别并放行。
+        // Original dae starts TProxy listener in daens.
+        // This way eBPF Routed marked packets are directly delivered to TProxy socket via daens policy Routing.
+        // TProxy upstream connections (to SOCKS5 proxy) use SO_MARK=0x100,
+        // identified and passed through by eBPF pid_is_control_plane().
         let proxy_ns_fd = self
             .netns_mgr
             .get_proxy_ns_fd()
@@ -1282,9 +1381,9 @@ impl ControlPlane {
         use std::os::unix::io::BorrowedFd;
         let thread_handle = std::thread::spawn(move || {
             debug!("TProxy thread spawned, entering daens...");
-            // ---- 进入 daens ----
-            // TProxy 必须运行在 daens 中，因为 eBPF 路由后的标记包
-            // 通过 daens 的策略路由投递到本地 lo。
+            // ---- Enter daens ----
+            // TProxy must run in daens because eBPF Routed marked packets
+            // are delivered to local lo via daens policy Routing.
             let borrowed_fd = unsafe { BorrowedFd::borrow_raw(proxy_ns_fd) };
             if let Err(e) = nix::sched::setns(borrowed_fd, nix::sched::CloneFlags::CLONE_NEWNET) {
                 error!("Failed to enter daens for TProxy listener: {}", e);
@@ -1919,6 +2018,16 @@ impl ControlPlane {
             handle.abort();
             debug!("Routing handoff consumer task aborted");
         }
+        // 0h. Rule set scheduler (graceful shutdown, wait up to 3s)
+        if let Some(sched) = self.rule_set_scheduler.take() {
+            let sched_start = std::time::Instant::now();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                sched.stop(),
+            )
+            .await;
+            debug!("Rule set scheduler stopped: {}ms", sched_start.elapsed().as_millis());
+        }
         debug!("Step 0 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 1: Stop API server ----
@@ -2054,8 +2163,8 @@ impl ControlPlane {
         debug!("reload_config: input size {} bytes", daefile_content.len());
 
         // ---- Step 0: Toggle flip bit for TC handle rotation ----
-        // 翻转 flip 位，使后续 attach 使用新的 handle，
-        // 旧 filter 在 detach 时使用旧 handle 被删除。
+        // Flip the flip bit so subsequent attach uses the new handle,
+        // old filter is deleted on detach using the old handle.
         let new_flip = self.ebpf().flip() ^ 1;
         self.ebpf().set_flip(new_flip);
         debug!("Hot-reload: toggled flip bit to {}", new_flip);
@@ -2095,6 +2204,7 @@ impl ControlPlane {
             &daefile_config.routing,
             &daefile_config.outbounds,
             &proxy_server_ips,
+            Some(&self.rule_set_cache),
         )
         .context("Failed to compile routing rules")?;
 
@@ -2234,6 +2344,46 @@ impl ControlPlane {
         info!("Hot-reload completed successfully");
         Ok(())
     }
+
+    /// Handle Routing hot-reload after ruleset update.
+    ///
+    /// Consume reload signal from [`ControlPlane::rule_set_reload_rx`] (filled by background watcher
+    // after ruleset successfully updated and in-memory cache refreshed). When signal exists, recompile
+    // Routing (using refreshed [`ControlPlane::rule_set_cache`]) and perform eBPF double-buffer
+    // hot-reload (reuses [`ControlPlane::reload_config`]).
+    ///
+    /// Returns whether hot-reload was performed. Should be called periodically (e.g., main event loop); returns
+    /// `false`。
+    ///
+    /// # Legacy
+    ///
+    /// Full "auto" hot-reload requires periodically calling this method in the main event loop (`src/lib.rs`); this method provides
+    /// Explicit interface + cache refresh already done by background watcher (satisfies "at least refresh in-memory cache + logging").
+    pub async fn handle_rule_set_reloads(&mut self) -> Result<bool> {
+        let mut rx = match self.rule_set_reload_rx.take() {
+            Some(rx) => rx,
+            None => return Ok(false),
+        };
+        // Merge all pending signals into one reload
+        let mut reloaded = false;
+        while rx.try_recv().is_ok() {
+            reloaded = true;
+        }
+        self.rule_set_reload_rx = Some(rx);
+        if !reloaded {
+            return Ok(false);
+        }
+
+        if let Some(content) = self.daefile_content.clone() {
+            info!("Rule set update: hot-reloading routing with refreshed data");
+            if let Err(e) = self.reload_config(&content) {
+                warn!("Rule set hot-reload failed: {:#}", e);
+            }
+        } else {
+            warn!("Rule set update detected but no daefile content available for reload");
+        }
+        Ok(true)
+    }
 }
 
 impl Drop for ControlPlane {
@@ -2258,6 +2408,31 @@ impl Drop for ControlPlane {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Default proxy resolution for Ruleset scheduler ("first outbound group → SOCKS5 address" semantics).
+///
+/// Current architecture only supports single node ([`Config::from_daefile`] takes the first node as proxy), therefore
+/// only the **first outbound group** name can be resolved to the first node's SOCKS5 address; other outbound group names are unavailable
+/// (returns `None`, scheduler falls back to direct and logs a warning).
+///
+/// TODO(Phase 3): integrate real outbound group resolution (by `proxy` group name → current selected node / alive
+/// node SOCKS5 address).
+struct DefaultProxyResolver {
+    /// SOCKS5 address of the first node.
+    addr: Option<SocketAddr>,
+    /// "First outbound group" name (the only resolvable outbound group).
+    default_group: Option<String>,
+}
+
+impl ruleset::scheduler::ProxyResolver for DefaultProxyResolver {
+    fn resolve(&self, proxy: &str) -> Option<SocketAddr> {
+        if self.default_group.as_deref() == Some(proxy) {
+            self.addr
+        } else {
+            None
+        }
+    }
+}
 
 // ============================================================================
 // Temp JSON File Lifecycle
@@ -2346,10 +2521,10 @@ pub fn cleanup_temp_json(max_age_secs: u64) {
 
 /// Connect to an address with SO_MARK set (bypasses eBPF self-intercept).
 /// Used by the connectivity checker and other internal health probes.
-/// 带 SO_MARK 的 TCP 连接（连通性检查用）。
+/// TCP connection with SO_MARK (for connectivity check).
 ///
-/// 统一委托 [`protocols::hostns::connect_tcp`] 实现，mark 语义与拨号器一致：
-/// dae-rs 自身流量必须直连（eBPF pid_is_control_plane 放行）。
+/// Delegates to [`protocols::hostns::connect_tcp`] implementation, mark semantics consistent with Dialer:
+/// dae-rs self-traffic must direct connect (eBPF pid_is_control_plane passes through).
 pub async fn connect_with_mark(
     addr: &std::net::SocketAddr,
     mark: u32,

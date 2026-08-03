@@ -1,17 +1,17 @@
-//! 命名网络命名空间 + netkit pair 管理
+//! Named Network namespace + netkit pair management
 //!
-//! 本模块负责创建和管理命名网络命名空间及 netkit 对，用于将代理流量
-//! 从宿主命名空间导入到代理命名空间进行处理。
+//! This module is responsible for creating and managing named Network namespaces and netkit pairs, used to import proxy traffic
+//! from the host namespace into the proxy namespace for processing.
 //!
-//! ## 架构
+//! ## Architecture
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────┐
-//! │                     宿主网络命名空间                          │
+//! │                     Host Network namespace                          │
 //! │                                                              │
 //! │  ┌─────────────┐  ┌──────────────┐                           │
 //! │  │   eth0      │  │   dae0       │                           │
-//! │  │  (外网)     │  │ fe80::.../128│                           │
+//! │  │  (external)   │  │ fe80::.../128│                           │
 //! │  └─────────────┘  └──────┬───────┘                           │
 //! │                           │                                   │
 //! ├───────────────────────────┼───────────────────────────────────┤
@@ -23,23 +23,23 @@
 //! │  │   route table 2023 │ │169.254.0.11/32 │                   │
 //! │  │                    │ │fe80::.../128   │                   │
 //! │  └────────────────────┘ └────────────────┘                   │
-//! │                   daens（代理网络命名空间）                     │
+//! │                   daens (Proxy Network namespace)                     │
 //! └──────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! ## 流量路径
+//! ## Traffic path
 //!
-//! 1. 入站数据包进入宿主 NS 中的 `dae0`
-//! 2. TC(tproxy_dae0_ingress) 拦截，查找路由，设置 fwmark
-//! 3. 数据包通过 netkit 到达 `dae0peer`（在 daens 中）
-//! 4. 策略路由（fwmark → table 2023 → local default dev lo）送达 TProxy socket
-//! 5. 代理处理完成后，回复通过 `dae0` 回到宿主 NS
+//! 1. Inbound packet enters `dae0` in host NS
+//! 2. TC(tproxy_dae0_ingress) intercepts, looks up Routing, sets fwmark
+//! 3. Packet reaches `dae0peer` via netkit (in daens)
+//! 4. Policy Routing (fwmark → table 2023 → local default dev lo) delivers to TProxy socket
+//! 5. After proxy processing, reply returns to host NS via `dae0`
 //!
-//! ## 与原版 dae 对齐
+//! ## Aligned with original dae
 //!
-//! 本实现与原版 dae (https://github.com/daeuniverse/dae) 的 `netns_utils.go`
-//! 保持一致：
-//! - 使用**命名**网络命名空间（`ip netns add daens`），而非 unshare
+//! This implementation aligns with the original dae (https://github.com/daeuniverse/dae) `netns_utils.go`
+//! remains consistent:
+//! - Uses **named** Network namespace (`ip netns add daens`), not unshare
 //! - netkit pair 在**宿主 NS** 中创建，再将 dae0peer 移入 daens
 //! - 通过 setns() 进行 daens 内操作
 //! - 使用永久 ARP/NDP 条目替代广播
@@ -64,10 +64,10 @@ use tracing::{debug, error, info, warn};
 // 常量
 // ============================================================================
 
-/// 命名网络命名空间名称
+/// 命名Network namespace名称
 const NS_NAME: &str = "dae-rs";
 
-/// 网络命名空间挂载路径
+/// Network namespace挂载路径
 const NETNS_RUN_DIR: &str = "/var/run/netns";
 
 /// 宿主侧接口名（位于宿主 NS）
@@ -79,7 +79,7 @@ pub const PEER_IF: &str = "dae0peer";
 /// 代理侧 IPv4 地址
 const PEER_ADDR: &str = "169.254.0.11/32";
 
-/// 路由下一跳（宿主角色的链路本地地址，实际不作为 dae0 的 IP）
+/// Routing下一跳（宿主角色的链路本地地址，实际不作为 dae0 的 IP）
 const NEXTHOP_ADDR: &str = "169.254.0.1";
 
 /// IPv6 链路本地地址（分配给 dae0）
@@ -88,7 +88,7 @@ const IPV6_LL: &str = "fe80::ecee:eeff:feee:eeee";
 /// 默认 MTU
 const DEFAULT_MTU: u32 = 1500;
 
-/// 默认策略路由表 ID
+/// 默认策略Routing表 ID
 const DEFAULT_ROUTE_TABLE: u32 = 2023;
 
 /// TPROXY_MARK（与原版 dae 一致）
@@ -101,7 +101,7 @@ const PROXY_MASK: u32 = 0x08000000;
 // 错误类型
 // ============================================================================
 
-/// 网络命名空间管理错误
+/// Network namespace management错误
 #[derive(Debug, thiserror::Error)]
 pub enum NetnsError {
     /// 命名空间已创建，操作冲突
@@ -151,7 +151,7 @@ impl<'a> Drop for NetnsGuard<'a> {
     }
 }
 
-/// RAII guard：在 Drop 时自动将当前线程的网络命名空间切回 `host_fd`。
+/// RAII guard：在 Drop 时自动将当前线程的Network namespace切回 `host_fd`。
 ///
 /// 用于 `configure_dae0peer_async` 等需要在宿主 NS 和 daens 之间临时切换的场景。
 /// 即使中间操作通过 `?` 提前返回，Guard 的 Drop 也会确保命名空间恢复。
@@ -185,14 +185,14 @@ impl<'a> Drop for NetnsSwitchGuard<'a> {
 }
 
 // ============================================================================
-// 辅助函数
+// Helper function
 // ============================================================================
 
-/// 在宿主网络命名空间中同步执行闭包，并在执行后恢复当前命名空间。
+/// 在宿主Network namespace中同步执行闭包，并在执行后恢复当前命名空间。
 ///
 /// # 流程
 ///
-/// 1. 保存当前线程的网络命名空间 fd
+/// 1. 保存当前线程的Network namespace fd
 /// 2. `setns(host_ns_fd)` 切换到宿主 NS
 /// 3. 执行 `f()`
 /// 4. 无论 `f()` 是否 panic，都恢复为原始命名空间
@@ -334,13 +334,13 @@ fn kernel_version() -> (u32, u32) {
 // NetnsManager
 // ============================================================================
 
-/// 网络命名空间管理器
+/// Network namespace management器
 ///
-/// 管理命名网络命名空间 `daens` 的生命周期，包括：
+/// 管理命名Network namespace `daens` 的生命周期，Includes:
 /// - 创建/销毁命名空间
 /// - 创建并配置 netkit pair（宿主 NS 中创建，对端移入 daens）
-/// - 配置 IPv4/IPv6 地址、路由、永久 ARP/NDP 条目
-/// - 配置策略路由（fwmark → table → lo 本地投递）
+/// - 配置 IPv4/IPv6 地址、Routing、永久 ARP/NDP 条目
+/// - 配置策略Routing（fwmark → table → lo 本地投递）
 /// - 配置 sysctl 参数
 ///
 /// # 与原版 dae 的关系
@@ -359,7 +359,7 @@ pub struct NetnsManager {
     peer_addr: String,
     /// 接口 MTU
     mtu: u32,
-    /// 策略路由表 ID（2023）
+    /// 策略Routing表 ID（2023）
     route_table: u32,
     /// TPROXY_MARK（0x8000000）
     proxy_mark: u32,
@@ -398,7 +398,7 @@ impl NetnsManager {
     /// | peer_if | "dae0peer" | 代理侧接口名 |
     /// | peer_addr | "169.254.0.11/32" | 代理侧地址 |
     /// | mtu | 1500 | 接口 MTU |
-    /// | route_table | 2023 | 策略路由表 ID |
+    /// | route_table | 2023 | 策略Routing表 ID |
     /// | proxy_mark | 0x08000000 | TPROXY_MARK |
     /// | proxy_mask | 0x08000000 | TPROXY_MASK |
     pub fn new() -> Self {
@@ -436,7 +436,7 @@ impl NetnsManager {
         supported
     }
 
-    /// 创建命名网络命名空间和 netkit pair
+    /// 创建命名Network namespace和 netkit pair
     ///
     /// # 完整流程
     ///
@@ -444,15 +444,15 @@ impl NetnsManager {
     ///
     /// 1. 保存宿主 netns fd
     /// 2. 清理残留的 daens 和 dae0/dae0peer 接口（崩溃安全）
-    /// 3. 创建命名网络命名空间 `daens`
+    /// 3. 创建命名Network namespace `daens`
     /// 4. 打开 `/var/run/netns/daens` 保存 daens fd
     /// 5. **在宿主 NS 中**创建 netkit pair (L2)
     /// 6. 将 dae0peer 移入 daens
-    /// 7. 配置 dae0peer（daens 中）：IP、路由、永久 ARP/NDP、sysctl、策略路由
+    /// 7. 配置 dae0peer（daens 中）：IP、Routing、永久 ARP/NDP、sysctl、策略Routing
     /// 8. 配置 dae0（宿主 NS 中）：IPv6 LL、MTU、up、sysctl
-    /// 9. 配置宿主 NS 策略路由：rule + route
+    /// 9. 配置宿主 NS 策略Routing：rule + route
     ///
-    /// # 错误
+    /// # Errors
     ///
     /// - 如果命名空间已创建，返回 [`NetnsError::AlreadyCreated`]
     pub async fn create(&mut self) -> Result<()> {
@@ -497,7 +497,7 @@ impl NetnsManager {
         // ---- Step 2: 清理残留 ----
         Self::cleanup_stale_sync();
 
-        // ---- Step 3: 创建命名网络命名空间 ----
+        // ---- Step 3: 创建命名Network namespace ----
         Self::create_named_netns(&self.ns_name)
             .context("Failed to create named network namespace")?;
         netns_created = true;
@@ -560,7 +560,7 @@ impl NetnsManager {
     // 命名空间创建（静态辅助方法）
     // ----------------------------------------------------------------
 
-    /// 创建命名网络命名空间（等效于 `ip netns add <name>`）
+    /// 创建命名Network namespace（等效于 `ip netns add <name>`）
     ///
     /// 实现方式：
     /// 1. 创建 `/var/run/netns/` 目录（若不存在）
@@ -590,7 +590,7 @@ impl NetnsManager {
         let host_ns_fd = OwnedFd::from(host_ns_file);
         let host_fd_raw = host_ns_fd.as_raw_fd();
 
-        // 创建新网络命名空间
+        // 创建新Network namespace
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)
             .context("Failed to unshare network namespace")?;
 
@@ -769,7 +769,7 @@ impl NetnsManager {
             .await
             .context("Failed to configure dae0")?;
 
-        // ---- Step 9: 配置宿主 NS 策略路由 ----
+        // ---- Step 9: 配置宿主 NS 策略Routing ----
         add_host_policy_routing_async(&host_handle, proxy_mark, proxy_mask, route_table)
             .await
             .context("Failed to add host policy routing")?;
@@ -781,7 +781,7 @@ impl NetnsManager {
         Ok(())
     }
 
-    /// 删除命名网络命名空间（同步版本）
+    /// 删除命名Network namespace（同步版本）
     ///
     /// 使用 `MNT_DETACH | MNT_FORCE` 强制卸载，与原版 dae 的 `DeleteNamedNetns` 一致。
     fn delete_named_netns_sync(name: &str) {
@@ -926,9 +926,9 @@ impl NetnsManager {
         self.proxy_ns_fd.as_ref().map(|fd| fd.as_raw_fd())
     }
 
-    /// 获取宿主网络命名空间的原始 fd（若已创建）。
+    /// 获取宿主Network namespace的原始 fd（若已创建）。
     ///
-    /// 用于把 `host_ns_fd` 传递给 SOCKS5 拨号器 / UDP TProxy 监听器，
+    /// 用于把 `host_ns_fd` 传递给 SOCKS5 Dialer / UDP TProxy 监听器，
     /// 使上行 socket 在宿主 NS 中创建（与 kdae 对齐）。
     pub fn get_host_ns_fd(&self) -> Option<std::os::unix::io::RawFd> {
         self.host_ns_fd.as_ref().map(|fd| fd.as_raw_fd())
@@ -962,9 +962,9 @@ impl NetnsManager {
         NetnsGuard::new(self)
     }
 
-    /// 在宿主 NS 中添加策略路由规则（异步）
+    /// 在宿主 NS 中添加策略Routing规则（异步）
     ///
-    /// 使被 TPROXY_MARK 标记的数据包通过 table <route_table> 路由到本地 lo，
+    /// 使被 TPROXY_MARK 标记的数据包通过 table <route_table> Routing到本地 lo，
     /// 最终被 TProxy socket 接收处理。
     pub async fn add_host_policy_routing(&self) -> Result<()> {
         let (task, handle) = create_host_handle()
@@ -984,15 +984,15 @@ impl NetnsManager {
     // 销毁
     // ================================================================
 
-    /// 销毁网络命名空间和 netkit pair
+    /// Destroy Network namespace and netkit pair
     ///
     /// 完整清理流程：
-    /// 1. 删除宿主 NS 策略路由规则
+    /// 1. 删除宿主 NS 策略Routing规则
     /// 2. 删除 netkit pair
-    /// 3. 删除命名网络命名空间
+    /// 3. 删除命名Network namespace
     /// 4. 关闭持有 netns 的 fd
     ///
-    /// 销毁网络命名空间和 netkit pair
+    /// Destroy Network namespace and netkit pair
     ///
     /// Uses synchronous cleanup only — avoids `tokio::task::block_in_place`
     /// which can panic if called during tokio runtime shutdown (Drop context).
@@ -1022,12 +1022,12 @@ impl NetnsManager {
         let (host_task, host_handle) =
             create_host_handle().context("Failed to create host netlink connection for destroy")?;
 
-        // ---- Step 0：清理跨命名空间 DNS 转发相关资源 ----
+        // ---- Step 0: Clean up cross-namespace DNS forwarding related resources ----
         // 删除宿主 lo 上的 169.254.0.1/32 地址
         let _ = Command::new("ip")
             .args(["addr", "del", "169.254.0.1/32", "dev", "lo", "2>/dev/null"])
             .output();
-        // 删除到 daens 的回程路由 169.254.0.11/32 dev <host_if>
+        // 删除到 daens 的回程Routing 169.254.0.11/32 dev <host_if>
         let _ = Command::new("ip")
             .args([
                 "route",
@@ -1039,7 +1039,7 @@ impl NetnsManager {
             ])
             .output();
 
-        // ---- Step 1：删除宿主 NS 策略路由规则 ----
+        // ---- Step 1: Delete host NS policy Routing rules ----
         if let Err(e) = remove_host_policy_routing_async(
             &host_handle,
             self.proxy_mark,
@@ -1051,8 +1051,8 @@ impl NetnsManager {
             warn!("Failed to remove host NS policy routing: {}", e);
         }
 
-        // ---- Step 2：删除 netkit pair ----
-        // 获取 dae0 ifindex
+        // ---- Step 2: Delete netkit pair ----
+        // Get dae0 ifindex
         let host_ifindex = get_host_ifindex_sync(&self.host_if).unwrap_or(0);
         if host_ifindex > 0 {
             if let Err(e) = host_handle.link().del(host_ifindex).execute().await {
@@ -1075,7 +1075,7 @@ impl NetnsManager {
 
         drop(host_task);
 
-        // ---- Step 3：删除命名网络命名空间 ----
+        // ---- Step 3: Delete named Network namespace ----
         Self::delete_named_netns_sync(&self.ns_name);
 
         Ok(())
@@ -1085,7 +1085,7 @@ impl NetnsManager {
     fn destroy_sync_fallback(&self) {
         warn!("Using sync fallback for destroy (no tokio runtime available)");
 
-        // ---- Step 0：清理跨命名空间 DNS 转发相关资源 ----
+        // ---- Step 0: Clean up cross-namespace DNS forwarding related resources ----
         let _ = Command::new("ip")
             .args(["addr", "del", "169.254.0.1/32", "dev", "lo"])
             .output();
@@ -1093,10 +1093,10 @@ impl NetnsManager {
             .args(["route", "del", "169.254.0.11/32", "dev", &self.host_if])
             .output();
 
-        // ---- Step 1：删除宿主 NS 策略路由规则 ----
+        // ---- Step 1: Delete host NS policy Routing rules ----
         remove_host_policy_routing_sync(self.proxy_mark, self.proxy_mask, self.route_table);
 
-        // ---- Step 2：删除 netkit pair ----
+        // ---- Step 2: Delete netkit pair ----
         let _ = Command::new("ip")
             .args(["link", "delete", &self.host_if])
             .output();
@@ -1104,7 +1104,7 @@ impl NetnsManager {
             .args(["link", "delete", &self.peer_if])
             .output();
 
-        // ---- Step 3：删除命名网络命名空间 ----
+        // ---- Step 3: Delete named Network namespace ----
         Self::delete_named_netns_sync(&self.ns_name);
     }
 }
@@ -1132,7 +1132,7 @@ impl Drop for NetnsManager {
 }
 
 // ============================================================================
-// 辅助函数：获取 ifindex（同步）
+// Helper function：获取 ifindex（同步）
 // ============================================================================
 
 fn get_ifindex_in_ns(ifname: &str) -> Result<u32> {
@@ -1160,12 +1160,12 @@ fn get_peer_ifindex_sync(ifname: &str) -> Result<u32> {
 
 /// 配置 dae0peer（在 daens 中）
 ///
-/// 对应原版 dae 的：
+/// Corresponds to the original dae's:
 /// - `setupNetns()` — lo/dae0peer up
-/// - `setupIPv4Datapath()` — 169.254.0.11/32 + 路由 + ARP
-/// - `setupIPv6Datapath()` — 默认路由 + NDP
+/// - `setupIPv4Datapath()` — 169.254.0.11/32 + Routing + ARP
+/// - `setupIPv6Datapath()` — 默认Routing + NDP
 /// - `setupSysctl()` — sysctl 参数
-/// - `setupRoutingPolicy()` — fwmark 策略路由
+/// - `setupRoutingPolicy()` — fwmark 策略Routing
 async fn configure_dae0peer_async(
     daens_handle: &rtnetlink::Handle,
     mgr: &NetnsManager,
@@ -1209,7 +1209,7 @@ async fn configure_dae0peer_async(
         .context("Failed to bring dae0peer up")?;
 
     // ---- lo up（新 netns 的 lo 默认是 down 的）----
-    // 需要获取 lo 在 daens 中的 ifindex
+    // Need to get lo's ifindex in daens
     let lo_ifindex = {
         nix::sched::setns(proxy_ns_fd, nix::sched::CloneFlags::CLONE_NEWNET)
             .context("Failed to enter daens to get lo ifindex")?;
@@ -1240,7 +1240,7 @@ async fn configure_dae0peer_async(
         .map_err(from_rtnetlink_err)
         .context("Failed to add IPv4 address to dae0peer")?;
 
-    // ---- IPv4 路由：169.254.0.1 dev dae0peer（链路本地下一跳, scope link）----
+    // ---- IPv4 Routing：169.254.0.1 dev dae0peer（链路本地下一跳, scope link）----
     // 原版 dae 明确设置 scope = LINK，使内核将 169.254.0.1 视为直接可达
     let nexthop_ip: std::net::Ipv4Addr = NEXTHOP_ADDR
         .parse()
@@ -1262,7 +1262,7 @@ async fn configure_dae0peer_async(
         .map_err(from_rtnetlink_err)
         .context("Failed to add IPv4 route to 169.254.0.1")?;
 
-    // ---- IPv4 默认路由：default via 169.254.0.1 dev dae0peer ----
+    // ---- IPv4 默认Routing：default via 169.254.0.1 dev dae0peer ----
     let default_route = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
         .gateway(nexthop_ip)
         .output_interface(peer_ifindex)
@@ -1308,7 +1308,7 @@ async fn configure_dae0peer_async(
         .map_err(from_rtnetlink_err)
         .context("Failed to add permanent ARP entry")?;
 
-    // ---- IPv6 默认路由：default via fe80::ecee:eeff:feee:eeee dev dae0peer ----
+    // ---- IPv6 默认Routing：default via fe80::ecee:eeff:feee:eeee dev dae0peer ----
     let ipv6_ll_addr: std::net::Ipv6Addr = IPV6_LL.parse().context("Failed to parse IPV6_LL")?;
     // 使用 RouteMessageBuilder 的 v6 版本
     let ipv6_default_route = RouteMessageBuilder::<std::net::Ipv6Addr>::new()
@@ -1336,7 +1336,7 @@ async fn configure_dae0peer_async(
     // ---- sysctl：daens accept_local（需在 daens 中设置）----
     // 与原版 dae (kdae) 完全对齐：daens 中只设置 accept_local 和 early_demux。
     // 注意：不设置 ip_forward=1 和 rp_filter=0 — 原版 dae 在 daens 中不设置这些。
-    // ip_forward=1 会导致内核启用 IP 转发路径，可能干扰 TProxy socket 的回程包路由。
+    // ip_forward=1 会导致内核启用 IP 转发路径，可能干扰 TProxy socket 的回程包Routing。
     {
         nix::sched::setns(proxy_ns_fd, nix::sched::CloneFlags::CLONE_NEWNET)
             .context("Failed to enter daens to set accept_local")?;
@@ -1379,7 +1379,7 @@ async fn configure_dae0peer_async(
     Ok(())
 }
 
-/// 在 daens 中添加策略路由规则
+/// 在 daens 中添加策略Routing规则
 ///
 /// 添加规则: `fwmark <proxy_mark>/<proxy_mask> → table <route_table>`
 /// 注意 proxy_mask 覆盖 fwmark_proxy 和 fwmark_bypass 两个位（mask=0x0f000000），
@@ -1399,7 +1399,7 @@ async fn add_policy_routing_in_daens(
         "Policy routing params"
     );
 
-    // IPv4 策略路由: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
+    // IPv4 策略Routing: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
     let mut v4_req = daens_handle.rule().add();
     v4_req = v4_req.fw_mark(proxy_mark);
     v4_req.message_mut().header.action = RuleAction::ToTable;
@@ -1415,7 +1415,7 @@ async fn add_policy_routing_in_daens(
         .map_err(from_rtnetlink_err)
         .context("Failed to add IPv4 policy routing rule in daens")?;
 
-    // IPv6 策略路由: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
+    // IPv6 策略Routing: fwmark <proxy_mark>/<proxy_mask> → table <route_table>
     let mut v6_req = daens_handle.rule().add();
     v6_req = v6_req.fw_mark(proxy_mark);
     v6_req.message_mut().header.action = RuleAction::ToTable;
@@ -1432,17 +1432,17 @@ async fn add_policy_routing_in_daens(
         .context("Failed to add IPv6 policy routing rule in daens")?;
 
     // ---- local default dev lo table <table> ----
-    // 需要获取 lo 在 daens 中的 ifindex
+    // Need to get lo's ifindex in daens
     // 但这里我们已经有 daens_handle，在 daens 中操作
 
     // IPv4: local default dev lo table <table>
-    // 构造路由消息：local 类型，oif=lo_ifindex，table=<table>
+    // 构造Routing消息：local 类型，oif=lo_ifindex，table=<table>
     // 需要先获取 lo 的 ifindex
     // 由于 daens_handle 的 socket 在 daens 中，获取操作会返回 daens 中的 lo
     let local_default_v4 = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
         .output_interface(1) // lo 在 netns 中通常是 ifindex 1
         .build();
-    // 修改路由类型为 local
+    // 修改Routing类型为 local
     let mut msg_v4 = local_default_v4;
     msg_v4.header.kind = RouteType::Local;
     msg_v4.header.scope = RouteScope::Host; // RTN_LOCAL 必须使用 host scope（254）
@@ -1492,7 +1492,7 @@ async fn add_policy_routing_in_daens(
 
 /// 配置 dae0（在宿主 NS 中）
 ///
-/// 对应原版 dae 的：
+/// Corresponds to the original dae's:
 /// - `setupIPv6Datapath()` — IPv6 LL 地址
 /// - `setupSysctl()` — 宿主侧 sysctl 参数
 async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManager) -> Result<()> {
@@ -1504,7 +1504,7 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
         "dae0 config parameters"
     );
 
-    // 获取 dae0 ifindex
+    // Get dae0 ifindex
     let host_ifindex = get_host_ifindex_sync(&mgr.host_if).context("Failed to get dae0 ifindex")?;
 
     // ---- IPv6 链路本地地址 ----
@@ -1546,7 +1546,7 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
         .context("Failed to bring dae0 up")?;
 
     // ---- 添加 169.254.0.1/32 到 lo ----
-    // 这个地址在 daens 中被用作默认路由的下一跳。
+    // 这个地址在 daens 中被用作默认Routing的下一跳。
     // 将它添加到宿主 NS 的 lo 接口使宿主可以接收从 daens 发来的目标为 169.254.0.1 的流量。
     // 这对于跨命名空间的 DNS 劫持至关重要：TProxy（在 daens 中）将 DNS 查询转发到
     // 169.254.0.1:5353，宿主 NS 中的 DNS handler 接收并处理。
@@ -1571,11 +1571,11 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
         info!("Added 169.254.0.1/32 to lo for cross-namespace DNS forwarding");
     }
 
-    // ---- 添加 169.254.0.11/32 → dae0 的路由 ----
-    // 这是给宿主 NS 添加一条到 daens 中 dae0peer 的回程路由。
+    // ---- 添加 169.254.0.11/32 → dae0 的Routing ----
+    // 这是给宿主 NS 添加一条到 daens 中 dae0peer 的回程Routing。
     // 当 TProxy（在 daens）将 DNS 查询转发到宿主 NS 的 DNS handler 后，
     // DNS handler 需要将响应发回 daens 中的 TProxy 临时 socket。
-    // 没有这条路由，响应包无法从宿主 NS 到达 daens。
+    // 没有这条Routing，响应包无法从宿主 NS 到达 daens。
     let add_route_msg = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
         .destination_prefix(std::net::Ipv4Addr::new(169, 254, 0, 11), 32)
         .output_interface(host_ifindex)
@@ -1616,7 +1616,7 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
     Ok(())
 }
 
-/// 在宿主 NS 中添加策略路由规则
+/// 在宿主 NS 中添加策略Routing规则
 async fn add_host_policy_routing_async(
     host_handle: &rtnetlink::Handle,
     proxy_mark: u32,
@@ -1741,7 +1741,7 @@ async fn add_host_policy_routing_async(
     Ok(())
 }
 
-/// 删除宿主 NS 策略路由规则（异步）
+/// 删除宿主 NS 策略Routing规则（异步）
 async fn remove_host_policy_routing_async(
     host_handle: &rtnetlink::Handle,
     proxy_mark: u32,
@@ -1786,7 +1786,7 @@ async fn remove_host_policy_routing_async(
         }
     }
 
-    // 删除 local default routes
+    // Delete local default routes
     let mut route_v4 = RouteMessage::default();
     route_v4.header.address_family = AddressFamily::Inet;
     route_v4.header.kind = RouteType::Local;
@@ -1816,14 +1816,14 @@ async fn remove_host_policy_routing_async(
     Ok(())
 }
 
-/// 删除宿主 NS 策略路由规则（同步版本，使用 ip 命令）
+/// 删除宿主 NS 策略Routing规则（同步版本，使用 ip 命令）
 ///
 /// 使用 while 循环删除所有匹配的规则，避免重复规则残留。
 fn remove_host_policy_routing_sync(proxy_mark: u32, proxy_mask: u32, route_table: u32) {
     let mark_str = format!("{:#x}/{:#x}", proxy_mark, proxy_mask);
     let table_str = route_table.to_string();
 
-    // 删除 local default routes
+    // Delete local default routes
     let _ = Command::new("ip")
         .args([
             "route", "del", "local", "default", "dev", "lo", "table", &table_str,
@@ -1861,7 +1861,7 @@ fn remove_host_policy_routing_sync(proxy_mark: u32, proxy_mask: u32, route_table
 }
 
 // ============================================================================
-// 单元测试
+// Unit test
 // ============================================================================
 
 #[cfg(test)]

@@ -6,13 +6,11 @@
 use async_trait::async_trait;
 use sha2::{Sha224, Digest};
 use std::net::SocketAddr;
-use std::os::fd::FromRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -35,12 +33,6 @@ pub enum TrojanError {
     #[error("Trojan error: {0}")]
     Other(String),
 }
-
-/// `IP_TRANSPARENT` socket 选项值（Linux）
-const IP_TRANSPARENT: libc::c_int = 19;
-
-/// `IPV6_TRANSPARENT` socket 选项值（Linux）
-const IPV6_TRANSPARENT: libc::c_int = 75;
 
 /// Trojan 拨号器
 pub struct TrojanDialer {
@@ -112,109 +104,24 @@ impl TrojanDialer {
 
     /// Connect to the Trojan proxy with SO_MARK set.
     async fn connect_with_mark(&self) -> Result<TcpStream, TrojanError> {
-        if self.self_mark == 0 && self.host_ns_fd.is_none() {
-            return timeout(self.dial_timeout, TcpStream::connect(&self.proxy_addr))
-                .await
-                .map_err(|_| TrojanError::Timeout(format!("connect to proxy {}", self.proxy_addr)))?
-                .map_err(TrojanError::Io);
-        }
-
-        let domain = if self.proxy_addr.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-
-        let create_and_connect = || -> Result<RawFd, TrojanError> {
-            let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
-            if fd < 0 {
-                return Err(TrojanError::Io(std::io::Error::last_os_error()));
-            }
-
-            if self.self_mark != 0 {
-                let mark_val = self.self_mark as libc::c_int;
-                let ret = unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_MARK,
-                        &mark_val as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    )
-                };
-                if ret != 0 {
-                    unsafe { libc::close(fd) };
-                    return Err(TrojanError::Io(std::io::Error::last_os_error()));
-                }
-            }
-
-            let one: libc::c_int = 1;
-            let (level, opt): (libc::c_int, libc::c_int) = if self.proxy_addr.is_ipv4() {
-                (libc::SOL_IP, IP_TRANSPARENT)
+        // Shared host-ns-aware TCP connect (SO_MARK + IP_TRANSPARENT + host NS).
+        crate::hostns::connect_tcp(
+            self.proxy_addr,
+            &crate::hostns::DirectSocket {
+                self_mark: self.self_mark,
+                host_ns_fd: self.host_ns_fd,
+            },
+            true,
+            self.dial_timeout,
+        )
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                TrojanError::Timeout(format!("connect to proxy {}", self.proxy_addr))
             } else {
-                (libc::SOL_IPV6, IPV6_TRANSPARENT)
-            };
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    level,
-                    opt,
-                    &one as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
+                TrojanError::Io(e)
             }
-
-            let sockaddr = socket2::SockAddr::from(self.proxy_addr);
-            let ret = unsafe {
-                libc::connect(
-                    fd,
-                    sockaddr.as_ptr() as *const libc::sockaddr,
-                    sockaddr.len(),
-                )
-            };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::WouldBlock {
-                    unsafe { libc::close(fd) };
-                    return Err(TrojanError::Io(err));
-                }
-            }
-
-            Ok(fd)
-        };
-
-        let fd = if self.host_ns_fd.is_some() {
-            let host_ns_fd = self.host_ns_fd.unwrap();
-            let current_fd =
-                unsafe { libc::open(c"/proc/self/ns/net".as_ptr(), libc::O_RDONLY) };
-            if current_fd < 0 {
-                return Err(TrojanError::Io(std::io::Error::last_os_error()));
-            }
-            if unsafe { libc::setns(host_ns_fd, libc::CLONE_NEWNET) } != 0 {
-                unsafe { libc::close(current_fd) };
-                return Err(TrojanError::Io(std::io::Error::last_os_error()));
-            }
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                create_and_connect()
-            }));
-            if unsafe { libc::setns(current_fd, libc::CLONE_NEWNET) } != 0 {
-                tracing::warn!("Failed to return to original netns");
-            }
-            unsafe { libc::close(current_fd) };
-            match result {
-                Ok(Ok(fd)) => fd,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(TrojanError::Other("panic in namespace switch".into())),
-            }
-        } else {
-            create_and_connect()?
-        };
-
-        // Convert raw fd to std TcpStream then to tokio TcpStream
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        std_stream.set_nonblocking(true)?;
-        let stream = TcpStream::from_std(std_stream)?;
-        Ok(stream)
+        })
     }
 
     /// Create TLS connector
@@ -253,90 +160,207 @@ impl TrojanDialer {
         Ok(tls_stream)
     }
 
+    /// 计算 Trojan 认证哈希（SHA224(password) 的 hex）
+    fn auth_hash(&self) -> String {
+        let mut hasher = Sha224::new();
+        hasher.update(self.password.as_bytes());
+        let hash = hasher.finalize();
+        hex::encode(hash)
+    }
+
+    /// 构建 Trojan 请求头：CRLF + HASH + CRLF + CMD + CRLF + ADDR + CRLF
+    fn build_header(&self, cmd: u8, host: &str, port: u16) -> Result<Vec<u8>, TrojanError> {
+        // Trojan protocol header:
+        // CRLF(2) + HASH(56) + CRLF(2) + CMD(1) + CRLF(2) + ATYP(1) + ADDR + PORT(2) + CRLF(2)
+        let mut header = Vec::new();
+        header.extend_from_slice(b"\r\n");
+        header.extend_from_slice(self.auth_hash().as_bytes());
+        header.extend_from_slice(b"\r\n");
+        header.push(cmd);
+        header.extend_from_slice(b"\r\n");
+        header.extend_from_slice(&encode_addr(host, port)?);
+        header.extend_from_slice(b"\r\n");
+        Ok(header)
+    }
+
     /// Perform Trojan handshake
     async fn handshake(
         &self,
         stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
         target: &str,
     ) -> Result<(), TrojanError> {
-        // Parse target
-        let (host, port) = if let Some(pos) = target.rfind(':') {
-            (&target[..pos], target[pos + 1..].to_string())
-        } else {
-            return Err(TrojanError::ProtocolError("invalid target".into()));
-        };
-
-        let port_num: u16 = port
-            .parse()
-            .map_err(|_| TrojanError::ProtocolError("invalid port".into()))?;
-
-        // Trojan protocol header:
-        // CRLF(2 bytes) + HASH(56 bytes) + CRLF(2 bytes) + CMD(1 byte) + CRLF(2 bytes) + ATYP(1 byte) + ADDR + PORT(2 bytes) + CRLF(2 bytes)
-        
-        // 1. Calculate SHA224(password)
-        let mut hasher = Sha224::new();
-        hasher.update(self.password.as_bytes());
-        let hash = hasher.finalize();
-        let hash_hex = hex::encode(hash);
-
-        // 2. Build header
-        let mut header = Vec::new();
-        
-        // CRLF
-        header.extend_from_slice(b"\r\n");
-        
-        // HASH (56 hex chars = 28 bytes SHA224)
-        header.extend_from_slice(hash_hex.as_bytes());
-        
-        // CRLF
-        header.extend_from_slice(b"\r\n");
-        
-        // CMD: 0x01 = CONNECT
-        header.push(0x01);
-        
-        // CRLF
-        header.extend_from_slice(b"\r\n");
-        
-        // ATYP: 0x03 = Domain
-        header.push(0x03);
-        
-        // ADDR: domain length + domain
-        let host_bytes = host.as_bytes();
-        header.push(host_bytes.len() as u8);
-        header.extend_from_slice(host_bytes);
-        
-        // PORT
-        header.extend_from_slice(&port_num.to_be_bytes());
-        
-        // CRLF
-        header.extend_from_slice(b"\r\n");
-
+        let (host, port) = split_target(target)?;
+        let header = self.build_header(0x01, host, port)?;
         stream.write_all(&header).await?;
-
         Ok(())
+    }
+}
+
+/// 拆分 `host:port` 目标字符串（支持 [ipv6]:port）
+fn split_target(target: &str) -> Result<(&str, u16), TrojanError> {
+    let (mut host, port) = target
+        .rsplit_once(':')
+        .ok_or_else(|| TrojanError::ProtocolError(format!("invalid target '{}'", target)))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| TrojanError::ProtocolError(format!("invalid target port '{}'", target)))?;
+    if host.starts_with('[') && host.ends_with(']') {
+        host = &host[1..host.len() - 1];
+    }
+    Ok((host, port))
+}
+
+/// 编码 Trojan 地址：ATYP + ADDR + PORT（1=IPv4, 3=域名, 4=IPv6）
+fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, TrojanError> {
+    let mut addr = Vec::with_capacity(1 + 16 + 2);
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        addr.push(0x01);
+        addr.extend_from_slice(&ip.octets());
+    } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        addr.push(0x04);
+        addr.extend_from_slice(&ip.octets());
+    } else {
+        let b = host.as_bytes();
+        addr.push(0x03);
+        addr.push(b.len() as u8);
+        addr.extend_from_slice(b);
+    }
+    addr.extend_from_slice(&port.to_be_bytes());
+    Ok(addr)
+}
+
+/// 解码 Trojan 地址，返回 `(SocketAddr, 消耗字节数)`
+fn decode_addr(data: &[u8]) -> Result<(SocketAddr, usize), TrojanError> {
+    if data.is_empty() {
+        return Err(TrojanError::ProtocolError("empty address".into()));
+    }
+    match data[0] {
+        0x01 => {
+            if data.len() < 7 {
+                return Err(TrojanError::ProtocolError("short ipv4".into()));
+            }
+            let ip = std::net::Ipv4Addr::new(data[1], data[2], data[3], data[4]);
+            Ok((
+                SocketAddr::from((ip, u16::from_be_bytes([data[5], data[6]]))),
+                7,
+            ))
+        }
+        0x04 => {
+            if data.len() < 19 {
+                return Err(TrojanError::ProtocolError("short ipv6".into()));
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[1..17]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            Ok((
+                SocketAddr::from((ip, u16::from_be_bytes([data[17], data[18]]))),
+                19,
+            ))
+        }
+        0x03 => {
+            if data.len() < 2 {
+                return Err(TrojanError::ProtocolError("short domain".into()));
+            }
+            let len = data[1] as usize;
+            if data.len() < 2 + len + 2 {
+                return Err(TrojanError::ProtocolError("short domain".into()));
+            }
+            let port = u16::from_be_bytes([data[2 + len], data[3 + len]]);
+            Ok((SocketAddr::from(([0, 0, 0, 0], port)), 2 + len + 2))
+        }
+        other => Err(TrojanError::ProtocolError(format!(
+            "unknown address type: {}",
+            other
+        ))),
     }
 }
 
 #[async_trait]
 impl OutboundDialer for TrojanDialer {
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
-        // 1. TCP connect to proxy
+        // 1. TCP connect to proxy (host-ns aware)
         let stream = self.connect_with_mark().await?;
-        
+
         // 2. TLS handshake
         let mut tls_stream = self.tls_handshake(stream).await?;
-        
-        // 3. Trojan handshake
+
+        // 3. Trojan handshake (auth + target address)
         self.handshake(&mut tls_stream, target).await?;
-        
-        // 4. Get the inner TCP stream back
-        // Note: tokio-rustls TlsStream doesn't have into_inner() in async context
-        // We need to split and handle differently
-        // For now, return error - this needs proper implementation
-        Err(anyhow::anyhow!("Trojan dialer needs further implementation"))
+
+        // 4. Return the TLS stream as a boxed duplex stream
+        Ok(ProxyConn::new_boxed(Box::new(tls_stream)))
+    }
+
+    /// 建立 Trojan UDP 中继会话。
+    ///
+    /// 1. 建立 TLS 控制连接并发送 UDP ASSOCIATE（CMD=0x03）命令；
+    /// 2. UDP 数据报直发代理服务器，格式 `[ATYP][ADDR][PORT][LEN(2)][PAYLOAD]`。
+    async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
+        // 控制连接：TLS + UDP ASSOCIATE 命令（地址 0.0.0.0:0）
+        let tcp = self.connect_with_mark().await?;
+        let mut control = self.tls_handshake(tcp).await?;
+        let header = self.build_header(0x03, "0.0.0.0", 0)?;
+        control.write_all(&header).await?;
+
+        // UDP socket（宿主 NS，连接代理服务器）
+        let socket = crate::hostns::create_udp(
+            self.proxy_addr,
+            &crate::hostns::DirectSocket {
+                self_mark: self.self_mark,
+                host_ns_fd: self.host_ns_fd,
+            },
+        )
+        .map_err(TrojanError::Io)?;
+        socket.connect(self.proxy_addr).map_err(TrojanError::Io)?;
+        let socket = tokio::net::UdpSocket::from_std(socket).map_err(TrojanError::Io)?;
+
+        Ok(Box::new(TrojanUdpSession { control, socket }))
     }
 
     fn protocol_name(&self) -> &'static str {
         "trojan"
+    }
+    fn proxy_addr(&self) -> std::net::SocketAddr {
+        self.proxy_addr
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Trojan UDP 中继会话（控制连接保活 + UDP 数据报转发）。
+pub struct TrojanUdpSession {
+    /// TLS 控制连接（保持存活以维持服务端的 UDP 放行）
+    #[allow(dead_code)]
+    control: tokio_rustls::client::TlsStream<TcpStream>,
+    /// UDP 数据 socket（宿主 NS，连接代理服务器）
+    socket: tokio::net::UdpSocket,
+}
+
+#[async_trait]
+impl crate::UdpSession for TrojanUdpSession {
+    async fn send(&self, dest: &SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
+        // [ATYP][ADDR][PORT][LEN(2)][PAYLOAD]
+        let mut datagram = Vec::with_capacity(1 + 16 + 2 + 2 + payload.len());
+        datagram.extend_from_slice(&encode_addr(&dest.ip().to_string(), dest.port())?);
+        datagram.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        datagram.extend_from_slice(payload);
+        self.socket.send(&datagram).await?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
+        let mut buf = vec![0u8; 65535];
+        let len = self.socket.recv(&mut buf).await?;
+        let (dest, consumed) = decode_addr(&buf[..len])?;
+        if len < consumed + 2 {
+            return Err(anyhow::anyhow!("trojan udp: short packet"));
+        }
+        let pkt_len = u16::from_be_bytes([buf[consumed], buf[consumed + 1]]) as usize;
+        if len < consumed + 2 + pkt_len {
+            return Err(anyhow::anyhow!("trojan udp: truncated payload"));
+        }
+        Ok((dest, buf[consumed + 2..consumed + 2 + pkt_len].to_vec()))
     }
 }

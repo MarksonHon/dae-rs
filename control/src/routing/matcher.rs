@@ -16,8 +16,8 @@ use std::str::FromStr;
 use tracing::{debug, info};
 
 use crate::config;
-use crate::ebpf::{match_type, outbound};
-use crate::ebpf::{CidrEntry, LpmKey, MatchSet, MatchSetValue, PortRange};
+use crate::net::ebpf::{match_type, outbound};
+use crate::net::ebpf::{CidrEntry, LpmKey, MatchSet, MatchSetValue, PortRange};
 
 // ============================================================================
 // Constants (must match tproxy.c and common/consts/ebpf_generated.go)

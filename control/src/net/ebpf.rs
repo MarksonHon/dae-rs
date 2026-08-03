@@ -842,6 +842,22 @@ impl EbpfManager {
             "Loading eBPF from byte slice via libbpf-rs"
         );
 
+        // 清理 pin 目录中的旧 pin：避免 libbpf 在 load 时尝试复用残留的
+        // 内部 map pin（如 <hash>.rodata）而报 -EPERM / "error reusing pinned map"。
+        if let Some(ref bpffs_path) = self.pin_path.clone() {
+            let dir = std::path::Path::new(bpffs_path);
+            if dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut builder = ObjectBuilder::default();
         let mut open_obj = builder
             .open_memory(bytes)
@@ -853,6 +869,24 @@ impl EbpfManager {
         // Write PARAM to .rodata BEFORE loading — .rodata becomes read-only
         // after bpf_object__load(), so post-load writes get EPERM.
         self.update_param_pre_load(&mut open_obj)?;
+
+        // C 侧部分 map 声明了 LIBBPF_PIN_BY_NAME（如 conn_state_map），
+        // 在 load 前统一覆盖 pin 路径到目标目录，避免 load 后
+        // bpf_map__pin() 报 "already has pin path ... different from ..."。
+        if let Some(ref bpffs_path) = self.pin_path.clone() {
+            let dir = std::path::Path::new(bpffs_path);
+            for mut map in open_obj.maps_mut() {
+                let name = map.name().to_string_lossy().to_string();
+                // 跳过内部 map（<hash>.rodata/.bss/.data/.kconfig 等，均含 '.'）
+                if name.is_empty() || name.contains('.') {
+                    continue;
+                }
+                let pin_path = dir.join(&name);
+                if let Err(e) = map.set_pin_path(&pin_path) {
+                    warn!("Failed to set pin path for map '{}' to {:?}: {}", name, pin_path, e);
+                }
+            }
+        }
 
         // Fix program types for non-standard TC section names before loading
         set_tc_prog_types(&mut open_obj);
@@ -1022,7 +1056,8 @@ impl EbpfManager {
             .maps()
             .filter_map(|m| {
                 let name = m.name().to_string_lossy().to_string();
-                if name.starts_with('.') || name.is_empty() {
+                // 跳过内部 map（<hash>.rodata/.bss/.data/.kconfig 等，均含 '.'）
+                if name.is_empty() || name.contains('.') {
                     None
                 } else {
                     Some(name)
@@ -1047,8 +1082,8 @@ impl EbpfManager {
         // 遍历所有 maps 并 pin
         for mut map in obj.maps_mut() {
             let map_name = map.name().to_string_lossy().to_string();
-            // 跳过内部 map（如 .rodata、.bss 等）
-            if map_name.starts_with('.') || map_name.is_empty() {
+            // 跳过内部 map（<hash>.rodata/.bss/.data 等，均含 '.'）
+            if map_name.is_empty() || map_name.contains('.') {
                 continue;
             }
             let pin_path = dir.join(&map_name);

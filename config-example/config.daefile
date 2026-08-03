@@ -187,7 +187,7 @@ outbounds {
       # policy: min          # pick node with lowest last probe latency
       # policy: min_avg10    # pick node with lowest avg10 latency
       policy: min_moving_avg # pick node with lowest moving average latency (recommended)
-      nodes(main, backup)
+      nodes(ss2022_node, ss_aead_node, trojan_node, tuic_node, juicity_node)
     }
 
     a_group {
@@ -199,8 +199,8 @@ outbounds {
     # select type: node is manually switched via REST API, no auto probing
     manual {
       type: select
-      selected: main         # initial selected node, can be updated via API
-      nodes(main, backup)
+      selected: socks5_node    # initial selected node, can be updated via API
+      nodes(socks5_node, vmess_tcp_node, vmess_ws_node)
     }
   }
 }

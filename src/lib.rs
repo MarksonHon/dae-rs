@@ -152,7 +152,7 @@ pub async fn run(
     // Set eBPF PARAM global variable
     // This must be done after netns creation but before eBPF loading
     // We'll set it in start() after netns is created
-    let ebpf_param = control::ebpf::Daeparam {
+    let ebpf_param = control::net::ebpf::Daeparam {
         tproxy_port: cp.config.tproxy_port as u32,
         control_plane_pid: std::process::id(),
         // dae_socket_mark: used by eBPF pid_is_control_plane() to identify

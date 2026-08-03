@@ -5,6 +5,12 @@
     "log_level": "info",
     "temp_json": true
   },
+  "interface": {
+    "wan_interface": [
+      "auto"
+    ],
+    "lan_interface": []
+  },
   "process_exclusion": {
     "enabled": true,
     "protect_self": true,
@@ -12,9 +18,10 @@
     "gc_interval_sec": 30,
     "stale_after_sec": 120,
     "match": {
-      "comm": ["dae-rs", "naiveproxy"],
-      "pid": [],
-      "tgid": []
+      "comm": [
+        "dae-rs",
+        "naiveproxy"
+      ]
     }
   },
   "outbounds": {
@@ -22,178 +29,180 @@
       {
         "name": "socks5_node",
         "protocol": "socks5",
-        "params": {
-          "address": "127.0.0.1:1080",
-          "username": "",
-          "password": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "127.0.0.1:1080",
+        "dial_timeout_ms": 5000
       },
       {
         "name": "ss2022_node",
         "protocol": "shadowsocks",
-        "params": {
-          "address": "server.example.com:8388",
-          "cipher": "2022-blake3-aes-256-gcm",
-          "password": "your-psk-here",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:8388",
+        "password": "your-psk-here",
+        "cipher": "2022-blake3-aes-256-gcm",
+        "dial_timeout_ms": 5000
       },
       {
         "name": "ss_aead_node",
         "protocol": "shadowsocks",
-        "params": {
-          "address": "server.example.com:8388",
-          "cipher": "aes-256-gcm",
-          "password": "your-password",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:8388",
+        "password": "your-password",
+        "cipher": "aes-256-gcm",
+        "dial_timeout_ms": 5000
       },
       {
         "name": "trojan_node",
         "protocol": "trojan",
-        "params": {
-          "address": "server.example.com:443",
-          "password": "your-password",
-          "sni": "server.example.com",
-          "ca_sha256": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:443",
+        "password": "your-password",
+        "sni": "server.example.com",
+        "dial_timeout_ms": 5000
       },
       {
         "name": "tuic_node",
         "protocol": "tuic",
-        "params": {
-          "address": "server.example.com:443",
-          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
-          "password": "your-password",
-          "congestion_control": "bbr",
-          "alpn": ["h3"],
-          "sni": "server.example.com",
-          "ca_sha256": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:443",
+        "password": "your-password",
+        "sni": "server.example.com",
+        "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+        "congestion_control": "bbr",
+        "alpn": [
+          "h3"
+        ],
+        "dial_timeout_ms": 5000
       },
       {
         "name": "juicity_node",
         "protocol": "juicity",
-        "params": {
-          "address": "server.example.com:443",
-          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
-          "password": "your-password",
-          "sni": "server.example.com",
-          "ca_sha256": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:443",
+        "password": "your-password",
+        "sni": "server.example.com",
+        "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+        "dial_timeout_ms": 5000
       },
       {
         "name": "vmess_tcp_node",
         "protocol": "vmess",
-        "params": {
-          "address": "server.example.com:443",
-          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
-          "security": "auto",
-          "alter_id": 0,
-          "network": "tcp",
-          "sni": "server.example.com",
-          "ca_sha256": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:443",
+        "sni": "server.example.com",
+        "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+        "security": "auto",
+        "alter_id": 0,
+        "dial_timeout_ms": 5000
       },
       {
         "name": "vmess_ws_node",
         "protocol": "vmess",
-        "params": {
-          "address": "server.example.com:80",
-          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
-          "security": "none",
-          "alter_id": 0,
-          "network": "ws",
-          "ws_path": "/ws",
-          "ws_headers": { "Host": "example.com" },
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:80",
+        "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+        "security": "none",
+        "alter_id": 0,
+        "network": "ws",
+        "ws_path": "/ws",
+        "ws_headers": {
+          "Host": "example.com"
+        },
+        "dial_timeout_ms": 5000
       },
       {
         "name": "vmess_ws_tls_node",
         "protocol": "vmess",
-        "params": {
-          "address": "server.example.com:443",
-          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
-          "security": "none",
-          "alter_id": 0,
-          "network": "ws",
-          "ws_path": "/ws",
-          "ws_headers": { "Host": "example.com" },
-          "sni": "server.example.com",
-          "ca_sha256": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:443",
+        "sni": "server.example.com",
+        "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+        "security": "none",
+        "alter_id": 0,
+        "network": "ws",
+        "ws_path": "/ws",
+        "ws_headers": {
+          "Host": "example.com"
+        },
+        "dial_timeout_ms": 5000
       },
       {
         "name": "vmess_h2_node",
         "protocol": "vmess",
-        "params": {
-          "address": "server.example.com:443",
-          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
-          "security": "none",
-          "alter_id": 0,
-          "network": "h2",
-          "h2_path": "/h2",
-          "h2_host": "example.com",
-          "sni": "server.example.com",
-          "ca_sha256": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:443",
+        "sni": "server.example.com",
+        "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+        "security": "none",
+        "alter_id": 0,
+        "network": "h2",
+        "h2_path": "/h2",
+        "h2_host": "example.com",
+        "dial_timeout_ms": 5000
       },
       {
         "name": "vmess_grpc_node",
         "protocol": "vmess",
-        "params": {
-          "address": "server.example.com:443",
-          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
-          "security": "none",
-          "alter_id": 0,
-          "network": "grpc",
-          "grpc_service_name": "grpc",
-          "sni": "server.example.com",
-          "ca_sha256": "",
-          "dial_timeout_ms": 5000
-        }
+        "address": "server.example.com:443",
+        "sni": "server.example.com",
+        "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+        "security": "none",
+        "alter_id": 0,
+        "network": "grpc",
+        "grpc_service_name": "grpc",
+        "dial_timeout_ms": 5000
       }
     ],
     "groups": [
       {
         "name": "proxy_primary",
-        "type": "auto",
+        "group_type": "auto",
         "policy": "min_moving_avg",
         "selectors": [
-          { "type": "list", "nodes": ["main", "backup"] }
+          {
+            "type": "list",
+            "nodes": [
+              "ss2022_node",
+              "ss_aead_node",
+              "trojan_node",
+              "tuic_node",
+              "juicity_node"
+            ]
+          }
         ]
       },
       {
         "name": "a_group",
-        "type": "auto",
+        "group_type": "auto",
         "policy": "min_avg10",
         "selectors": [
-          { "type": "regex", "pattern": ".*" }
+          {
+            "type": "regex",
+            "pattern": "*"
+          }
         ]
       },
       {
         "name": "manual",
-        "type": "select",
-        "selected": "main",
+        "group_type": "select",
+        "selected": "socks5_node",
         "selectors": [
-          { "type": "list", "nodes": ["main", "backup"] }
+          {
+            "type": "list",
+            "nodes": [
+              "socks5_node",
+              "vmess_tcp_node",
+              "vmess_ws_node"
+            ]
+          }
         ]
       }
     ]
   },
   "routing": {
     "rules": [
-      { "match": "dip(geoip:private)", "action": "direct" },
-      { "match": "dport(22)", "action": "direct" },
-      { "match": "l4proto(tcp)", "action": "proxy(proxy_primary)" }
+      {
+        "match": "dip(geoip:private)",
+        "action": "direct"
+      },
+      {
+        "match": "dport(22)",
+        "action": "direct"
+      },
+      {
+        "match": "l4proto(tcp)",
+        "action": "proxy(proxy_primary)"
+      }
     ],
     "fallback": "proxy(proxy_primary)"
   },
@@ -201,6 +210,10 @@
     "starting_dns": {
       "ip_version_prefer": 4,
       "upstream": [
+        {
+          "label": "bootstrap",
+          "address": "udp://1.1.1.1:53"
+        },
         {
           "label": "bootstrap",
           "address": "udp://1.1.1.1:53"
@@ -219,7 +232,7 @@
     "groups": [
       {
         "name": "trusted_dns",
-        "proxy": "proxy(proxy_primary)",
+        "proxy": "proxy_primary",
         "upstream": [
           {
             "label": "googledns",
@@ -264,8 +277,7 @@
         "request_routing": {
           "rules": [],
           "fallback": "alidns"
-        },
-        "response_routing": null
+        }
       }
     ],
     "routing": {

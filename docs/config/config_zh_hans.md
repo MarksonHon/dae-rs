@@ -14,7 +14,7 @@ dae-rs 是一个基于 eBPF 的透明代理系统，是原 `dae` 项目的 Rust 
 | **daefile**（`.daefile`） | 类 Caddyfile 的易读文本语法，是主要输入格式。 |
 | **JSON**（`config.json`） | daefile 解析后得到的规范化、机器可读的结构。 |
 
-`daefile` 由 `parse_daefile()`（位于 `control/src/config.rs`）解析，再经
+`daefile` 由 `parse_daefile()`（位于 `control/src/config/`）解析，再经
 `validate_config()` 做语义校验。校验后的结果即规范化 JSON 结构，可输出为
 "temp JSON" 文件用于调试（见 `runtime.temp_json`）。参考示例位于
 `config-example/` 目录（`config.daefile`、`config-minimal.daefile`、`config.json`）。
@@ -216,7 +216,7 @@ routing {
   `proxy(<group>, mark=0x..., must)`。
 - `fallback:` 表示无规则命中时使用的动作（默认 `proxy(proxy_primary)`）。
 
-已实现的匹配函数（位于 `control/src/routing.rs`）：
+已实现的匹配函数（位于 `control/src/routing/matcher.rs`）：
 
 | 函数 | 含义 |
 |------|------|

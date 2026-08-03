@@ -67,7 +67,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y \
             clang llvm \
-            autoconf automake gettext \
+            autoconf automake autopoint gettext \
             flex bison gawk \
             pkg-config make
 

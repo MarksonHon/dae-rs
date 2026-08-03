@@ -70,39 +70,14 @@ impl DnsUpstreamPool {
         }
     }
 
-    /// Create a raw UDP socket bound to an ephemeral port with SO_MARK=DAE_SOCKET_MARK
-    /// for eBPF self-exclusion. This ensures dae-rs's own DNS queries bypass the
-    /// transparent proxy pipeline and go directly to the upstream DNS server.
+    /// Create a raw UDP socket bound to an ephemeral port with
+    /// SO_MARK=DAE_SOCKET_MARK for eBPF self-exclusion.
+    ///
+    /// 通过 [`protocols::hostns::create_udp`] 统一实现“dae-rs 自身流量必须直连”
+    /// 的约定（控制面标记 + 宿主 NS），确保 DNS 查询绕过透明代理管道。
     fn create_marked_udp_socket(addr: &SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
-        use socket2::{Domain, Socket, Type};
-        use std::os::unix::io::AsRawFd;
-
-        let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
-        let socket = Socket::new(domain, Type::DGRAM, None)
-            .context("Failed to create marked UDP socket")?;
-        let fd = socket.as_raw_fd();
-
-        let mark_val = shared::DAE_SOCKET_MARK as libc::c_int;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_MARK,
-                &mark_val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-
-        // Bind to ephemeral port before converting
-        let bind_addr: SocketAddr = if addr.is_ipv6() {
-            ([0u16; 8], 0u16).into()
-        } else {
-            ([0u8; 4], 0u16).into()
-        };
-        socket.bind(&socket2::SockAddr::from(bind_addr))?;
-
-        let std_socket: std::net::UdpSocket = socket.into();
-        Ok(std_socket)
+        protocols::hostns::create_udp(*addr, &protocols::hostns::DirectSocket::control_plane(None))
+            .context("Failed to create marked UDP socket")
     }
 
     /// Send a DNS query and receive response
@@ -142,31 +117,17 @@ impl DnsUpstreamPool {
     }
 
     async fn query_tcp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        use std::os::unix::io::FromRawFd;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Create TCP socket with SO_MARK=0x100 (same rationale as UDP)
-        let domain = if self.address.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
-        if fd < 0 {
-            return Err(anyhow::anyhow!("failed to create marked TCP socket: {}", std::io::Error::last_os_error()));
-        }
-        let mark_val = shared::DAE_SOCKET_MARK as libc::c_int;
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_MARK,
-                &mark_val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        let mut stream = tokio::net::TcpStream::from_std(std_stream)?;
+        // TCP 查询 socket：统一走 hostns::connect_tcp（控制面标记 → 直连）
+        let mut stream = protocols::hostns::connect_tcp(
+            self.address,
+            &protocols::hostns::DirectSocket::control_plane(None),
+            false,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to create marked TCP socket: {}", e))?;
 
         // TCP DNS: 2-byte length prefix
         let len = (request.len() as u16).to_be_bytes();

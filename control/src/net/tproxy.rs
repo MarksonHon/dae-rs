@@ -35,9 +35,8 @@
 //! * 错误不应导致整个监听器崩溃
 
 use anyhow::{Context, Result};
-use protocols::OutboundDialer;
-use protocols::Socks5Dialer;
-use protocols::UdpAssociateSession;
+use protocols::{OutboundDialer, ProxyStream};
+use protocols::UdpSession;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -132,16 +131,17 @@ const SO_MARK: libc::c_int = 36;
 /// # 示例
 ///
 /// ```no_run
-/// use control::tproxy::TproxyListener;
+/// use control::net::tproxy::TproxyListener;
 /// use protocols::Socks5Dialer;
+/// use protocols::OutboundDialer;
 /// use std::net::SocketAddr;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let addr: SocketAddr = "0.0.0.0:15080".parse()?;
-/// let dialer = Socks5Dialer::new(
+/// let dialer: std::sync::Arc<dyn OutboundDialer> = std::sync::Arc::new(Socks5Dialer::new(
 ///     "127.0.0.1:1080".parse()?,
 ///     "", "", 5000,
-/// );
+/// ));
 /// let listener = TproxyListener::new(addr, dialer);
 /// listener.start().await?;
 /// # Ok(())
@@ -150,8 +150,8 @@ const SO_MARK: libc::c_int = 36;
 pub struct TproxyListener {
     /// 监听地址（在代理命名空间内，如 `0.0.0.0:15080`）
     listen_addr: SocketAddr,
-    /// 出站拨号器
-    dialer: Arc<Socks5Dialer>,
+    /// 出站拨号器（按配置的协议构造）
+    dialer: Arc<dyn OutboundDialer>,
     /// 运行标记
     running: Arc<AtomicBool>,
     /// socket 标记值（用于 eBPF 自排除，默认 0x100）
@@ -166,11 +166,11 @@ impl TproxyListener {
     /// # 参数
     ///
     /// * `listen_addr` — 监听地址（如 `0.0.0.0:15080`）
-    /// * `dialer` — SOCKS5 出站拨号器
-    pub fn new(listen_addr: SocketAddr, dialer: Socks5Dialer) -> Self {
+    /// * `dialer` — 出站拨号器
+    pub fn new(listen_addr: SocketAddr, dialer: Arc<dyn OutboundDialer>) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(dialer),
+            dialer,
             running: Arc::new(AtomicBool::new(false)),
             socket_mark: shared::DAE_SOCKET_MARK, // 原版 dae 默认值
             stop_signal: Arc::new(Notify::new()),
@@ -178,10 +178,14 @@ impl TproxyListener {
     }
 
     /// 创建新的 TProxy 监听器，指定 socket 标记值
-    pub fn new_with_mark(listen_addr: SocketAddr, dialer: Socks5Dialer, socket_mark: u32) -> Self {
+    pub fn new_with_mark(
+        listen_addr: SocketAddr,
+        dialer: Arc<dyn OutboundDialer>,
+        socket_mark: u32,
+    ) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(dialer),
+            dialer,
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
@@ -194,7 +198,7 @@ impl TproxyListener {
     }
 
     /// 获取出站拨号器的引用
-    pub fn dialer(&self) -> &Arc<Socks5Dialer> {
+    pub fn dialer(&self) -> &Arc<dyn OutboundDialer> {
         &self.dialer
     }
 
@@ -360,10 +364,10 @@ impl TproxyListener {
     /// [`stop()`](TproxyListener::stop) is called.
     pub async fn serve(&self, listener_v4: TcpListener, listener_v6: TcpListener) -> Result<()> {
         self.running.store(true, Ordering::SeqCst);
-        let proxy_addr = self.dialer.proxy_addr.to_string();
+        let protocol = self.dialer.protocol_name();
         info!(
             listen_addr = %self.listen_addr,
-            proxy_addr = %proxy_addr,
+            protocol = %protocol,
             "TProxy listener started (AF_INET + AF_INET6)"
         );
 
@@ -515,8 +519,8 @@ impl std::fmt::Debug for TproxyListener {
 /// * 如果双向拷贝失败，返回错误（可能网络中断）
 /// * 单个连接的错误不会影响监听器的其他连接
 async fn handle_connection(
-    inbound: TcpStream,
-    dialer: Arc<Socks5Dialer>,
+    mut inbound: TcpStream,
+    dialer: Arc<dyn OutboundDialer>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let peer_addr = inbound.peer_addr().ok();
@@ -537,15 +541,16 @@ async fn handle_connection(
     // 入站连接由内核 accept 默认开启 Nagle；出站连接在 SOCKS5 拨号器中设置。
     set_tcp_nodelay(&inbound);
 
-    // ---- 步骤 2：通过 SOCKS5 拨号到目标 ----
-    let proxy_addr = dialer.proxy_addr;
+    // ---- 步骤 2：通过出站拨号器拨号到目标 ----
+    let protocol = dialer.protocol_name();
+    let proxy_addr = dialer.proxy_addr();
     let dial_result = dialer.dial(&orig_dst.to_string()).await;
 
     debug!(
         orig_dst = %orig_dst,
-        proxy_addr = %proxy_addr,
+        protocol = %protocol,
         dial_elapsed_ms = start.elapsed().as_millis(),
-        "handle_connection: SOCKS5 dial result={}",
+        "handle_connection: dial result={}",
         if dial_result.is_ok() { "ok" } else { "fail" }
     );
 
@@ -553,23 +558,52 @@ async fn handle_connection(
         Ok(conn) => conn,
         Err(e) => {
             info!(
-                "TCP  {}:{} -> {} [PROXY] FAIL dial: {}",
+                "TCP  {}:{} -> {} [PROXY] FAIL dial via {} -> proxy {}: {}",
                 peer_addr
                     .map(|a| a.ip())
                     .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
                 peer_addr.map(|a| a.port()).unwrap_or(0),
                 orig_dst,
+                protocol,
+                proxy_addr,
                 e,
             );
-            return Err(e).context("SOCKS5 dial failed");
+            return Err(e).context("dial failed");
         }
     };
 
+    // ---- 步骤 2.5：记录出站连接信息（INFO）----
+    // outbound local 地址为宿主 NS 中真实源地址（Tcp 变体）；
+    // TLS/WS/QUIC 包装流无法直接取 socket 地址，显示 n/a。
+    let outbound_local = match &outbound.stream {
+        ProxyStream::Tcp(s) => s.local_addr().ok(),
+        ProxyStream::Boxed(_) => None,
+    };
+    info!(
+        "TCP  {}:{} -> {} [PROXY] outbound via {} -> proxy {} (local {}) dial={:.1}ms",
+        peer_addr
+            .map(|a| a.ip())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        peer_addr.map(|a| a.port()).unwrap_or(0),
+        orig_dst,
+        protocol,
+        proxy_addr,
+        outbound_local
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "n/a".into()),
+        start.elapsed().as_micros() as f64 / 1000.0,
+    );
+
     // ---- 步骤 3：双向数据拷贝 ----
-    // splice 零拷贝中继（不可用时回退 64KB 缓冲拷贝）。
-    // ProxyConn 内部就是 tokio TcpStream，解构取出以走 splice 路径。
-    let outbound_stream = outbound.stream;
-    let result = relay_bidirectional(inbound, outbound_stream).await;
+    // 纯 TCP 连接走 splice 零拷贝中继；TLS/WS/QUIC 包装流走缓冲拷贝。
+    let result = match outbound.stream {
+        ProxyStream::Tcp(outbound_stream) => {
+            relay_bidirectional(inbound, outbound_stream).await
+        }
+        ProxyStream::Boxed(mut outbound_stream) => {
+            tokio::io::copy_bidirectional(&mut inbound, &mut outbound_stream).await
+        }
+    };
     let elapsed_ms = start.elapsed().as_micros() as f64 / 1000.0;
     let bytes_transferred = result.as_ref().map(|(a, b)| a + b).unwrap_or(0);
 
@@ -1003,12 +1037,13 @@ pub fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use protocols::Socks5Dialer;
     use std::net::SocketAddr;
 
     #[test]
     fn test_tproxy_listener_new() {
         let addr: SocketAddr = "0.0.0.0:15080".parse().unwrap();
-        let dialer = Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000);
+        let dialer: std::sync::Arc<dyn protocols::OutboundDialer> = std::sync::Arc::new(Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000));
         let listener = TproxyListener::new(addr, dialer);
 
         assert_eq!(listener.listen_addr(), addr);
@@ -1018,7 +1053,7 @@ mod tests {
     #[test]
     fn test_tproxy_listener_stop() {
         let addr: SocketAddr = "0.0.0.0:15080".parse().unwrap();
-        let dialer = Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000);
+        let dialer: std::sync::Arc<dyn protocols::OutboundDialer> = std::sync::Arc::new(Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000));
         let listener = TproxyListener::new(addr, dialer);
 
         assert!(!listener.is_running());
@@ -1029,7 +1064,7 @@ mod tests {
     #[test]
     fn test_tproxy_listener_running_flag() {
         let addr: SocketAddr = "0.0.0.0:15080".parse().unwrap();
-        let dialer = Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000);
+        let dialer: std::sync::Arc<dyn protocols::OutboundDialer> = std::sync::Arc::new(Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000));
         let listener = TproxyListener::new(addr, dialer);
 
         let flag = listener.running_flag();
@@ -1057,7 +1092,7 @@ mod tests {
 
             // 这里无法测试 get_original_dst 因为需要真实的 TProxy 连接，
             // 但我们至少确保函数签名和基本类型正确
-            let dialer = Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000);
+            let dialer: std::sync::Arc<dyn protocols::OutboundDialer> = std::sync::Arc::new(Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000));
             let tproxy = TproxyListener::new(addr, dialer);
             assert_eq!(tproxy.listen_addr(), addr);
         });
@@ -1066,7 +1101,7 @@ mod tests {
     #[test]
     fn test_tproxy_listener_debug() {
         let addr: SocketAddr = "0.0.0.0:15080".parse().unwrap();
-        let dialer = Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000);
+        let dialer: std::sync::Arc<dyn protocols::OutboundDialer> = std::sync::Arc::new(Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000));
         let listener = TproxyListener::new(addr, dialer);
 
         let debug_str = format!("{:?}", listener);
@@ -1260,7 +1295,7 @@ pub struct UdpTproxyListener {
     /// 监听地址（如 `0.0.0.0:15080` 或 `[::]:15080`）
     listen_addr: SocketAddr,
     /// 出站拨号器
-    dialer: Arc<Socks5Dialer>,
+    dialer: Arc<dyn OutboundDialer>,
     /// 运行标记
     running: Arc<AtomicBool>,
     /// socket 标记值（用于 eBPF 自排除，默认 0x100）
@@ -1281,10 +1316,10 @@ pub struct UdpTproxyListener {
 
 impl UdpTproxyListener {
     /// 创建新的 UDP TProxy 监听器
-    pub fn new(listen_addr: SocketAddr, dialer: Socks5Dialer) -> Self {
+    pub fn new(listen_addr: SocketAddr, dialer: Arc<dyn OutboundDialer>) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(dialer),
+            dialer,
             running: Arc::new(AtomicBool::new(false)),
             socket_mark: shared::DAE_SOCKET_MARK,
             stop_signal: Arc::new(Notify::new()),
@@ -1294,10 +1329,14 @@ impl UdpTproxyListener {
     }
 
     /// 创建新的 UDP TProxy 监听器，指定 socket 标记值
-    pub fn new_with_mark(listen_addr: SocketAddr, dialer: Socks5Dialer, socket_mark: u32) -> Self {
+    pub fn new_with_mark(
+        listen_addr: SocketAddr,
+        dialer: Arc<dyn OutboundDialer>,
+        socket_mark: u32,
+    ) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(dialer),
+            dialer,
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
@@ -1486,7 +1525,7 @@ impl UdpTproxyListener {
     /// 启动 UDP TProxy 监听循环
     pub async fn start(
         &self,
-        ebpf_mgr: Option<Arc<Mutex<crate::ebpf::EbpfManager>>>,
+        ebpf_mgr: Option<Arc<Mutex<crate::net::ebpf::EbpfManager>>>,
     ) -> Result<()> {
         use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
@@ -1706,13 +1745,13 @@ impl UdpTproxyListener {
 
                     tokio::spawn(async move {
                         let session = match flows
-                            .get_or_create(dest, peer, &dialer, &resp_socks, host_ns_fd)
+                            .get_or_create(dest, peer, dialer.as_ref(), &resp_socks, host_ns_fd)
                             .await
                         {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!(
-                                    "UDP ASSOCIATE failed for {} -> {}: {}",
+                                    "UDP relay session failed for {} -> {}: {}",
                                     peer.map(|p| p.to_string()).unwrap_or_default(),
                                     dest,
                                     e
@@ -1722,13 +1761,8 @@ impl UdpTproxyListener {
                             }
                         };
 
-                        // Build SOCKS5 UDP request: header + payload.
-                        // 发送无需持锁：tokio UdpSocket 的 send 可并发调用。
-                        let mut send_buf =
-                            UdpAssociateSession::build_udp_request_header(&dest, payload.len());
-                        send_buf.extend_from_slice(&payload);
-
-                        if let Err(e) = session.udp.send(&send_buf).await {
+                        // 通过协议的 UDP 会话转发数据报（无需锁，各协议内部处理）。
+                        if let Err(e) = session.send(&dest, &payload).await {
                             debug!("UDP send to relay failed: {}", e);
                             flows.remove(dest, peer).await;
                         }
@@ -1752,21 +1786,21 @@ impl UdpTproxyListener {
 // UDP flow 池 & 回包 socket 池
 // ============================================================================
 
-/// 一个 UDP relay flow：SOCKS5 UDP ASSOCIATE 会话 + 专属 reader 任务。
+/// 一个 UDP relay flow：协议无关的 UDP 会话 + 专属 reader 任务。
 ///
-/// reader 任务持续从中继 socket 读取响应（SOCKS5 UDP header + payload），
-/// 解析后通过池化的透明回包 socket 发回对应客户端。这样发送方在 `send()`
+/// reader 任务持续从会话接收中继响应（原始目标地址 + payload），
+/// 通过池化的透明回包 socket 发回对应客户端。这样发送方在 `send()`
 /// 后立即返回，同一 flow 的并发包不会被互斥锁串行化。
 struct UdpRelayFlow {
-    session: Arc<UdpAssociateSession>,
+    session: Arc<dyn UdpSession>,
     /// reader 任务句柄（空闲超时或出错时自行从池中移除自己）
     #[allow(dead_code)]
     reader: tokio::task::JoinHandle<()>,
 }
 
-/// SOCKS5 UDP flow 池，按 (原始目标地址, 客户端地址) 复用会话。
+/// UDP flow 池，按 (原始目标地址, 客户端地址) 复用会话。
 ///
-/// 以 (dest, peer) 为键是因为中继响应的 SOCKS5 header 中只有目标地址，
+/// 以 (dest, peer) 为键是因为中继响应的头中只有目标地址，
 /// 没有客户端信息；一个 flow 对应一个客户端，响应才能准确回发。
 struct UdpFlowPool {
     inner: tokio::sync::Mutex<HashMap<(SocketAddr, Option<SocketAddr>), UdpRelayFlow>>,
@@ -1787,10 +1821,10 @@ impl UdpFlowPool {
         self: &Arc<Self>,
         dest: SocketAddr,
         peer: Option<SocketAddr>,
-        dialer: &Socks5Dialer,
+        dialer: &dyn OutboundDialer,
         resp_socks: &Arc<RespSocketPool>,
         host_ns_fd: Option<RawFd>,
-    ) -> anyhow::Result<Arc<UdpAssociateSession>> {
+    ) -> anyhow::Result<Arc<dyn UdpSession>> {
         let key = (dest, peer);
         {
             let map = self.inner.lock().await;
@@ -1799,7 +1833,15 @@ impl UdpFlowPool {
             }
         }
 
-        let session = Arc::new(dialer.udp_associate().await?);
+        // 通过拨号器建立协议对应的 UDP 中继会话（宿主 NS 中创建）。
+        let session: Arc<dyn UdpSession> = Arc::from(dialer.udp_dial().await?);
+        info!(
+            "UDP  {} -> {} [PROXY] outbound via {} -> proxy {}",
+            peer.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+            dest,
+            dialer.protocol_name(),
+            dialer.proxy_addr(),
+        );
         let reader = Self::spawn_reader(
             key,
             session.clone(),
@@ -1824,44 +1866,41 @@ impl UdpFlowPool {
     /// 移除自己（替代原先从未被调用的 `UdpEndpointPool::cleanup`）。
     fn spawn_reader(
         key: (SocketAddr, Option<SocketAddr>),
-        session: Arc<UdpAssociateSession>,
+        session: Arc<dyn UdpSession>,
         resp_socks: Arc<RespSocketPool>,
         host_ns_fd: Option<RawFd>,
         flows: std::sync::Weak<UdpFlowPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let (dest, peer) = key;
-            let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
             loop {
-                let read = tokio::time::timeout(UDP_FLOW_IDLE_TIMEOUT, session.udp.recv(&mut recv_buf)).await;
-                let len = match read {
-                    Ok(Ok(len)) => len,
+                let read = tokio::time::timeout(UDP_FLOW_IDLE_TIMEOUT, session.recv()).await;
+                let (resp_dest, payload) = match read {
+                    Ok(Ok(pkt)) => pkt,
                     Ok(Err(e)) => {
-                        debug!("UDP relay recv error for {}: {}", dest, e);
+                        debug!("UDP relay recv error: {}", e);
                         break;
                     }
                     Err(_) => {
                         debug!(
-                            "UDP relay flow idle, expiring: {} -> {}",
+                            "UDP relay flow idle, expiring: {}",
                             peer.map(|p| p.to_string()).unwrap_or_default(),
-                            dest
                         );
                         break;
                     }
                 };
 
-                if let Some((_resp_peer, payload_offset)) =
-                    UdpAssociateSession::parse_udp_response_header(&recv_buf[..len])
-                {
-                    let payload = &recv_buf[payload_offset..len];
-                    if let Some(peer) = peer {
-                        if let Some(sock) = resp_socks.get(&dest, host_ns_fd).await {
-                            if let Err(e) = sock.send_to(payload, peer).await {
-                                debug!("UDP response send failed: {}", e);
-                            }
-                        } else {
-                            debug!("UDP response: failed to get TProxy response socket for {}", dest);
+                // 全锥形中继：响应可能来自任意目标，回包 socket 按响应目标地址取。
+                if let Some(peer) = peer {
+                    if let Some(sock) = resp_socks.get(&resp_dest, host_ns_fd).await {
+                        if let Err(e) = sock.send_to(&payload, peer).await {
+                            debug!("UDP response send failed: {}", e);
                         }
+                    } else {
+                        debug!(
+                            "UDP response: failed to get TProxy response socket for {}",
+                            resp_dest
+                        );
                     }
                 }
             }
@@ -1998,120 +2037,28 @@ fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
 }
 
 /// 创建一个带有 IP_TRANSPARENT 和 SO_MARK=0x100 的 UDP socket，并绑定到目标地址。
-/// 用于 DNS 劫持：TProxy 将 DNS 查询转发到上游 DNS 服务器时使用此 socket。
-/// IP_TRANSPARENT 允许绑定到非本机地址（如上游 DNS 服务器地址），
-/// 确保响应包的源地址是上游 DNS 服务器，而非代理地址。
-/// SO_MARK=0x100 确保 eBPF 程序将流量识别为 dae-rs 自身流量并放行。
 ///
-/// 当 `host_ns_fd` 为 `Some` 时，socket 在宿主 NS 中创建（与 kdae 对齐）：
-/// - 源地址为宿主真实 WAN 地址，而非 daens 内部地址 `169.254.0.11`；
-/// - 同一上游 DNS 地址可并发复用 socket，避免 `EADDRINUSE`。
+/// 用于 DNS 劫持与 UDP 回包：IP_TRANSPARENT 允许绑定非本机地址（如上游
+/// DNS 服务器地址），确保响应包源地址正确；SO_MARK=0x100 使 eBPF 放行
+/// （dae-rs 自身流量必须直连）。统一委托
+/// [`protocols::hostns::create_transparent_udp`] 实现。
 async fn create_marked_udp_socket(
     target: &SocketAddr,
     host_ns_fd: Option<RawFd>,
 ) -> Option<tokio::net::UdpSocket> {
-    use std::os::unix::io::FromRawFd;
-
-    // 同步的 socket 创建逻辑（无 .await），可在宿主 NS 切换中执行。
-    let create = || -> Option<tokio::net::UdpSocket> {
-        let domain = if target.is_ipv6() {
-            libc::AF_INET6
-        } else {
-            libc::AF_INET
-        };
-        let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
-        if fd < 0 {
-            warn!(
-                "create_marked_udp_socket: socket() failed: {}",
-                std::io::Error::last_os_error()
-            );
-            return None;
-        }
-
-        let one: libc::c_int = 1;
-        let mark_val: libc::c_int = shared::DAE_SOCKET_MARK as libc::c_int;
-
-        unsafe {
-            // Set IP_TRANSPARENT / IPV6_TRANSPARENT to allow binding to non-local
-            // addresses (e.g. upstream DNS server IP). This MUST be set before bind().
-            if target.is_ipv6() {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_IPV6,
-                    IPV6_TRANSPARENT,
-                    &one as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            } else {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_IP,
-                    IP_TRANSPARENT,
-                    &one as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-
-            // Set SO_MARK for eBPF self-exclusion
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_MARK,
-                &mark_val as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // SO_REUSEADDR allows concurrent DNS queries to the same upstream
-            // (identical target address:port) to bind without EADDRINUSE.
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-
-            // SO_REUSEPORT further reduces EADDRINUSE for transparent UDP sockets
-            // by allowing multiple sockets to share the same local address/port.
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-
-        // Bind to the target address. With IP_TRANSPARENT, this succeeds even for
-        // non-local addresses (e.g. upstream DNS server IPs). The socket will then
-        // send responses with the target address as the source.
-        let sock_addr = socket2::SockAddr::from(*target);
-        let bind_ret = unsafe {
-            libc::bind(fd, sock_addr.as_ptr() as *const libc::sockaddr, sock_addr.len())
-        };
-        if bind_ret < 0 {
-            warn!(
-                "create_marked_udp_socket: bind({}) failed: {}",
-                target,
-                std::io::Error::last_os_error()
-            );
-            unsafe { libc::close(fd) };
-            return None;
-        }
-
-        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-        match tokio::net::UdpSocket::from_std(std_socket) {
+    let sock = protocols::hostns::DirectSocket::control_plane(host_ns_fd);
+    match protocols::hostns::create_transparent_udp(target, &sock) {
+        Ok(s) => match tokio::net::UdpSocket::from_std(s) {
             Ok(s) => Some(s),
             Err(e) => {
                 warn!("create_marked_udp_socket: from_std failed: {}", e);
                 None
             }
+        },
+        Err(e) => {
+            warn!("create_marked_udp_socket: create failed for {}: {}", target, e);
+            None
         }
-    };
-
-    match host_ns_fd {
-        Some(fd) => crate::netns::with_host_ns_fd(fd, create).ok().flatten(),
-        None => create(),
     }
 }
 

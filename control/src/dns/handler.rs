@@ -824,98 +824,28 @@ async fn bind_tcp_with_reuseaddr(addr: SocketAddr) -> anyhow::Result<tokio::net:
 ///
 /// # Parameters
 ///
-/// * `orig_dst` — The address to bind to. For upstream query results, this is the
-///   upstream DNS server address (e.g. 8.8.8.8:53). For cache hits, this can be
-///   an ephemeral address (0.0.0.0:0).
-/// * `mark` — The SO_MARK value to set (typically 0x100).
+/// 创建用于 DNS 响应的 IP_TRANSPARENT UDP socket（绑定到 orig_dst）。
 ///
-/// Returns `None` if socket creation or binding fails.
-async fn create_marked_udp_socket_for_dns(orig_dst: SocketAddr, mark: u32) -> Option<tokio::net::UdpSocket> {
-    use std::os::unix::io::FromRawFd;
-
-    let domain = if orig_dst.is_ipv6() {
-        libc::AF_INET6
-    } else {
-        libc::AF_INET
-    };
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0) };
-    if fd < 0 {
-        warn!("create_marked_udp_socket_for_dns: socket() failed: {}", std::io::Error::last_os_error());
-        return None;
-    }
-
-    let one: libc::c_int = 1;
-    let mark_val: libc::c_int = mark as libc::c_int;
-
-    unsafe {
-        // Set SO_REUSEADDR to avoid EADDRINUSE when re-binding to the same address
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-
-        // SO_REUSEPORT allows concurrent responses to the same upstream
-        // (identical bind address:port) without EADDRINUSE. Without it, two
-        // concurrent queries to the same upstream would make the second bind
-        // fail and drop its response.
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-
-        // Set SO_MARK for eBPF self-exclusion
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            SO_MARK,
-            &mark_val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-
-        // Set IP_TRANSPARENT / IPV6_TRANSPARENT to allow binding to non-local addresses.
-        // This MUST be set before bind().
-        if orig_dst.is_ipv6() {
-            libc::setsockopt(
-                fd,
-                libc::SOL_IPV6,
-                IPV6_TRANSPARENT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        } else {
-            libc::setsockopt(
-                fd,
-                libc::SOL_IP,
-                IP_TRANSPARENT,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-
-    // Bind to orig_dst. With IP_TRANSPARENT, this will succeed even if orig_dst
-    // is not a local address (e.g. an upstream DNS server IP).
-    let sock_addr = socket2::SockAddr::from(orig_dst);
-    let ret = unsafe {
-        libc::bind(fd, sock_addr.as_ptr() as *const libc::sockaddr, sock_addr.len())
-    };
-    if ret != 0 {
-        warn!("create_marked_udp_socket_for_dns: bind({}) failed: {}", orig_dst, std::io::Error::last_os_error());
-        unsafe { libc::close(fd) };
-        return None;
-    }
-
-    let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-    match tokio::net::UdpSocket::from_std(std_socket) {
-        Ok(s) => Some(s),
+/// 统一委托 [`protocols::hostns::create_transparent_udp`] 实现“dae-rs 自身
+/// 流量必须直连”的约定（SO_MARK=0x100 自排除 + 宿主 NS）。
+async fn create_marked_udp_socket_for_dns(
+    orig_dst: SocketAddr,
+    _mark: u32,
+) -> Option<tokio::net::UdpSocket> {
+    let sock = protocols::hostns::DirectSocket::control_plane(None);
+    match protocols::hostns::create_transparent_udp(&orig_dst, &sock) {
+        Ok(s) => match tokio::net::UdpSocket::from_std(s) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("create_marked_udp_socket_for_dns: from_std failed: {}", e);
+                None
+            }
+        },
         Err(e) => {
-            warn!("create_marked_udp_socket_for_dns: from_std failed: {}", e);
+            warn!(
+                "create_marked_udp_socket_for_dns: create failed for {}: {}",
+                orig_dst, e
+            );
             None
         }
     }

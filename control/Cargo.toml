@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["full"] }
 nix = { version = "0.31", features = ["net", "sched", "signal", "process", "mount", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

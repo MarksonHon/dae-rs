@@ -7,7 +7,7 @@
 
 This document describes the routing subsystem of dae-rs **as it is implemented
 today**. It covers the rule language, the userspace compile pipeline
-(`control/src/routing.rs`), the kernel-side evaluation in `bpf/kern/tproxy.c`,
+(`control/src/routing/matcher.rs`), the kernel-side evaluation in `bpf/kern/tproxy.c`,
 and the "routing handoff" mechanism that lets userspace finish decisions the
 eBPF data path cannot.
 
@@ -63,7 +63,7 @@ routing {
 ## 3. Compile Pipeline
 
 `compile_rules(routing, outbounds, proxy_server_ips)` in
-`control/src/routing.rs`:
+`control/src/routing/matcher.rs`:
 
 ```
 daefile routing config
@@ -96,7 +96,7 @@ CompiledRouting { match_sets, lpm_tries, domain_sets, fallback_* }
 ### Lowering to MatchSet
 
 Each function invocation becomes one or more `MatchSet` entries (defined in
-`control/src/ebpf.rs`, synced with `tproxy.c`). Every MatchSet carries:
+`control/src/net/ebpf.rs`, synced with `tproxy.c`). Every MatchSet carries:
 
 - `type` — one of `IP_SET`, `SOURCE_IP_SET`, `MAC`, `PORT`, `SOURCE_PORT`,
   `L4_PROTO`, `IP_VERSION`, `DOMAIN_SET`, `PROCESS_NAME`, `DSCP`, `QTYPE`,
@@ -158,7 +158,7 @@ The eBPF TC programs intercept traffic at `wan_egress` / `wan_ingress` /
 
 ## 5. Userspace RoutingMatcher
 
-`RoutingMatcher` (`control/src/routing.rs`) is a userspace mirror of the eBPF
+`RoutingMatcher` (`control/src/routing/matcher.rs`) is a userspace mirror of the eBPF
 evaluator, built from the same `CompiledRouting` data. `match_routing(params)`
 walks the MatchSet chain identically and returns `RoutingResult { outbound,
 mark, must }`. It evaluates `dip`/`sip` against the LPM tries, `domain` against
@@ -176,7 +176,7 @@ resolution is known). The design is:
    `OUTBOUND_CONTROL_PLANE_ROUTING (0xFD)`.
 2. The packet/connection is recorded in `routing_handoff_map`
    (`MAX_ROUTING_HANDOFF_NUM` entries).
-3. The **routing handoff consumer** (`control/src/routing_handoff.rs`) drains
+3. The **routing handoff consumer** (`control/src/routing/routing_handoff.rs`) drains
    the map, reconstructs the connection params, calls `choose_dial_target()`
    against the userspace `RoutingMatcher`, and writes the final decision into
    `conn_state_map`.

@@ -8,12 +8,12 @@
 //!
 //! | Protocol | Feature | Module | Status |
 //! |----------|---------|--------|--------|
-//! | SOCKS5   | `socks` | [`socks`] | ✅ Complete (TCP CONNECT + UDP ASSOCIATE) |
-//! | Shadowsocks | `shadowsocks` | [`shadowsocks`] | ✅ Basic implementation |
-//! | Trojan | `trojan` | [`trojan`] | ✅ Basic implementation |
-//! | TUIC v5 | `tuic` | [`tuic`] | ✅ Basic implementation |
-//! | Juicity | `juicity` | [`juicity`] | ✅ Basic implementation |
-//! | VMess | `vmess` | [`vmess`] | ✅ Basic implementation |
+//! | SOCKS5   | `socks` | [`socks`] | ✅ Complete (TCP + UDP ASSOCIATE) |
+//! | Shadowsocks | `shadowsocks` | [`shadowsocks`] | ✅ Complete (AEAD legacy + 2022, TCP + UDP) |
+//! | Trojan | `trojan` | [`trojan`] | ✅ Complete (TLS, TCP + UDP ASSOCIATE) |
+//! | TUIC v5 | `tuic` | [`tuic`] | ✅ Complete (QUIC + 0-RTT + BBR, TCP + Packet) |
+//! | Juicity | `juicity` | [`juicity`] | ✅ Complete (QUIC + BBR, TCP + UDP over Stream) |
+//! | VMess | `vmess` | [`vmess`] | ✅ Complete (AEAD, TCP/WS + UDP) |
 //!
 //! # Adding a New Protocol
 //!
@@ -27,6 +27,12 @@ use async_trait::async_trait;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+
+// ── Shared host-namespace socket helpers ──
+
+/// Generic helpers to create upstream sockets in the host network namespace
+/// (see [`hostns::with_host_ns`]).
+pub mod hostns;
 
 // ── Protocol modules (gated by features) ──
 
@@ -189,22 +195,96 @@ impl ProtocolRegistry {
 
 // ── OutboundDialer trait ──
 
-/// Proxy connection wrapping a TCP stream.
+/// Object-safe helper trait combining [`AsyncRead`] + [`AsyncWrite`]
+/// (Rust does not allow `dyn AsyncRead + AsyncWrite` directly).
+pub trait AsyncDuplex: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncDuplex for T {}
+
+/// A proxy connection's data stream.
+///
+/// - [`ProxyStream::Tcp`] — plain TCP stream (supports the zero-copy splice
+///   relay path in the control plane).
+/// - [`ProxyStream::Boxed`] — any wrapped duplex stream (TLS, WebSocket,
+///   QUIC stream, ...) used by the non-TCP transports.
+pub enum ProxyStream {
+    /// Plain TCP connection to the proxy server.
+    Tcp(TcpStream),
+    /// Wrapped duplex stream (TLS / WebSocket / QUIC ...).
+    Boxed(Box<dyn AsyncDuplex + Unpin + Send>),
+}
+
+impl AsyncRead for ProxyStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ProxyStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ProxyStream::Boxed(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ProxyStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            ProxyStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ProxyStream::Boxed(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ProxyStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            ProxyStream::Boxed(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            ProxyStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            ProxyStream::Boxed(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Proxy connection wrapping a duplex stream.
 pub struct ProxyConn {
-    pub stream: TcpStream,
+    pub stream: ProxyStream,
     pub peer_addr: SocketAddr,
     pub local_addr: SocketAddr,
 }
 
 impl ProxyConn {
-    pub fn new(stream: TcpStream) -> std::io::Result<Self> {
+    /// Wrap a plain TCP stream (splice-capable).
+    pub fn new_tcp(stream: TcpStream) -> std::io::Result<Self> {
         let peer_addr = stream.peer_addr()?;
         let local_addr = stream.local_addr()?;
         Ok(Self {
-            stream,
+            stream: ProxyStream::Tcp(stream),
             peer_addr,
             local_addr,
         })
+    }
+
+    /// Wrap an arbitrary duplex stream (TLS / WebSocket / QUIC ...).
+    pub fn new_boxed(stream: Box<dyn AsyncDuplex + Unpin + Send>) -> Self {
+        Self {
+            stream: ProxyStream::Boxed(stream),
+            peer_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            local_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+        }
     }
 }
 
@@ -250,8 +330,34 @@ pub trait OutboundDialer: Send + Sync {
     /// Dial the target through the proxy.
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn>;
 
+    /// Open a UDP relay session through the proxy (full-cone).
+    ///
+    /// The returned session can send datagrams to any destination and
+    /// receive relayed responses. Each protocol implements its own UDP
+    /// framing on top of this abstraction.
+    async fn udp_dial(&self) -> anyhow::Result<Box<dyn UdpSession>>;
+
     /// Return the protocol name (e.g., "socks5").
     fn protocol_name(&self) -> &'static str;
+
+    /// Return the upstream proxy server address this dialer connects to.
+    fn proxy_addr(&self) -> SocketAddr;
+
+    /// Downcast support (e.g. for the SOCKS5-only UDP relay path).
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// A full-cone UDP relay session through a proxy.
+///
+/// `send` forwards a datagram to `dest` via the proxy; `recv` returns the
+/// next relayed datagram together with its original destination address.
+#[async_trait]
+pub trait UdpSession: Send + Sync {
+    /// Send a payload to the destination through the proxy.
+    async fn send(&self, dest: &SocketAddr, payload: &[u8]) -> anyhow::Result<()>;
+
+    /// Receive the next relayed datagram: `(original destination, payload)`.
+    async fn recv(&self) -> anyhow::Result<(SocketAddr, Vec<u8>)>;
 }
 
 // ── Tests ──

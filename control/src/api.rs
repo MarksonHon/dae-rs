@@ -481,13 +481,13 @@ async fn metrics_handler(
         .lock()
         .unwrap()
         .read_stats()
-        .unwrap_or([0u64; crate::ebpf::STATS_MAP_SIZE as usize]);
+        .unwrap_or([0u64; crate::net::ebpf::STATS_MAP_SIZE as usize]);
 
     // bpf_stats_map in tproxy.c has 2 entries: UdpConnOverflow and TcpConnOverflow.
     // Map them to the API response; set detailed counters to 0 for now.
     Ok(Json(MetricsResponse {
-        total_packets: stats[crate::ebpf::StatIndex::UdpConnOverflow as usize]
-            + stats[crate::ebpf::StatIndex::TcpConnOverflow as usize],
+        total_packets: stats[crate::net::ebpf::StatIndex::UdpConnOverflow as usize]
+            + stats[crate::net::ebpf::StatIndex::TcpConnOverflow as usize],
         direct_decisions: 0,   // tproxy.c tracks overflow, not per-decision stats
         proxy_decisions: 0,    // tproxy.c tracks overflow, not per-decision stats
         bypass_count: 0,       // tproxy.c tracks overflow, not per-decision stats

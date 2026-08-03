@@ -5,7 +5,7 @@
 ## 1. 范围
 
 本文档描述 dae-rs 路由子系统**当前已实现**的实际情况。涵盖规则语言、
-用户空间编译管线（`control/src/routing.rs`）、`bpf/kern/tproxy.c` 中的内核侧
+用户空间编译管线（`control/src/routing/matcher.rs`）、`bpf/kern/tproxy.c` 中的内核侧
 求值，以及让用户空间补全 eBPF 数据通路无法完成决策的"路由交接"
 （routing handoff）机制。
 
@@ -57,7 +57,7 @@ routing {
 
 ## 3. 编译管线
 
-`control/src/routing.rs` 中的
+`control/src/routing/matcher.rs` 中的
 `compile_rules(routing, outbounds, proxy_server_ips)`：
 
 ```
@@ -90,7 +90,7 @@ CompiledRouting { match_sets, lpm_tries, domain_sets, fallback_* }
 
 ### 降级为 MatchSet
 
-每个函数调用生成一个或多个 `MatchSet` 条目（定义在 `control/src/ebpf.rs`，
+每个函数调用生成一个或多个 `MatchSet` 条目（定义在 `control/src/net/ebpf.rs`，
 与 `tproxy.c` 同步）。每个 MatchSet 携带：
 
 - `type` — `IP_SET`、`SOURCE_IP_SET`、`MAC`、`PORT`、`SOURCE_PORT`、
@@ -146,7 +146,7 @@ eBPF TC 程序在 `wan_egress` / `wan_ingress` / `lan_ingress` /
 
 ## 5. 用户空间 RoutingMatcher
 
-`RoutingMatcher`（`control/src/routing.rs`）是 eBPF 求值器的用户空间镜像，
+`RoutingMatcher`（`control/src/routing/matcher.rs`）是 eBPF 求值器的用户空间镜像，
 由同一份 `CompiledRouting` 数据构建。`match_routing(params)` 以相同方式遍历
 MatchSet 链，返回 `RoutingResult { outbound, mark, must }`。它会对 LPM 前缀树
 求 `dip`/`sip`、对 `domain_sets` 求 `domain`、端口、四层协议、IP 版本、
@@ -162,7 +162,7 @@ MatchSet 链，返回 `RoutingResult { outbound, mark, must }`。它会对 LPM �
 1. eBPF 路由无法决策时，MatchSet 链以 `OUTBOUND_CONTROL_PLANE_ROUTING (0xFD)`
    收尾。
 2. 报文/连接记录进 `routing_handoff_map`（`MAX_ROUTING_HANDOFF_NUM` 条）。
-3. **路由交接消费者**（`control/src/routing_handoff.rs`）排空该 map，重建
+3. **路由交接消费者**（`control/src/routing/routing_handoff.rs`）排空该 map，重建
    连接参数，调用 `choose_dial_target()` 对照用户空间 `RoutingMatcher` 决策，
    并把最终决策写入 `conn_state_map`。
 4. 数据通路后续报文按连接五元组读取 `conn_state_map`。每条记录带路由 epoch

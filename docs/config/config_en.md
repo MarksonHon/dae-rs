@@ -16,7 +16,7 @@ The configuration lives in two equivalent forms:
 | **daefile** (`.daefile`) | Human-friendly, Caddyfile-like text syntax. This is the primary input format. |
 | **JSON** (`config.json`) | The normalized, machine-readable representation produced after parsing a daefile. |
 
-A `daefile` is parsed by `parse_daefile()` (in `control/src/config.rs`), then
+A `daefile` is parsed by `parse_daefile()` (in `control/src/config/`), then
 validated semantically by `validate_config()`. The result is a normalized JSON
 structure which can be written out as a "temp JSON" file for debugging (see
 `runtime.temp_json` below). Reference examples live under `config-example/`
@@ -225,7 +225,7 @@ routing {
 - `fallback:` is the action used when no rule matches (default
   `proxy(proxy_primary)`).
 
-Supported match functions (implemented in `control/src/routing.rs`):
+Supported match functions (implemented in `control/src/routing/matcher.rs`):
 
 | Function | Meaning |
 |----------|---------|

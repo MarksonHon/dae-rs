@@ -187,16 +187,24 @@ wait $TCPDUMP_PID 2>/dev/null || true
 echo "" >> "$LOG"
 echo "=== Concurrent DNS query stress test ===" >> "$LOG"
 if command -v dig >/dev/null 2>&1; then
+    dig_pids=()
     for i in $(seq 1 20); do
         dig +short +time=3 +tries=1 "test${i}.example.com" >/dev/null 2>&1 &
+        dig_pids+=($!)
     done
-    wait
+    for pid in "${dig_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
     echo "20 concurrent dig queries launched" >> "$LOG"
 else
+    ns_pids=()
     for i in $(seq 1 20); do
         nslookup -timeout=3 "test${i}.example.com" >/dev/null 2>&1 &
+        ns_pids+=($!)
     done
-    wait
+    for pid in "${ns_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
     echo "20 concurrent nslookup queries launched" >> "$LOG"
 fi
 collect_dns_log

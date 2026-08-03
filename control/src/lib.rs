@@ -28,10 +28,11 @@
 //!
 //! | Module | Responsibility |
 //! |--------|----------------|
-//! | [`ebpf`] | eBPF program load/unload/attach |
-//! | [`netns`] | Network namespace & veth management |
-//! | [`tproxy`] | TProxy transparent proxy listener |
-//! | [`config`] | daefile config parsing & compilation |
+//! | [`config`] | daefile config parsing, validation & protocol conversion |
+//! | [`dns`] | DNS resolver stack |
+//! | [`net`] | Network data plane: eBPF / TProxy / netns / interfaces |
+//! | [`routing`] | Routing rule matching & proxy handoff |
+//! | [`api`] | REST API server |
 //!
 //! # Quick Start
 //!
@@ -52,16 +53,11 @@
 //! ```
 
 pub mod api;
+pub mod dialer;
 pub mod config;
 pub mod dns;
-pub mod domain_routing;
-pub mod ebpf;
-pub mod iface_mgr;
-pub mod netns;
+pub mod net;
 pub mod routing;
-pub mod routing_handoff;
-pub mod tproxy;
-pub mod udp_tracker;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -74,10 +70,10 @@ use std::sync::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use protocols::Socks5Dialer;
-use tproxy::{TproxyListener, UdpTproxyListener};
+use protocols::{OutboundDialer, Socks5Dialer};
+use net::tproxy::{TproxyListener, UdpTproxyListener};
 
-use crate::ebpf::CidrEntry;
+use crate::net::ebpf::CidrEntry;
 
 // Ringbuf event constants (must match tproxy.c)
 #[allow(dead_code)]
@@ -158,7 +154,7 @@ impl Default for Config {
             fwmark_mask: 0x08000000,
             mtu: 1500,
             log_level: "info".into(),
-            ebpf_path: ebpf::DEFAULT_EBPF_PATH.to_string(),
+            ebpf_path: net::ebpf::DEFAULT_EBPF_PATH.to_string(),
             proxy_addr: "127.0.0.1:1080".into(),
             proxy_username: String::new(),
             proxy_password: String::new(),
@@ -241,7 +237,7 @@ impl Config {
             fwmark_mask: 0x08000000,
             mtu: 1500,
             log_level: runtime.log_level.clone(),
-            ebpf_path: ebpf::DEFAULT_EBPF_PATH.to_string(),
+            ebpf_path: net::ebpf::DEFAULT_EBPF_PATH.to_string(),
             proxy_addr,
             proxy_username,
             proxy_password,
@@ -290,9 +286,9 @@ pub struct ControlPlane {
     /// Control plane configuration
     pub config: Config,
     /// eBPF program manager (shared with background tasks via Mutex)
-    pub ebpf_mgr: Arc<Mutex<ebpf::EbpfManager>>,
+    pub ebpf_mgr: Arc<Mutex<net::ebpf::EbpfManager>>,
     /// Network namespace manager
-    pub netns_mgr: netns::NetnsManager,
+    pub netns_mgr: net::netns::NetnsManager,
     /// TProxy TCP listener (runs in the proxy namespace)
     pub tproxy: Option<Arc<TproxyListener>>,
     /// TProxy UDP listener
@@ -304,7 +300,7 @@ pub struct ControlPlane {
     /// Raw daefile config (for API queries of outbound groups/nodes/routing)
     pub daefile_config: Option<config::DaefileConfig>,
     /// Interface event monitor for dynamic WAN/LAN TC attach/detach
-    iface_mgr: Option<crate::iface_mgr::InterfaceManager>,
+    iface_mgr: Option<crate::net::iface_mgr::InterfaceManager>,
     /// Raw daefile text content (for API config reload)
     pub daefile_content: Option<String>,
     /// Tokio task handle for the API server
@@ -327,17 +323,17 @@ pub struct ControlPlane {
     /// When set, `load()` uses this instead of reading from file.
     pub embedded_ebpf: Option<&'static [u8]>,
     /// Daeparam to pass to the eBPF program before loading.
-    pub ebpf_param: Option<crate::ebpf::Daeparam>,
+    pub ebpf_param: Option<crate::net::ebpf::Daeparam>,
     /// Domain routing tracker for DNS-driven domain_routing_map updates.
     /// Shared handle: the DNS listener writes resolved domains into the current
     /// tracker, and the janitor removes entries on TTL expiry.
-    pub domain_routing: Option<crate::domain_routing::DomainRoutingHandle>,
+    pub domain_routing: Option<crate::routing::domain_routing::DomainRoutingHandle>,
     /// DNS manager (handles DNS query routing, upstream forwarding, caching)
     pub dns_manager: Option<crate::dns::DnsManager>,
     /// UDP connection state tracker (for UDP flow cleanup in janitor)
-    udp_tracker: Option<Arc<Mutex<crate::udp_tracker::UdpConnStateTracker>>>,
+    udp_tracker: Option<Arc<Mutex<crate::net::udp_tracker::UdpConnStateTracker>>>,
     /// Userspace routing matcher (used by routing handoff consumer)
-    routing_matcher: Option<Arc<crate::routing::RoutingMatcher>>,
+    routing_matcher: Option<Arc<crate::routing::matcher::RoutingMatcher>>,
     /// Current routing epoch slot (0 or 1) for double-buffering.
     /// On each reload, we write to the non-active slot, then flip.
     current_epoch_slot: u32,
@@ -349,7 +345,7 @@ pub struct ControlPlane {
 impl ControlPlane {
     /// Convenience accessor for the locked eBPF manager.
     /// Panics if the mutex is poisoned.
-    fn ebpf(&self) -> std::sync::MutexGuard<'_, ebpf::EbpfManager> {
+    fn ebpf(&self) -> std::sync::MutexGuard<'_, net::ebpf::EbpfManager> {
         self.ebpf_mgr.lock().expect("ebpf_mgr lock poisoned")
     }
 
@@ -362,11 +358,11 @@ impl ControlPlane {
     ///
     /// * `config` — Control plane configuration
     pub fn new(config: Config) -> Self {
-        let ebpf_mgr = Arc::new(Mutex::new(ebpf::EbpfManager::new_with_path(
-            netns::HOST_IF,
+        let ebpf_mgr = Arc::new(Mutex::new(net::ebpf::EbpfManager::new_with_path(
+            net::netns::HOST_IF,
             &config.ebpf_path,
         )));
-        let netns_mgr = netns::NetnsManager::new();
+        let netns_mgr = net::netns::NetnsManager::new();
         let daefile_config = config.daefile_config.clone();
 
         Self {
@@ -388,7 +384,7 @@ impl ControlPlane {
             domain_routing: None,
             dns_manager: None,
             udp_tracker: Some(Arc::new(
-                Mutex::new(udp_tracker::UdpConnStateTracker::new()),
+                Mutex::new(net::udp_tracker::UdpConnStateTracker::new()),
             )),
             iface_mgr: None,
             ringbuf_thread: None,
@@ -496,7 +492,7 @@ impl ControlPlane {
             info!("Set PARAM.control_plane_pid = {}", param.control_plane_pid);
 
             // Set use_redirect_peer based on kernel support
-            param.use_redirect_peer = crate::ebpf::probe_redirect_peer();
+            param.use_redirect_peer = crate::net::ebpf::probe_redirect_peer();
             info!("Set PARAM.use_redirect_peer = {}", param.use_redirect_peer);
 
             debug!(
@@ -517,7 +513,7 @@ impl ControlPlane {
         // 检查是否有 pinned maps 来判断是否是热重载/重启恢复
         // 如果有 pinned maps，说明之前有过运行实例，需要翻转 flip 位
         // 以避免与旧 filter 的 handle 冲突
-        let flip = if crate::ebpf::EbpfManager::pinned_maps_exist(crate::ebpf::BPFFS_PATH) {
+        let flip = if crate::net::ebpf::EbpfManager::pinned_maps_exist(crate::net::ebpf::BPFFS_PATH) {
             info!("Pinned maps detected — setting flip=1 for TC handle rotation");
             1u32
         } else {
@@ -538,8 +534,8 @@ impl ControlPlane {
         // 设置 eBPF map pinning 路径，使 maps 在 load 后自动 pin 到 bpffs
         // 这样 dae-rs 重启后连接状态可以持久化
         self.ebpf()
-            .set_pin_path(crate::ebpf::BPFFS_PATH.to_string());
-        info!("eBPF map pinning enabled: {}", crate::ebpf::BPFFS_PATH);
+            .set_pin_path(crate::net::ebpf::BPFFS_PATH.to_string());
+        info!("eBPF map pinning enabled: {}", crate::net::ebpf::BPFFS_PATH);
 
         let load_start = std::time::Instant::now();
         if let Some(ebpf_bytes) = self.embedded_ebpf {
@@ -593,7 +589,7 @@ impl ControlPlane {
                 lan_patterns = ?self.config.lan_interface,
                 "InterfaceManager configuration"
             );
-            let mut iface_mgr = crate::iface_mgr::InterfaceManager::new();
+            let mut iface_mgr = crate::net::iface_mgr::InterfaceManager::new();
 
             // Register WAN interface patterns with bind/unbind callbacks
             for pattern in &self.config.wan_interface {
@@ -735,7 +731,7 @@ impl ControlPlane {
                             .r#match
                             .comm
                             .iter()
-                            .map(|c| crate::ebpf::hash_comm(c))
+                            .map(|c| crate::net::ebpf::hash_comm(c))
                             .collect();
                         debug!(
                             comms = ?pe.r#match.comm,
@@ -776,13 +772,16 @@ impl ControlPlane {
         //   2. SO_MARK=0x100 fallback on dae-rs's outgoing sockets
 
         // 3.5b. Compile routing rules into MatchSet and write to eBPF maps
+        // NOTE: 即使配置没有任何显式规则，也必须编译并写入 fallback match set，
+        // 否则 eBPF route() 的 active_rules_len=0 → bpf_loop 不迭代 → 全部 SHOT。
         if let Some(ref dc) = self.daefile_config {
             debug!(
                 n_rules = dc.routing.rules.len(),
                 n_outbounds = dc.outbounds.nodes.len(),
+                fallback = %dc.routing.fallback,
                 "Processing routing rules"
             );
-            if !dc.routing.rules.is_empty() {
+            {
                 // Collect proxy server IPs from all outbound nodes for auto-direct rules.
                 // This prevents traffic destined for proxy servers from being re-proxied (loop prevention).
                 let proxy_server_ips = collect_proxy_server_ips(&self.config, &dc.outbounds);
@@ -797,7 +796,7 @@ impl ControlPlane {
                 }
                 let compile_start = std::time::Instant::now();
                 let compiled =
-                    routing::compile_rules(&dc.routing, &dc.outbounds, &proxy_server_ips)
+                    routing::matcher::compile_rules(&dc.routing, &dc.outbounds, &proxy_server_ips)
                         .context("Failed to compile routing rules")?;
                 debug!(
                     compile_ms = compile_start.elapsed().as_millis(),
@@ -826,7 +825,7 @@ impl ControlPlane {
                 {
                     let mut all_cidr_entries: Vec<(u32, CidrEntry)> = Vec::new();
                     for (trie_idx, cidrs) in compiled.lpm_tries.iter().enumerate() {
-                        let entries = crate::routing::cidrs_to_cidr_entries(cidrs);
+                        let entries = crate::routing::matcher::cidrs_to_cidr_entries(cidrs);
                         for (_, entry) in entries {
                             all_cidr_entries.push((trie_idx as u32, entry));
                         }
@@ -855,7 +854,7 @@ impl ControlPlane {
 
                 // Set up userspace routing matcher (used by RoutingHandoffConsumer)
                 self.routing_matcher = Some(Arc::new(
-                    crate::routing::RoutingMatcher::from_compiled(&compiled),
+                    crate::routing::matcher::RoutingMatcher::from_compiled(&compiled),
                 ));
                 debug!("RoutingMatcher built from compiled rules");
 
@@ -863,7 +862,7 @@ impl ControlPlane {
                 if !compiled.domain_sets.is_empty() {
                     let n_sets = compiled.domain_sets.len();
                     let tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::domain_routing::DomainRoutingTracker::new(
+                        crate::routing::domain_routing::DomainRoutingTracker::new(
                             std::sync::Arc::new(compiled.domain_sets),
                             init_slot,
                         ),
@@ -876,8 +875,6 @@ impl ControlPlane {
                     );
                     debug!(n_sets, "Domain routing tracker created");
                 }
-            } else {
-                debug!("No routing rules defined in config (empty rules list)");
             }
         }
         debug!("Step 3.5 completed: {}ms", step_start.elapsed().as_millis());
@@ -1021,7 +1018,7 @@ impl ControlPlane {
         // routing decision and writes it to conn_state_map.
         if let Some(ref matcher) = self.routing_matcher {
             info!("Step 4.6/5: Starting routing handoff consumer");
-            let consumer = crate::routing_handoff::RoutingHandoffConsumer::new(
+            let consumer = crate::routing::routing_handoff::RoutingHandoffConsumer::new(
                 self.ebpf_mgr.clone(),
                 matcher.clone(),
             );
@@ -1039,7 +1036,7 @@ impl ControlPlane {
         let ringbuf_fd = self.ebpf().event_ringbuf_fd().ok();
         if let Some(fd) = ringbuf_fd {
             debug!("Ringbuf fd obtained: {}", fd);
-            let (handle, running) = ebpf::EbpfManager::spawn_ringbuf_consumer(fd);
+            let (handle, running) = net::ebpf::EbpfManager::spawn_ringbuf_consumer(fd);
             self.ringbuf_thread = Some(handle);
             self.ringbuf_running = Some(running);
             debug!("Ringbuf consumer spawned");
@@ -1131,25 +1128,73 @@ impl ControlPlane {
         let start_time = std::time::Instant::now();
         debug!("start_tproxy: beginning TProxy setup");
 
-        // ---- Create SOCKS5 dialer ----
-        let proxy_addr: SocketAddr = self.config.proxy_addr.parse().map_err(|e| {
-            anyhow::anyhow!("Invalid proxy address '{}': {}", self.config.proxy_addr, e)
-        })?;
-        debug!(
-            proxy_addr = %proxy_addr,
-            proxy_has_username = !self.config.proxy_username.is_empty(),
-            proxy_dial_timeout_ms = self.config.proxy_dial_timeout_ms,
-            "SOCKS5 dialer configuration"
+        // ---- 宿主网络命名空间 fd ----
+        // TProxy 监听 socket 保留在 daens，但所有上行连接（到代理的
+        // TCP、UDP ASSOCIATE、DNS 劫持/UDP relay 的响应 socket）在宿主 NS 中
+        // 创建并发出（与 kdae 对齐），源地址为宿主真实 WAN 地址。
+        let host_ns_fd = self.netns_mgr.get_host_ns_fd();
+        info!(
+            host_ns_fd = host_ns_fd.map(|fd| fd.to_string()).unwrap_or_else(|| "none".to_string()),
+            "Upstream sockets will be created in host namespace (kdae-aligned)"
         );
 
-        // ---- Create TProxy listener in DAENS (proxy namespace) ----
+        let socket_mark = shared::DAE_SOCKET_MARK;
+        debug!(socket_mark = format!("{:#x}", socket_mark), "Socket mark for eBPF self-exclusion");
+        let tproxy_listener_mark = 0u32;
+        debug!(
+            tproxy_listener_mark = format!("{:#x}", tproxy_listener_mark),
+            "TProxy listener socket mark for daens policy routing"
+        );
+
+        // ---- 按配置的协议构造出站拨号器 ----
+        let dialer: Arc<dyn OutboundDialer> = match self
+            .config
+            .daefile_config
+            .as_ref()
+            .and_then(|c| c.outbounds.nodes.first())
+        {
+            Some(node) => {
+                let d = dialer::build_dialer(node, host_ns_fd, socket_mark)?;
+                info!(
+                    node = %node.name,
+                    protocol = %node.protocol,
+                    address = %node.address,
+                    "Outbound dialer built from node config"
+                );
+                d
+            }
+            None => {
+                // Fallback: legacy flat config fields (single SOCKS5 node).
+                let proxy_addr: SocketAddr = self.config.proxy_addr.parse().map_err(|e| {
+                    anyhow::anyhow!("Invalid proxy address '{}': {}", self.config.proxy_addr, e)
+                })?;
+                debug!(
+                    proxy_addr = %proxy_addr,
+                    proxy_has_username = !self.config.proxy_username.is_empty(),
+                    proxy_dial_timeout_ms = self.config.proxy_dial_timeout_ms,
+                    "Legacy SOCKS5 dialer configuration (no daefile nodes)"
+                );
+                let mut d = Socks5Dialer::new_with_mark(
+                    proxy_addr,
+                    &self.config.proxy_username,
+                    &self.config.proxy_password,
+                    self.config.proxy_dial_timeout_ms,
+                    socket_mark,
+                );
+                d.set_host_ns_fd(host_ns_fd);
+                Arc::new(d)
+            }
+        };
+        debug!("Outbound dialer created: {}", dialer.protocol_name());
+
+        // ---- TProxy listener (in DAENS) ----
         // eBPF 数据流：
         // 1. WAN egress TC 拦截 SYN 包
         // 2. 重定向到 dae0 → dae0peer（进入 daens）
         // 3. dae0peer_ingress TC：设置 skb->mark = TPROXY_MARK
         // 4. daens 中的策略路由：fwmark → table 2023 → local default dev lo
         // 5. TProxy socket（在 daens 中）接受连接
-        // 6. TProxy 通过 dae0peer → dae0 转发到宿主 NS → 上游 SOCKS5 代理
+        // 6. TProxy 通过 dae0peer → dae0 转发到宿主 NS → 上游代理
         let listen_addr: SocketAddr = format!("[::]:{}", self.config.tproxy_port)
             .parse()
             .map_err(|e| {
@@ -1161,51 +1206,15 @@ impl ControlPlane {
             })?;
         debug!(listen_addr = %listen_addr, "TProxy listen address");
 
-        let socket_mark = shared::DAE_SOCKET_MARK;
-        debug!(socket_mark = format!("{:#x}", socket_mark), "Socket mark for eBPF self-exclusion");
-        let tproxy_listener_mark = 0u32;
-        debug!(
-            tproxy_listener_mark = format!("{:#x}", tproxy_listener_mark),
-            "TProxy listener socket mark for daens policy routing"
-        );
-
-        // ---- 宿主网络命名空间 fd ----
-        // TProxy 监听 socket 保留在 daens，但所有上行连接（到 SOCKS5 代理的
-        // TCP、UDP ASSOCIATE、DNS 劫持/UDP relay 的响应 socket）在宿主 NS 中
-        // 创建并发出（与 kdae 对齐），源地址为宿主真实 WAN 地址。
-        let host_ns_fd = self.netns_mgr.get_host_ns_fd();
-        info!(
-            host_ns_fd = host_ns_fd.map(|fd| fd.to_string()).unwrap_or_else(|| "none".to_string()),
-            "Upstream sockets will be created in host namespace (kdae-aligned)"
-        );
-
-        let mut dialer_tcp = Socks5Dialer::new_with_mark(
-            proxy_addr,
-            &self.config.proxy_username,
-            &self.config.proxy_password,
-            self.config.proxy_dial_timeout_ms,
-            socket_mark,
-        );
-        dialer_tcp.set_host_ns_fd(host_ns_fd);
-        let mut dialer_udp = Socks5Dialer::new_with_mark(
-            proxy_addr,
-            &self.config.proxy_username,
-            &self.config.proxy_password,
-            self.config.proxy_dial_timeout_ms,
-            socket_mark,
-        );
-        dialer_udp.set_host_ns_fd(host_ns_fd);
-        debug!("TCP and UDP SOCKS5 dialers created");
-
         let tproxy_tcp = Arc::new(TproxyListener::new_with_mark(
             listen_addr,
-            dialer_tcp,
+            dialer.clone(),
             tproxy_listener_mark,
         ));
         let tproxy_udp = {
             let mut udp = UdpTproxyListener::new_with_mark(
                 listen_addr,
-                dialer_udp,
+                dialer,
                 tproxy_listener_mark,
             );
             // Upstream UDP sockets (DNS hijack query socket, relay response socket)
@@ -1408,14 +1417,14 @@ impl ControlPlane {
     /// also deleted from conn_state_map. If `domain_routing` is provided,
     /// expired domain_routing_map entries are deleted (DNS TTL expiry).
     pub fn spawn_conn_state_janitor(
-        ebpf_mgr: Arc<Mutex<crate::ebpf::EbpfManager>>,
-        udp_tracker: Option<Arc<Mutex<crate::udp_tracker::UdpConnStateTracker>>>,
-        domain_routing: Option<crate::domain_routing::DomainRoutingHandle>,
+        ebpf_mgr: Arc<Mutex<crate::net::ebpf::EbpfManager>>,
+        udp_tracker: Option<Arc<Mutex<crate::net::udp_tracker::UdpConnStateTracker>>>,
+        domain_routing: Option<crate::routing::domain_routing::DomainRoutingHandle>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("ConnState janitor started with pressure detection");
 
-            use crate::ebpf::{PRESSURE_ENTER_USAGE, PRESSURE_EXIT_ROUNDS, PRESSURE_EXIT_USAGE};
+            use crate::net::ebpf::{PRESSURE_ENTER_USAGE, PRESSURE_EXIT_ROUNDS, PRESSURE_EXIT_USAGE};
 
             let mut pressure_rounds: u32 = 0;
             let mut in_pressure = false;
@@ -1546,7 +1555,7 @@ impl ControlPlane {
     /// - redirect_track TTL: 5 minutes
     /// - Capacity: 65536 entries (HASH map, auto-overwrite when full)
     pub fn spawn_redirect_track_janitor(
-        ebpf_mgr: Arc<Mutex<crate::ebpf::EbpfManager>>,
+        ebpf_mgr: Arc<Mutex<crate::net::ebpf::EbpfManager>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("RedirectTrack janitor started (interval: 30s)");
@@ -1574,7 +1583,7 @@ impl ControlPlane {
     /// if `cgroup/sock_release` doesn't fire for some sockets.
     /// TTL: 5 minutes based on `last_seen_ns` in the ProcInfo value.
     pub fn spawn_cookie_pid_map_janitor(
-        ebpf_mgr: Arc<Mutex<crate::ebpf::EbpfManager>>,
+        ebpf_mgr: Arc<Mutex<crate::net::ebpf::EbpfManager>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("CookiePidMap janitor started (interval: 60s)");
@@ -1605,7 +1614,7 @@ impl ControlPlane {
     /// - domain: 0=TCP, 1=DNS UDP, 2=data UDP
     /// - ipversion: 0=IPv4, 1=IPv6
     pub fn start_connectivity_checker(
-        ebpf_mgr: Arc<Mutex<crate::ebpf::EbpfManager>>,
+        ebpf_mgr: Arc<Mutex<crate::net::ebpf::EbpfManager>>,
         proxy_addr: std::net::SocketAddr,
         outbound_id: u8,
     ) -> tokio::task::JoinHandle<()> {
@@ -1807,12 +1816,12 @@ impl ControlPlane {
     /// The `domain_routing` and `ebpf_mgr` are separate fields, passed individually
     /// to avoid borrow checker conflicts.
     ///
-    /// Lock order (see [`crate::domain_routing::DomainRoutingHandle`]):
+    /// Lock order (see [`crate::routing::domain_routing::DomainRoutingHandle`]):
     /// the outer handle is locked briefly to clone the inner `Arc`, then released
     /// before acquiring the ebpf lock, then the inner tracker is locked.
     pub fn add_dns_result_to_tracker(
-        domain_routing: &Option<crate::domain_routing::DomainRoutingHandle>,
-        ebpf_mgr: &Arc<Mutex<crate::ebpf::EbpfManager>>,
+        domain_routing: &Option<crate::routing::domain_routing::DomainRoutingHandle>,
+        ebpf_mgr: &Arc<Mutex<crate::net::ebpf::EbpfManager>>,
         domain: &str,
         ip: std::net::IpAddr,
         ttl_secs: u32,
@@ -1979,7 +1988,7 @@ impl ControlPlane {
         // ---- Step 7: Unpin eBPF maps from bpffs ----
         info!("Step 7/5: Unpinning eBPF maps");
         let step_start = std::time::Instant::now();
-        if let Err(e) = self.ebpf().unpin_maps(crate::ebpf::BPFFS_PATH) {
+        if let Err(e) = self.ebpf().unpin_maps(crate::net::ebpf::BPFFS_PATH) {
             warn!("Failed to unpin eBPF maps: {}", e);
         }
         debug!("Unpin completed: {}ms", step_start.elapsed().as_millis());
@@ -2082,7 +2091,7 @@ impl ControlPlane {
 
         // 2. Re-compile routing rules (with proxy server auto-direct)
         let proxy_server_ips = collect_proxy_server_ips(&self.config, &daefile_config.outbounds);
-        let compiled = routing::compile_rules(
+        let compiled = routing::matcher::compile_rules(
             &daefile_config.routing,
             &daefile_config.outbounds,
             &proxy_server_ips,
@@ -2110,7 +2119,7 @@ impl ControlPlane {
         );
 
         // Compute the next (target) epoch slot
-        let next_slot = (self.current_epoch_slot + 1) % crate::ebpf::ROUTING_EPOCH_SLOT_NUM;
+        let next_slot = (self.current_epoch_slot + 1) % crate::net::ebpf::ROUTING_EPOCH_SLOT_NUM;
         let prev_slot = self.current_epoch_slot;
         info!(
             "Hot-reload: epoch switching slot {} -> {}",
@@ -2142,7 +2151,7 @@ impl ControlPlane {
                 {
                     let mut all_cidr_entries: Vec<(u32, CidrEntry)> = Vec::new();
                     for (trie_idx, cidrs) in compiled.lpm_tries.iter().enumerate() {
-                        let entries = crate::routing::cidrs_to_cidr_entries(cidrs);
+                        let entries = crate::routing::matcher::cidrs_to_cidr_entries(cidrs);
                         for (_, entry) in entries {
                             all_cidr_entries.push((trie_idx as u32, entry));
                         }
@@ -2181,7 +2190,7 @@ impl ControlPlane {
                                 .r#match
                                 .comm
                                 .iter()
-                                .map(|c| crate::ebpf::hash_comm(c))
+                                .map(|c| crate::net::ebpf::hash_comm(c))
                                 .collect();
                             let _ = ebpf.write_excluded_comm(&hashes);
                         }
@@ -2203,7 +2212,7 @@ impl ControlPlane {
         if !compiled.domain_sets.is_empty() {
             if let Some(handle) = self.domain_routing.as_ref() {
                 let new_tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::domain_routing::DomainRoutingTracker::new(
+                    crate::routing::domain_routing::DomainRoutingTracker::new(
                         std::sync::Arc::new(compiled.domain_sets),
                         next_slot,
                     ),
@@ -2337,74 +2346,26 @@ pub fn cleanup_temp_json(max_age_secs: u64) {
 
 /// Connect to an address with SO_MARK set (bypasses eBPF self-intercept).
 /// Used by the connectivity checker and other internal health probes.
+/// 带 SO_MARK 的 TCP 连接（连通性检查用）。
+///
+/// 统一委托 [`protocols::hostns::connect_tcp`] 实现，mark 语义与拨号器一致：
+/// dae-rs 自身流量必须直连（eBPF pid_is_control_plane 放行）。
 pub async fn connect_with_mark(
     addr: &std::net::SocketAddr,
     mark: u32,
     timeout_secs: u64,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    use std::os::unix::io::FromRawFd;
-
-    let domain = if addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
+    let sock = protocols::hostns::DirectSocket {
+        self_mark: mark,
+        host_ns_fd: None,
     };
-
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let mark_val = mark as libc::c_int;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark_val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let sockaddr = socket2::SockAddr::from(*addr);
-    let sockaddr_ptr = sockaddr.as_ptr();
-    let sockaddr_len = sockaddr.len();
-    let ret = unsafe { libc::connect(fd, sockaddr_ptr as *const libc::sockaddr, sockaddr_len) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINPROGRESS) {
-            unsafe {
-                libc::close(fd);
-            }
-            return Err(err);
-        }
-    }
-
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-    let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
-
-    // Wait for the connection to complete
-    let writable = tokio::time::timeout(
+    protocols::hostns::connect_tcp(
+        *addr,
+        &sock,
+        false,
         std::time::Duration::from_secs(timeout_secs),
-        tokio_stream.writable(),
     )
-    .await;
-
-    writable
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
-
-    // Check for connection errors
-    if let Some(err) = tokio_stream.take_error()? {
-        return Err(err);
-    }
-
-    Ok(tokio_stream)
+    .await
 }
 
 // ============================================================================
@@ -2581,12 +2542,12 @@ mod tests {
     #[test]
     fn test_compile_rules_fallback() {
         // This test was removed - compile_rules in lib.rs is deprecated.
-        // Routing tests are in routing::tests.
+        // Routing tests are in routing::matcher::tests.
     }
 
     #[test]
     fn test_compile_rules_action_mapping() {
         // This test was removed - compile_rules in lib.rs is deprecated.
-        // Routing tests are in routing::tests.
+        // Routing tests are in routing::matcher::tests.
     }
 }

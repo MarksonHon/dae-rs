@@ -139,7 +139,7 @@ DNS 解析结果会写入 eBPF `domain_routing_map`，使 `domain(...)` 路由�
 数据通路内求值：
 
 1. `ControlPlane` 编译路由规则，若存在域名规则则创建
-   `DomainRoutingTracker`（见 `control/src/domain_routing.rs`）。
+   `DomainRoutingTracker`（见 `control/src/routing/domain_routing.rs`）。
 2. 从 DNS 管理器到 tracker 接入 `DnsResolveCallback`（`on_resolve`）。
 3. 每条**被接受**的 DNS 响应中，每个 A/AAAA 记录以上报为 `(domain, ip, ttl)`。
 4. tracker 计算路由位图（该域名命中了哪些域名集规则），把 `ip → 位图`

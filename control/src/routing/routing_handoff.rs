@@ -47,10 +47,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::ebpf::{
+use crate::net::ebpf::{
     ConnState, EbpfManager, RoutingHandoffEntry, RoutingMeta, TuplesKey,
 };
-use crate::routing::{RoutingMatcher, RoutingParams, RoutingResult};
+use crate::routing::matcher::{RoutingMatcher, RoutingParams, RoutingResult};
 
 // ============================================================================
 // Constants
@@ -300,11 +300,11 @@ fn build_conn_state(entry: &RoutingHandoffEntry, decision: &RoutingResult) -> Co
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ebpf::outbound;
+    use crate::net::ebpf::outbound;
 
     /// Helper: create a zeroed eBPF RoutingResult for test entries.
-    fn zero_ebpf_result() -> crate::ebpf::RoutingResult {
-        crate::ebpf::RoutingResult::zeroed()
+    fn zero_ebpf_result() -> crate::net::ebpf::RoutingResult {
+        crate::net::ebpf::RoutingResult::zeroed()
     }
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
 
         // This is the userspace RoutingResult (from routing::RoutingResult)
         // that build_conn_state expects.
-        let decision = crate::routing::RoutingResult {
+        let decision = crate::routing::matcher::RoutingResult {
             outbound: outbound::DIRECT,
             mark: 0,
             must: false,

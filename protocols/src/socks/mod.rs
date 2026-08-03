@@ -9,14 +9,12 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use tokio::time::timeout;
-use tracing::warn;
 
 use crate::{OutboundDialer, ProxyConn};
 
@@ -41,69 +39,6 @@ pub enum Socks5Error {
     /// 其他错误
     #[error("SOCKS5 error: {0}")]
     Other(String),
-}
-
-/// `IP_TRANSPARENT` socket 选项值（Linux）
-///
-/// 允许 socket 绑定/连接到非本机地址。与 kdae 对齐，上行 socket
-/// 即使不显式绑定源地址也设置该选项，确保在透明代理环境下可用。
-const IP_TRANSPARENT: libc::c_int = 19;
-
-/// `IPV6_TRANSPARENT` socket 选项值（Linux）
-const IPV6_TRANSPARENT: libc::c_int = 75;
-
-/// 设置 TCP_NODELAY 禁用 Nagle 算法（代理路径小包延迟关键，失败非致命）。
-fn set_tcp_nodelay(stream: &TcpStream) {
-    use socket2::SockRef;
-    if let Err(e) = SockRef::from(stream).set_nodelay(true) {
-        warn!("Failed to set TCP_NODELAY on proxy connection: {}", e);
-    }
-}
-
-/// 在宿主网络命名空间中同步执行闭包，并在执行后恢复当前命名空间。
-///
-/// 由于 `protocols` crate 不能依赖 `control` crate，这里使用裸 libc 调用实现，
-/// 语义与 `control::netns::with_host_ns_fd` 一致：
-/// 1. 保存当前线程的网络命名空间 fd
-/// 2. `setns(host_ns_fd)` 切换到宿主 NS
-/// 3. 执行 `f()`（捕获 panic 以确保恢复）
-/// 4. 恢复为原始命名空间
-///
-/// 注意：闭包内不能出现 `.await` 点。
-fn with_host_ns_fd<T>(
-    host_ns_fd: RawFd,
-    f: impl FnOnce() -> Result<T, Socks5Error>,
-) -> Result<T, Socks5Error> {
-    // 1. 保存当前命名空间 fd
-    let current_fd = unsafe { libc::open(c"/proc/self/ns/net".as_ptr(), libc::O_RDONLY) };
-    if current_fd < 0 {
-        return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-    }
-
-    // 2. 切换到宿主 NS
-    if unsafe { libc::setns(host_ns_fd, libc::CLONE_NEWNET) } != 0 {
-        unsafe { libc::close(current_fd) };
-        return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-    }
-
-    // 3. 执行闭包（捕获 panic 以确保恢复命名空间）
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-    // 4. 恢复原始命名空间
-    if unsafe { libc::setns(current_fd, libc::CLONE_NEWNET) } != 0 {
-        let e = std::io::Error::last_os_error();
-        warn!(
-            "CRITICAL: Failed to return to original netns after with_host_ns_fd: {}. \
-             The current thread may be in the wrong namespace!",
-            e
-        );
-    }
-    unsafe { libc::close(current_fd) };
-
-    match result {
-        Ok(v) => v,
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
 }
 
 /// SOCKS5 拨号器
@@ -191,115 +126,24 @@ impl Socks5Dialer {
     /// source address is the host's real WAN address instead of the daens
     /// internal address `169.254.0.11`. This matches kdae's behavior.
     async fn connect_with_mark(&self) -> Result<TcpStream, Socks5Error> {
-        if self.self_mark == 0 && self.host_ns_fd.is_none() {
-            let stream = timeout(self.dial_timeout, TcpStream::connect(&self.proxy_addr))
-                .await
-                .map_err(|_| Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr)))?
-                .map_err(Socks5Error::Io)?;
-            set_tcp_nodelay(&stream);
-            return Ok(stream);
-        }
-
-        let domain = if self.proxy_addr.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-
-        // Create socket, set SO_MARK / IP_TRANSPARENT, start non-blocking connect.
-        // The whole phase is synchronous (no .await) so it can run inside a
-        // temporary host-namespace switch.
-        let create_and_connect = || -> Result<RawFd, Socks5Error> {
-            let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
-            if fd < 0 {
-                return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-            }
-
-            if self.self_mark != 0 {
-                let mark_val = self.self_mark as libc::c_int;
-                let ret = unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::SOL_SOCKET,
-                        libc::SO_MARK,
-                        &mark_val as *const _ as *const libc::c_void,
-                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                    )
-                };
-                if ret != 0 {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-                }
-            }
-
-            // IP_TRANSPARENT — aligned with kdae, harmless for client sockets.
-            let one: libc::c_int = 1;
-            let (level, opt): (libc::c_int, libc::c_int) = if self.proxy_addr.is_ipv4() {
-                (libc::SOL_IP, IP_TRANSPARENT)
+        // 统一的宿主 NS 感知 TCP 连接（SO_MARK + IP_TRANSPARENT + host NS）。
+        crate::hostns::connect_tcp(
+            self.proxy_addr,
+            &crate::hostns::DirectSocket {
+                self_mark: self.self_mark,
+                host_ns_fd: self.host_ns_fd,
+            },
+            true,
+            self.dial_timeout,
+        )
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr))
             } else {
-                (libc::SOL_IPV6, IPV6_TRANSPARENT)
-            };
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    level,
-                    opt,
-                    &one as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
+                Socks5Error::Io(e)
             }
-
-            // Connect (non-blocking, returns EINPROGRESS)
-            let sockaddr = socket2::SockAddr::from(self.proxy_addr);
-            let sockaddr_ptr = sockaddr.as_ptr();
-            let sockaddr_len = sockaddr.len();
-            let ret =
-                unsafe { libc::connect(fd, sockaddr_ptr as *const libc::sockaddr, sockaddr_len) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINPROGRESS) {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    return Err(Socks5Error::Io(err));
-                }
-            }
-
-            Ok(fd)
-        };
-
-        // Run the socket creation + connect in the host NS when configured.
-        let fd = match self.host_ns_fd {
-            Some(host_fd) => with_host_ns_fd(host_fd, create_and_connect)?,
-            None => create_and_connect()?,
-        };
-
-        // Wrap in std TcpStream, then tokio TcpStream.
-        // tokio will register the fd with epoll and wait for writability
-        // (connected) or error. Note: the fd is namespace-independent after
-        // creation, so I/O can continue from the original (daens) context.
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        let tokio_stream = tokio::net::TcpStream::from_std(std_stream).map_err(Socks5Error::Io)?;
-
-        // Wait for the connection to complete with the same dial timeout used
-        // by the plain TcpStream::connect path.
-        timeout(self.dial_timeout, tokio_stream.writable())
-            .await
-            .map_err(|_| Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr)))?
-            .map_err(Socks5Error::Io)?;
-
-        // Check for connection errors (e.g., ECONNREFUSED, ECONNRESET)
-        if let Ok(Some(err)) = tokio_stream.take_error() {
-            return Err(Socks5Error::Io(err));
-        }
-
-        // 禁用 Nagle（TCP_NODELAY）：代理路径的小包（SSH、游戏、API）不受 40ms
-        // 延迟合并影响，与入站侧设置保持一致。
-        set_tcp_nodelay(&tokio_stream);
-
-        Ok(tokio_stream)
+        })
     }
 
     /// 执行 SOCKS5 握手
@@ -733,70 +577,16 @@ impl Socks5Dialer {
         // address (kdae-aligned). The fd is namespace-independent after
         // creation, so tokio I/O can continue from the original context.
         let local_udp: UdpSocket = {
-            let create_relay = || -> Result<std::net::UdpSocket, Socks5Error> {
-                let domain = if relay_addr.is_ipv4() {
-                    libc::AF_INET
-                } else {
-                    libc::AF_INET6
-                };
-                let fd = unsafe {
-                    libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK, 0)
-                };
-                if fd < 0 {
-                    return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-                }
-
-                if self.self_mark != 0 {
-                    let mark_val = self.self_mark as libc::c_int;
-                    let ret = unsafe {
-                        libc::setsockopt(
-                            fd,
-                            libc::SOL_SOCKET,
-                            libc::SO_MARK,
-                            &mark_val as *const _ as *const libc::c_void,
-                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                        )
-                    };
-                    if ret != 0 {
-                        unsafe { libc::close(fd) };
-                        return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-                    }
-                }
-
-                // Bind to port 0 so the OS assigns an ephemeral port.
-                let bind_addr: SocketAddr = if relay_addr.is_ipv4() {
-                    "0.0.0.0:0".parse().expect("valid bind addr")
-                } else {
-                    "[::]:0".parse().expect("valid bind addr")
-                };
-                let sock_addr = socket2::SockAddr::from(bind_addr);
-                let ret = unsafe {
-                    libc::bind(fd, sock_addr.as_ptr() as *const libc::sockaddr, sock_addr.len())
-                };
-                if ret != 0 {
-                    unsafe { libc::close(fd) };
-                    return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-                }
-
-                // Connect the UDP socket to the relay address (so we can use send()).
-                let sock_addr = socket2::SockAddr::from(relay_addr);
-                let ret = unsafe {
-                    libc::connect(fd, sock_addr.as_ptr() as *const libc::sockaddr, sock_addr.len())
-                };
-                if ret != 0 {
-                    unsafe { libc::close(fd) };
-                    return Err(Socks5Error::Io(std::io::Error::last_os_error()));
-                }
-
-                let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-                std_socket.set_nonblocking(true)?;
-                Ok(std_socket)
-            };
-
-            let std_udp = match self.host_ns_fd {
-                Some(host_fd) => with_host_ns_fd(host_fd, create_relay)?,
-                None => create_relay()?,
-            };
+            let std_udp = crate::hostns::create_udp(
+                relay_addr,
+                &crate::hostns::DirectSocket {
+                    self_mark: self.self_mark,
+                    host_ns_fd: self.host_ns_fd,
+                },
+            )
+            .map_err(Socks5Error::Io)?;
+            // Connect the UDP socket to the relay address (so we can use send()).
+            std_udp.connect(relay_addr).map_err(Socks5Error::Io)?;
             tokio::net::UdpSocket::from_std(std_udp).map_err(Socks5Error::Io)?
         };
 
@@ -949,22 +739,68 @@ fn parse_host_from_target(target: &str) -> &str {
 impl OutboundDialer for Socks5Dialer {
     /// 通过 SOCKS5 代理拨号到目标地址
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
-        let stream = self.connect_with_mark().await?;
-        let mut proxy_conn = ProxyConn::new(stream)?;
+        let mut stream = self.connect_with_mark().await?;
 
         // 执行 SOCKS5 握手
-        self.handshake(&mut proxy_conn.stream, target)
+        self.handshake(&mut stream, target)
             .await
             .map_err(|e| anyhow::anyhow!("SOCKS5 handshake failed: {}", e))?;
 
-        Ok(proxy_conn)
+        ProxyConn::new_tcp(stream).map_err(Into::into)
+    }
+
+    /// 建立 SOCKS5 UDP ASSOCIATE 会话
+    async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
+        let session = self.udp_associate().await?;
+        Ok(Box::new(SocksUdpSession { session }))
     }
 
     /// 返回协议名称
     fn protocol_name(&self) -> &'static str {
         "socks5"
     }
+    fn proxy_addr(&self) -> std::net::SocketAddr {
+        self.proxy_addr
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
+
+/// SOCKS5 UDP ASSOCIATE 会话的 `UdpSession` 适配。
+///
+/// 发送：SOCKS5 UDP 请求头（RSV/FRAG/ATYP/ADDR/PORT）+ payload。
+/// 接收：解析 SOCKS5 UDP 响应头，返回原始目标地址 + payload。
+pub struct SocksUdpSession {
+    session: UdpAssociateSession,
+}
+
+#[async_trait]
+impl crate::UdpSession for SocksUdpSession {
+    async fn send(&self, dest: &std::net::SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
+        let mut send_buf = UdpAssociateSession::build_udp_request_header(dest, payload.len());
+        send_buf.extend_from_slice(payload);
+        self.session.udp.send(&send_buf).await?;
+        Ok(())
+    }
+
+    async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Vec<u8>)> {
+        let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
+        loop {
+            let len = self.session.udp.recv(&mut buf).await?;
+            if let Some((dest, offset)) =
+                UdpAssociateSession::parse_udp_response_header(&buf[..len])
+            {
+                return Ok((dest, buf[offset..len].to_vec()));
+            }
+            // 非 SOCKS5 UDP 数据包（如碎片），忽略重试
+        }
+    }
+}
+
+/// SOCKS5 UDP 数据包最大尺寸
+const MAX_UDP_PACKET_SIZE: usize = 65535;
 
 #[cfg(test)]
 mod tests {

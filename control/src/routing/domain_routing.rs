@@ -10,8 +10,8 @@
 //!
 //! This mirrors dae's `control/domain_routing_tracker.go`.
 
-use crate::ebpf::EbpfManager;
-use crate::routing::build_domain_routing_bitmap;
+use crate::net::ebpf::EbpfManager;
+use crate::routing::matcher::build_domain_routing_bitmap;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;

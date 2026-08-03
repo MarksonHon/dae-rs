@@ -55,7 +55,7 @@ use rtnetlink::{
 };
 use std::fs;
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::process::Command;
 use std::{net::IpAddr, path::Path};
 use tracing::{debug, error, info, warn};
@@ -211,30 +211,9 @@ pub fn with_host_ns_fd<F, T>(host_ns_fd: RawFd, f: F) -> Result<T>
 where
     F: FnOnce() -> T,
 {
-    // 1. 保存当前命名空间 fd
-    let current_ns = fs::File::open("/proc/self/ns/net").context("Failed to open current netns fd")?;
-
-    // 2. 切换到宿主 NS
-    let borrowed = unsafe { BorrowedFd::borrow_raw(host_ns_fd) };
-    nix::sched::setns(borrowed, nix::sched::CloneFlags::CLONE_NEWNET)
-        .context("Failed to switch to host netns")?;
-
-    // 3. 执行闭包（捕获 panic 以确保恢复命名空间）
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-    // 4. 恢复原始命名空间
-    if let Err(e) = nix::sched::setns(&current_ns, nix::sched::CloneFlags::CLONE_NEWNET) {
-        error!(
-            "CRITICAL: Failed to return to original netns after with_host_ns_fd: {}. \
-             The current thread may be in the wrong namespace!",
-            e
-        );
-    }
-
-    match result {
-        Ok(v) => Ok(v),
-        Err(payload) => std::panic::resume_unwind(payload),
-    }
+    // 委托给 protocols::hostns 的统一实现（setns + panic-safe 恢复）。
+    protocols::hostns::with_host_ns(Some(host_ns_fd), || Ok(f()))
+        .map_err(|e| anyhow::anyhow!("with_host_ns failed: {}", e))
 }
 
 /// 读取 /sys/class/net/<ifname>/address 的 MAC 地址

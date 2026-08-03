@@ -154,7 +154,7 @@ DNS resolution results feed the eBPF `domain_routing_map` so that
 `domain(...)` routing rules can be evaluated in the data path:
 
 1. `ControlPlane` compiles routing rules and, when domain rules exist, creates a
-   `DomainRoutingTracker` (see `control/src/domain_routing.rs`).
+   `DomainRoutingTracker` (see `control/src/routing/domain_routing.rs`).
 2. A `DnsResolveCallback` (`on_resolve`) is wired from the DNS manager to the
    tracker.
 3. On every **accepted** DNS response, each A/AAAA record is reported as

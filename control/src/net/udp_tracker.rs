@@ -17,7 +17,7 @@
 //!    to safely mark them for deletion.
 //! 3. The janitor only deletes entries not in the retained set.
 
-use crate::ebpf::TuplesKey;
+use crate::net::ebpf::TuplesKey;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -143,7 +143,7 @@ impl Default for UdpConnStateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ebpf::TuplesKey;
+    use crate::net::ebpf::TuplesKey;
 
     #[test]
     fn test_retain_and_forget() {

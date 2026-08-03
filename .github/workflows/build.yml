@@ -1,0 +1,157 @@
+# ============================================
+# dae-rs Build & Release CI
+# ============================================
+# dae-rs 仅支持 Linux。所有产物均通过 zigbuild（zig cc 链接）交叉编译。
+# 支持目标:
+#   x86_64-unknown-linux-gnu  (amdv1/v2/v3, jemalloc)
+#   x86_64-unknown-linux-musl (amdv1/v2/v3, mimalloc)
+#   aarch64-unknown-linux-gnu (jemalloc)
+#   aarch64-unknown-linux-musl (mimalloc)
+#
+# 说明:
+#   - libbpf-sys 统一启用 vendored 特性（libbpf + elfutils libelf + zlib
+#     全部用 zig cc 从源码静态构建，不依赖宿主系统的 libelf）
+#   - vendored-libelf 构建需要 autotools：autoreconf/autopoint/flex/bison/gawk
+#   - musl 目标额外需要 glibc 的 argp/fts/obstack（musl 缺失），
+#     由 scripts/build-musl-deps.sh 用 zig 交叉编译
+#   - eBPF 字节码由 build.rs 用 clang 编译，需安装 clang + llvm-strip
+# ============================================
+
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --------------------------------------------------
+  # Linux — zigbuild
+  # --------------------------------------------------
+  linux:
+    name: Linux (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cpu_variant: v1
+          - target: x86_64-unknown-linux-gnu
+            cpu_variant: v2
+          - target: x86_64-unknown-linux-gnu
+            cpu_variant: v3
+          - target: x86_64-unknown-linux-musl
+            cpu_variant: v1
+          - target: x86_64-unknown-linux-musl
+            cpu_variant: v2
+          - target: x86_64-unknown-linux-musl
+            cpu_variant: v3
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            clang llvm \
+            autoconf automake gettext \
+            flex bison gawk \
+            pkg-config make
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build musl deps (argp/fts/obstack)
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        env:
+          ZIG_TARGET: ${{ matrix.target == 'x86_64-unknown-linux-musl' && 'x86_64-linux-musl' || 'aarch64-linux-musl' }}
+        run: |
+          bash scripts/build-musl-deps.sh "${ZIG_TARGET}" /tmp/dae-rs-musl-deps
+
+      - name: Build with zigbuild
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
+          CFLAGS_x86_64_unknown_linux_musl: "-I/tmp/dae-rs-musl-deps/include -L/tmp/dae-rs-musl-deps/lib"
+          CFLAGS_aarch64_unknown_linux_musl: "-I/tmp/dae-rs-musl-deps/include -L/tmp/dae-rs-musl-deps/lib"
+        run: |
+          cargo zigbuild --release --workspace --target ${{ matrix.target }}
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          case "${{ matrix.cpu_variant }}" in
+            v1) PKG_NAME="dae-rs-${{ matrix.target }}" ;;
+            v2) PKG_NAME="dae-rs-${{ matrix.target }}-v2" ;;
+            v3) PKG_NAME="dae-rs-${{ matrix.target }}-v3" ;;
+            *)  PKG_NAME="dae-rs-${{ matrix.target }}" ;;
+          esac
+          mkdir -p "${PKG_NAME}/config-example"
+          cp "target/${{ matrix.target }}/release/dae-rs" "${PKG_NAME}/"
+          cp config-example/* "${PKG_NAME}/config-example/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dae-rs-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          path: dae-rs-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # Release — attach all artifacts to GitHub Release
+  # --------------------------------------------------
+  release:
+    name: Attach to Release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: linux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Compress artifacts into zip files
+        shell: bash
+        run: |
+          shopt -s globstar
+          for dir in artifacts/*/; do
+            target_name=$(basename "$dir")
+            zipfile="artifacts/${target_name}.zip"
+            echo "Creating zip: $zipfile from $dir"
+            (cd "$dir" && zip -ry "../../${zipfile}" .)
+          done
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*.zip

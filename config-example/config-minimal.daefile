@@ -12,39 +12,27 @@ interface {
 outbounds {
   nodes {
     main {
-      protocol: socks5
-      address: 192.168.12.1:9696
+      protocol: shadowsocks
+      address: 192.168.12.1:9697
+      cipher: aes-128-gcm
+      password: password123
       dial_timeout_ms: 5000
     }
   }
   groups {
-    proxy_primary {
+    proxy {
       policy: fixed
-      nodes(main)
-    }
-
-    a_group {
-      type: auto
-      policy: min_avg10
-      nodes(regex: '*')
-    }
-
-    manual {
-      type: select
-      selected: main
       nodes(main)
     }
   }
 }
 
 routing {
-  l4proto(tcp) -> proxy(proxy_primary)
-  fallback: proxy(proxy_primary)
+  fallback: proxy(proxy)
 }
 
 dns {
   starting_dns {
-    ip_version_prefer: 4
     upstream {
       bootstrap: 'udp://1.1.1.1:53'
     }
@@ -52,7 +40,7 @@ dns {
   bind: '127.0.0.1:5353'
   groups {
     default_dns {
-      proxy: proxy_primary
+      proxy: proxy
       upstream {
         cloudflare: 'udp://1.1.1.1:53'
       }

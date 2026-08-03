@@ -37,14 +37,44 @@
 use anyhow::{Context, Result};
 use protocols::OutboundDialer;
 use protocols::Socks5Dialer;
+use protocols::UdpAssociateSession;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
+use std::time::Duration;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// TCP 中继常量
+// ============================================================================
+
+/// 单次 splice() 的数据块大小（内核页接管，块大减少系统调用）
+const SPLICE_CHUNK: usize = 64 * 1024;
+
+/// splice 不可用时回退路径的双向拷贝缓冲大小（tokio 默认 copy_bidirectional 仅 8KB）
+const COPY_BUFFER_SIZE: usize = 64 * 1024;
+
+// ============================================================================
+// UDP 中继常量
+// ============================================================================
+
+/// UDP 数据包最大尺寸
+const MAX_UDP_SIZE: usize = 65535;
+
+/// recvmsg 辅助数据（cmsg）缓冲大小
+const CMSG_BUFFER_SIZE: usize = 128;
+
+/// UDP relay flow 空闲超时：超过该时间没有收到中继响应则关闭会话
+const UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 透明回包 socket 池容量上限（超出时淘汰最久未用条目）
+const RESP_SOCKET_POOL_CAP: usize = 256;
 
 // ============================================================================
 // Linux socket 选项常量
@@ -485,7 +515,7 @@ impl std::fmt::Debug for TproxyListener {
 /// * 如果双向拷贝失败，返回错误（可能网络中断）
 /// * 单个连接的错误不会影响监听器的其他连接
 async fn handle_connection(
-    mut inbound: TcpStream,
+    inbound: TcpStream,
     dialer: Arc<Socks5Dialer>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
@@ -503,6 +533,10 @@ async fn handle_connection(
     )?;
     debug!(orig_dst = %orig_dst, "handle_connection: got original destination");
 
+    // ---- 步骤 1.5：禁用 Nagle（TCP_NODELAY），降低交互式小包延迟 ----
+    // 入站连接由内核 accept 默认开启 Nagle；出站连接在 SOCKS5 拨号器中设置。
+    set_tcp_nodelay(&inbound);
+
     // ---- 步骤 2：通过 SOCKS5 拨号到目标 ----
     let proxy_addr = dialer.proxy_addr;
     let dial_result = dialer.dial(&orig_dst.to_string()).await;
@@ -515,8 +549,8 @@ async fn handle_connection(
         if dial_result.is_ok() { "ok" } else { "fail" }
     );
 
-    let mut outbound = match dial_result {
-        Ok(stream) => stream,
+    let outbound = match dial_result {
+        Ok(conn) => conn,
         Err(e) => {
             info!(
                 "TCP  {}:{} -> {} [PROXY] FAIL dial: {}",
@@ -532,7 +566,10 @@ async fn handle_connection(
     };
 
     // ---- 步骤 3：双向数据拷贝 ----
-    let result = copy_bidirectional(&mut inbound, &mut outbound).await;
+    // splice 零拷贝中继（不可用时回退 64KB 缓冲拷贝）。
+    // ProxyConn 内部就是 tokio TcpStream，解构取出以走 splice 路径。
+    let outbound_stream = outbound.stream;
+    let result = relay_bidirectional(inbound, outbound_stream).await;
     let elapsed_ms = start.elapsed().as_micros() as f64 / 1000.0;
     let bytes_transferred = result.as_ref().map(|(a, b)| a + b).unwrap_or(0);
 
@@ -633,6 +670,245 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     }
 
     Ok(addr)
+}
+
+/// 设置 TCP_NODELAY 禁用 Nagle 算法。
+///
+/// 代理路径上每个字节流都可能承载交互式小包（SSH、游戏、API 请求等），
+/// Nagle 会把这些小包合并等待 ACK，显著增加 RTT。原版 dae 对入站和出站
+/// 连接都显式设置 TCP_NODELAY。失败仅记录 debug（非致命）。
+fn set_tcp_nodelay(stream: &TcpStream) {
+    use socket2::SockRef;
+    if let Err(e) = SockRef::from(stream).set_nodelay(true) {
+        debug!("Failed to set TCP_NODELAY: {}", e);
+    }
+}
+
+// ============================================================================
+// TCP 双向中继：splice 零拷贝 + 大缓冲回退
+// ============================================================================
+
+/// 管道对（RAII，析构时关闭两端 fd）。
+struct PipePair {
+    r: RawFd,
+    w: RawFd,
+}
+
+impl PipePair {
+    fn new() -> std::io::Result<Self> {
+        let mut fds = [0; 2];
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { r: fds[0], w: fds[1] })
+    }
+}
+
+impl Drop for PipePair {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.r);
+            libc::close(self.w);
+        }
+    }
+}
+
+/// 探测 splice() 对 (src, dst) 组合是否可用。
+///
+/// 用 len=0 的 splice 调用只触发内核的 fd 类型校验而不搬运数据；
+/// 若返回 EINVAL（内核/文件类型不支持）则回退到缓冲拷贝。
+fn splice_supported(src: &TcpStream, dst: &TcpStream, pipe: &PipePair) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
+    let n = unsafe {
+        libc::splice(
+            src.as_raw_fd(),
+            std::ptr::null_mut(),
+            pipe.w,
+            std::ptr::null_mut(),
+            0,
+            flags,
+        )
+    };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINVAL) {
+            return false;
+        }
+    }
+    let n = unsafe {
+        libc::splice(
+            pipe.r,
+            std::ptr::null_mut(),
+            dst.as_raw_fd(),
+            std::ptr::null_mut(),
+            0,
+            flags,
+        )
+    };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINVAL) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 为 splice 就绪等待复制一个独立 fd（dup）。
+///
+/// 原 tokio `TcpStream` 已注册到 reactor，不能直接用其 fd 再注册
+/// AsyncFd（同一 fd 重复注册会与现有注册冲突）；dup 出独立 fd 后
+/// 两个注册互不干扰，且原流仍可用于 shutdown 等操作。
+fn dup_fd_stream(stream: &TcpStream) -> std::io::Result<AsyncFd<std::net::TcpStream>> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let dup_fd = unsafe { libc::dup(stream.as_raw_fd()) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(dup_fd) };
+    AsyncFd::new(std_stream)
+}
+
+/// 用 splice() 单向搬运数据：src socket → 管道 → dst socket（零拷贝）。
+///
+/// 源 EOF 时对 dst 执行 `shutdown(SHUT_WR)` 传播 FIN（半关闭语义），
+/// 然后返回本方向搬运的总字节数。
+async fn splice_direction(
+    src: &TcpStream,
+    dst: &TcpStream,
+    pipe: &PipePair,
+) -> std::io::Result<u64> {
+    use std::os::unix::io::AsRawFd;
+
+    let src_ready = dup_fd_stream(src)?;
+    let dst_ready = dup_fd_stream(dst)?;
+    let src_fd = src.as_raw_fd();
+    let dst_fd = dst.as_raw_fd();
+    let mut total: u64 = 0;
+
+    loop {
+        // 1. 等待源可读，splice 进管道
+        let n = loop {
+            let mut guard = src_ready.readable().await?;
+            let n = unsafe {
+                libc::splice(
+                    src_fd,
+                    std::ptr::null_mut(),
+                    pipe.w,
+                    std::ptr::null_mut(),
+                    SPLICE_CHUNK,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if n > 0 {
+                break n as usize;
+            }
+            if n == 0 {
+                // 源 EOF：向对端传播 FIN，本方向结束
+                unsafe { libc::shutdown(dst_fd, libc::SHUT_WR) };
+                return Ok(total);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
+            guard.clear_ready();
+        };
+
+        // 2. 等待目标可写，把管道数据全部 splice 进目标。
+        // 必须循环排空管道：若一次只搬走部分字节（m < n），剩余字节若
+        // 留到下一轮外层循环会因等待源可读而滞留（死锁）。
+        let mut remaining = n;
+        while remaining > 0 {
+            let mut guard = dst_ready.writable().await?;
+            let m = unsafe {
+                libc::splice(
+                    pipe.r,
+                    std::ptr::null_mut(),
+                    dst_fd,
+                    std::ptr::null_mut(),
+                    remaining,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                )
+            };
+            if m > 0 {
+                total += m as u64;
+                remaining -= m as usize;
+                continue;
+            }
+            if m == 0 {
+                // 管道 EOF（写端已关），正常结束
+                return Ok(total);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
+            guard.clear_ready();
+        }
+    }
+}
+
+/// 单方向缓冲拷贝（64KB 缓冲），源 EOF 时 shutdown 目标写端传播 FIN。
+async fn buffered_copy_direction<R, W>(src: &mut R, dst: &mut W) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; COPY_BUFFER_SIZE];
+    let mut total: u64 = 0;
+    loop {
+        let n = src.read(&mut buf).await?;
+        if n == 0 {
+            dst.shutdown().await?;
+            return Ok(total);
+        }
+        dst.write_all(&buf[..n]).await?;
+        total += n as u64;
+    }
+}
+
+/// 双向 TCP 中继：优先 splice() 零拷贝路径，不可用时回退到 64KB 缓冲拷贝。
+///
+/// 返回 `(客户端→代理 字节数, 代理→客户端 字节数)`，与 tokio
+/// `copy_bidirectional` 的顺序一致。
+async fn relay_bidirectional(
+    mut inbound: TcpStream,
+    mut outbound: TcpStream,
+) -> std::io::Result<(u64, u64)> {
+    // ---- splice 零拷贝路径 ----
+    if let Ok(pipe_ab) = PipePair::new() {
+        if let Ok(pipe_ba) = PipePair::new() {
+            if splice_supported(&inbound, &outbound, &pipe_ab)
+                && splice_supported(&outbound, &inbound, &pipe_ba)
+            {
+                let (to_up, from_up) = tokio::join!(
+                    splice_direction(&inbound, &outbound, &pipe_ab),
+                    splice_direction(&outbound, &inbound, &pipe_ba),
+                );
+                return match (to_up, from_up) {
+                    (Err(e), _) => Err(e),
+                    (_, Err(e)) => Err(e),
+                    (Ok(a), Ok(b)) => Ok((a, b)),
+                };
+            }
+        }
+    }
+
+    // ---- 64KB 缓冲回退路径（splice 不可用）----
+    let (mut inbound_r, mut inbound_w) = inbound.split();
+    let (mut outbound_r, mut outbound_w) = outbound.split();
+    let (to_up, from_up) = tokio::join!(
+        buffered_copy_direction(&mut inbound_r, &mut outbound_w),
+        buffered_copy_direction(&mut outbound_r, &mut inbound_w),
+    );
+    match (to_up, from_up) {
+        (Err(e), _) => Err(e),
+        (_, Err(e)) => Err(e),
+        (Ok(a), Ok(b)) => Ok((a, b)),
+    }
 }
 
 // ============================================================================
@@ -1245,315 +1521,220 @@ impl UdpTproxyListener {
     /// 并通过 SOCKS5 UDP ASSOCIATE 将数据包转发到原始目标。
     /// 对于 DNS 流量，如果配置了 dns_forward_addr，则直接转发到内部的 DNS handler，
     /// 实现 DNS 劫持，而不是通过 SOCKS5 代理。
+    ///
+    /// # 优化说明
+    ///
+    /// - 收包/发送缓冲在循环外复用，避免每个 UDP 包 64KB 堆分配；
+    /// - 用 tokio `AsyncFd` 等待可读，替代 spawn_blocking + 10ms 轮询；
+    /// - SOCKS5 UDP ASSOCIATE 会话按 (dest, peer) 建立 flow，每个 flow 有独立
+    ///   reader 任务持续读取中继响应并回发客户端；发送不持锁，同一目标的并发
+    ///   包（QUIC 多包在途）不再被互斥锁串行化；
+    /// - 回包 socket（IP_TRANSPARENT，绑定原目标地址）按 dest 复用，避免每包
+    ///   socket()+setsockopt()+bind()（host_ns_fd 场景下还包括 2 次 setns）；
+    /// - 包级日志降为 debug。
     async fn run_receive_loop(&self, socket: std::net::UdpSocket) -> Result<()> {
-        use protocols::UdpAssociateSession;
         use std::os::unix::io::AsRawFd;
-
-        const MAX_UDP_SIZE: usize = 65535;
-        const CMSG_BUFFER_SIZE: usize = 128;
 
         let fd = socket.as_raw_fd();
         let dialer = self.dialer.clone();
-        let _running = self.running.clone();
         let stop_signal = self.stop_signal.clone();
         let dns_forward_addr = self.dns_forward_addr;
         let host_ns_fd = self.host_ns_fd;
 
-        // Pool for reusing UDP ASSOCIATE sessions per destination
-        let pool = Arc::new(protocols::UdpEndpointPool::new());
+        // 缓冲在循环外复用（避免每包 64KB 分配）
+        let mut buf = vec![0u8; MAX_UDP_SIZE];
+        let mut cmsg_buf = vec![0u8; CMSG_BUFFER_SIZE];
+
+        // SOCKS5 UDP flow 池：(dest, peer) → 会话 + reader 任务
+        let flows = Arc::new(UdpFlowPool::new());
+        // 透明回包 socket 池：dest → socket（DNS 劫持与 SOCKS5 回包共用）
+        let resp_socks = Arc::new(RespSocketPool::new());
+
+        // 将 fd 注册到 tokio reactor，用可读事件驱动 recvmsg（fd 保持非阻塞）
+        let async_fd =
+            AsyncFd::new(socket).context("Failed to register UDP socket with reactor")?;
 
         loop {
-            // Receive one UDP packet via recvmsg (blocking, to get cmsg for original dst)
-            let mut buf = vec![0u8; MAX_UDP_SIZE];
-            let mut cmsg_buf = vec![0u8; CMSG_BUFFER_SIZE];
-
-            // Use select! to allow immediate shutdown even when blocked on recvmsg
-            let recv_fut = tokio::task::spawn_blocking(move || {
-                let mut iov = libc::iovec {
-                    iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: buf.len(),
-                };
-
-                let mut msg_name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-                let mut msg = libc::msghdr {
-                    msg_name: &mut msg_name as *mut _ as *mut libc::c_void,
-                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
-                    msg_iov: &mut iov,
-                    msg_iovlen: 1,
-                    msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
-                    msg_controllen: cmsg_buf.len() as libc::size_t,
-                    msg_flags: 0,
-                };
-
-                let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
-                if n < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        return Ok::<_, anyhow::Error>((
-                            0usize,
-                            buf,
-                            None::<SocketAddr>,
-                            None::<SocketAddr>,
-                        ));
-                    }
-                    return Err(anyhow::anyhow!("recvmsg failed: {}", err));
-                }
-
-                let n = n as usize;
-
-                // Parse peer address (source of the intercepted packet)
-                let peer_addr = match msg.msg_namelen {
-                    0 => None,
-                    _ => {
-                        let ss_ptr = msg.msg_name as *const libc::sockaddr_storage;
-                        let storage = unsafe { &*ss_ptr };
-                        match storage.ss_family as libc::c_int {
-                            libc::AF_INET => {
-                                let addr =
-                                    unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
-                                let ip =
-                                    std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
-                                let port = u16::from_be_bytes(addr.sin_port.to_ne_bytes());
-                                Some(SocketAddr::new(ip.into(), port))
-                            }
-                            libc::AF_INET6 => {
-                                let addr =
-                                    unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
-                                let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
-                                let port = u16::from_be_bytes(addr.sin6_port.to_ne_bytes());
-                                Some(SocketAddr::new(ip.into(), port))
-                            }
-                            _ => None,
-                        }
-                    }
-                };
-
-                // Parse original destination from cmsg (TProxy metadata)
-                let orig_dst = parse_orig_dst_from_cmsg(&cmsg_buf[..msg.msg_controllen]);
-
-                buf.truncate(n);
-                Ok((n, buf, peer_addr, orig_dst))
-            });
-
-            // Wait for either a packet or a stop signal
-            let result = tokio::select! {
-                result = recv_fut => result,
+            tokio::select! {
                 _ = stop_signal.notified() => {
                     info!("UDP TProxy listener stopping via signal");
                     break;
                 }
-            };
-
-            let (n, pkt_buf, peer_addr, orig_dst) = match result {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    warn!("UDP recvmsg error: {}", e);
-                    continue;
-                }
-                Err(e) => {
-                    warn!("UDP spawn_blocking join error: {}", e);
-                    continue;
-                }
-            };
-
-            if n == 0 {
-                // WouldBlock
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-
-            let dest = match orig_dst {
-                Some(dst) => dst,
-                None => {
-                    warn!(
-                        "UDP TProxy: cannot determine original dest, peer={:?}",
-                        peer_addr
-                    );
-                    continue;
-                }
-            };
-
-            // Log every UDP packet: DNS queries get special treatment
-            let is_dns = dest.port() == 53 && n > 12;
-            if is_dns {
-                let qname = extract_dns_query_name(&pkt_buf);
-                info!(
-                    "DNS  {}:{} -> {} QUERY {}",
-                    peer_addr
-                        .map(|a| a.ip())
-                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                    peer_addr.map(|a| a.port()).unwrap_or(0),
-                    dest,
-                    qname.as_deref().unwrap_or("<parse-failed>"),
-                );
-            } else {
-                info!(
-                    "UDP  {}:{} -> {} {}bytes",
-                    peer_addr
-                        .map(|a| a.ip())
-                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                    peer_addr.map(|a| a.port()).unwrap_or(0),
-                    dest,
-                    n,
-                );
-            }
-
-            // ---- DNS hijacking: forward DNS queries to the internal DNS handler ----
-            // Only intercept UDP packets to port 53. The internal DNS handler
-            // listens on 169.254.0.1:<port> (IPv4) in the host NS. We use a
-            // separate IPv4 socket to talk to the handler, then create a
-            // second IP_TRANSPARENT socket bound to the original destination
-            // (the DNS server the client queried) so the response reaches the
-            // client with the expected source address.
-            if is_dns {
-                if let Some(handler_addr) = dns_forward_addr {
-                    let peer = peer_addr;
-                    let pkt = pkt_buf.clone();
-
-                    tokio::spawn(async move {
-                        // The TProxy UDP listener is dual-stack (AF_INET6), so an
-                        // IPv4 client appears as IPv4-mapped IPv6 (::ffff:...).
-                        // Canonicalize to a real IPv4/IPv6 SocketAddr so the
-                        // response socket family matches.
-                        let peer = peer.map(canonicalize_socket_addr);
-
-                        // 1. Send the query to the internal DNS handler. The handler
-                        //    is IPv4-only, so use an IPv4 socket bound to any port.
-                        let query_bind: SocketAddr = "0.0.0.0:0".parse().expect("valid IPv4 any addr");
-                        let query_socket = match create_marked_udp_socket(&query_bind, host_ns_fd).await {
-                            Some(s) => s,
-                            None => {
-                                warn!("DNS hijack: failed to create query socket for handler {}", handler_addr);
-                                return;
-                            }
-                        };
-
-                        if let Err(e) = query_socket.send_to(&pkt, handler_addr).await {
-                            debug!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
-                            return;
+                readable = async_fd.readable() => {
+                    let mut guard = match readable {
+                        Ok(g) => g,
+                        Err(e) => {
+                            warn!("UDP TProxy readable error: {}", e);
+                            continue;
                         }
+                    };
 
-                        // Wait for the handler's DNS response.
-                        let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
-                        let recv_fut = query_socket.recv_from(&mut recv_buf);
-                        let len = match tokio::time::timeout(std::time::Duration::from_secs(5), recv_fut).await {
-                            Ok(Ok((len, _))) => len,
-                            Ok(Err(e)) => {
-                                debug!("DNS hijack: recv from handler error: {}", e);
-                                return;
+                    let (n, peer_addr, orig_dst) =
+                        match recvmsg_with_cmsg(fd, &mut buf, &mut cmsg_buf) {
+                            Ok(r) => r,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                guard.clear_ready();
+                                continue;
                             }
-                            Err(_) => {
-                                debug!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
-                                return;
+                            Err(e) => {
+                                warn!("UDP recvmsg error: {}", e);
+                                guard.clear_ready();
+                                continue;
                             }
                         };
-                        recv_buf.truncate(len);
 
-                        // 2. Send the response back to the client from the original
-                        //    destination address (the DNS server it queried).
-                        if let Some(peer) = peer {
-                            let resp_socket = match create_marked_udp_socket(&dest, host_ns_fd).await {
-                                Some(s) => s,
-                                None => {
-                                    debug!("DNS hijack: failed to create response socket for {}", dest);
+                    let peer_addr = peer_addr.map(canonicalize_socket_addr);
+                    let dest = match orig_dst {
+                        Some(dst) => dst,
+                        None => {
+                            warn!(
+                                "UDP TProxy: cannot determine original dest, peer={:?}",
+                                peer_addr
+                            );
+                            guard.clear_ready();
+                            continue;
+                        }
+                    };
+
+                    // 包级日志（QUIC/游戏等高频 UDP 下 info 会刷屏，使用 debug）
+                    let is_dns = dest.port() == 53 && n > 12;
+                    if is_dns {
+                        let qname = extract_dns_query_name(&buf[..n]);
+                        debug!(
+                            "DNS  {}:{} -> {} QUERY {}",
+                            peer_addr
+                                .map(|a| a.ip())
+                                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                            peer_addr.map(|a| a.port()).unwrap_or(0),
+                            dest,
+                            qname.as_deref().unwrap_or("<parse-failed>"),
+                        );
+                    } else {
+                        debug!(
+                            "UDP  {}:{} -> {} {}bytes",
+                            peer_addr
+                                .map(|a| a.ip())
+                                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                            peer_addr.map(|a| a.port()).unwrap_or(0),
+                            dest,
+                            n,
+                        );
+                    }
+
+                    // ---- DNS hijacking: forward DNS queries to the internal DNS handler ----
+                    // Only intercept UDP packets to port 53. The internal DNS handler
+                    // listens on 169.254.0.1:<port> (IPv4) in the host NS. We use a
+                    // separate IPv4 socket to talk to the handler, then reuse a pooled
+                    // IP_TRANSPARENT socket bound to the original destination (the DNS
+                    // server the client queried) so the response reaches the client
+                    // with the expected source address.
+                    if is_dns {
+                        if let Some(handler_addr) = dns_forward_addr {
+                            let peer = peer_addr;
+                            let pkt = buf[..n].to_vec();
+                            let resp_socks = resp_socks.clone();
+
+                            tokio::spawn(async move {
+                                // 1. Send the query to the internal DNS handler. The handler
+                                //    is IPv4-only, so use an IPv4 socket bound to any port.
+                                let query_bind: SocketAddr =
+                                    "0.0.0.0:0".parse().expect("valid IPv4 any addr");
+                                let query_socket =
+                                    match create_marked_udp_socket(&query_bind, host_ns_fd).await
+                                    {
+                                        Some(s) => s,
+                                        None => {
+                                            warn!("DNS hijack: failed to create query socket for handler {}", handler_addr);
+                                            return;
+                                        }
+                                    };
+
+                                if let Err(e) = query_socket.send_to(&pkt, handler_addr).await {
+                                    debug!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
                                     return;
                                 }
-                            };
-                            if let Err(e) = resp_socket.send_to(&recv_buf, peer).await {
-                                debug!("DNS hijack: response send_to client {} failed: {}", peer, e);
+
+                                // Wait for the handler's DNS response.
+                                let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
+                                let recv_fut = query_socket.recv_from(&mut recv_buf);
+                                let len = match tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    recv_fut,
+                                )
+                                .await
+                                {
+                                    Ok(Ok((len, _))) => len,
+                                    Ok(Err(e)) => {
+                                        debug!("DNS hijack: recv from handler error: {}", e);
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        debug!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
+                                        return;
+                                    }
+                                };
+                                recv_buf.truncate(len);
+
+                                // 2. Send the response back to the client from the original
+                                //    destination address (the DNS server it queried),
+                                //    reusing the pooled transparent socket.
+                                if let Some(peer) = peer {
+                                    if let Some(resp_sock) =
+                                        resp_socks.get(&dest, host_ns_fd).await
+                                    {
+                                        if let Err(e) = resp_sock.send_to(&recv_buf, peer).await {
+                                            debug!("DNS hijack: response send_to client {} failed: {}", peer, e);
+                                        }
+                                    } else {
+                                        debug!("DNS hijack: failed to get response socket for {}", dest);
+                                    }
+                                }
+                            });
+                            guard.clear_ready();
+                            continue; // Skip SOCKS5 path for hijacked DNS
+                        }
+                    }
+
+                    // ---- SOCKS5 UDP ASSOCIATE path (non-DNS traffic) ----
+                    // 按 (dest, peer) 复用 flow：发送立即完成，响应由 flow 的
+                    // reader 任务回发（send 与 recv 解耦，不持锁等待）。
+                    let flows = flows.clone();
+                    let resp_socks = resp_socks.clone();
+                    let dialer = dialer.clone();
+                    let peer = peer_addr;
+                    let payload = buf[..n].to_vec();
+
+                    tokio::spawn(async move {
+                        let session = match flows
+                            .get_or_create(dest, peer, &dialer, &resp_socks, host_ns_fd)
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(
+                                    "UDP ASSOCIATE failed for {} -> {}: {}",
+                                    peer.map(|p| p.to_string()).unwrap_or_default(),
+                                    dest,
+                                    e
+                                );
+                                flows.remove(dest, peer).await;
+                                return;
                             }
+                        };
+
+                        // Build SOCKS5 UDP request: header + payload.
+                        // 发送无需持锁：tokio UdpSocket 的 send 可并发调用。
+                        let mut send_buf =
+                            UdpAssociateSession::build_udp_request_header(&dest, payload.len());
+                        send_buf.extend_from_slice(&payload);
+
+                        if let Err(e) = session.udp.send(&send_buf).await {
+                            debug!("UDP send to relay failed: {}", e);
+                            flows.remove(dest, peer).await;
                         }
                     });
-                    continue; // Skip SOCKS5 path for hijacked DNS
                 }
             }
-
-            // ---- SOCKS5 UDP ASSOCIATE path (non-DNS traffic) ----
-            // Spawn a task to forward this UDP packet via SOCKS5 and get response.
-            // Each task manages its own UDP ASSOCIATE session lifecycle.
-            let pool = pool.clone();
-            let dialer = dialer.clone();
-            let dest_str = dest.to_string();
-
-            tokio::spawn(async move {
-                let target = &dest_str;
-
-                // Get or create a UDP ASSOCIATE session for this destination
-                let session_result = pool.get_or_create(target, &dialer).await;
-                let session = match session_result {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("UDP ASSOCIATE failed for {}: {}", target, e);
-                        pool.remove(target).await;
-                        return;
-                    }
-                };
-
-                // Build SOCKS5 UDP request: header + payload
-                let header = UdpAssociateSession::build_udp_request_header(&dest, pkt_buf.len());
-                let mut send_buf = header;
-                send_buf.extend_from_slice(&pkt_buf);
-
-                // Send via the relay socket
-                let sess = session.lock().await;
-                if let Err(e) = sess.udp.send(&send_buf).await {
-                    warn!("UDP send to relay failed: {}", e);
-                    pool.remove(target).await;
-                    return;
-                }
-
-                // Try to read one response with a short timeout
-                let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
-                let read_fut = sess.udp.recv(&mut recv_buf);
-                match tokio::time::timeout(std::time::Duration::from_secs(5), read_fut).await {
-                    Ok(Ok(len)) => {
-                        recv_buf.truncate(len);
-                        // Parse SOCKS5 UDP response header to extract payload
-                        if let Some((_resp_peer, payload_offset)) =
-                            UdpAssociateSession::parse_udp_response_header(&recv_buf)
-                        {
-                            let payload = &recv_buf[payload_offset..];
-
-                            // DNS response logging
-                            if dest.port() == 53 && payload.len() > 12 {
-                                let qname = extract_dns_query_name(payload);
-                                info!(
-                                    "DNS  {} -> {}:{}",
-                                    qname.as_deref().unwrap_or("<parse-failed>"),
-                                    peer_addr.map(|a| a.ip()).unwrap_or(std::net::IpAddr::V4(
-                                        std::net::Ipv4Addr::UNSPECIFIED
-                                    )),
-                                    peer_addr.map(|a| a.port()).unwrap_or(0),
-                                );
-                            }
-
-                            // Send response back to original client.
-                            // Create a TProxy response socket bound to orig_dst (dest) with
-                            // IP_TRANSPARENT, so the response source address matches what the
-                            // client originally requested (not the proxy address).
-                            // The socket is created in the host NS when host_ns_fd is set.
-                            if let Some(peer) = peer_addr {
-                                if let Some(resp_sock) =
-                                    create_marked_udp_socket(&dest, host_ns_fd).await
-                                {
-                                    if let Err(e) = resp_sock.send_to(payload, peer).await {
-                                        debug!("UDP response send failed: {}", e);
-                                    }
-                                } else {
-                                    debug!("UDP response: failed to create TProxy response socket for {}", dest);
-                                }
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        debug!("UDP recv from relay: {}", e);
-                    }
-                    Err(_) => {
-                        // Timeout — this is normal, especially for DNS
-                        debug!("UDP relay response timeout for {}", dest);
-                    }
-                }
-            });
         }
 
         Ok(())
@@ -1565,6 +1746,236 @@ impl UdpTproxyListener {
         self.stop_signal.notify_one();
         info!("UDP TProxy listener stop signal sent");
     }
+}
+
+// ============================================================================
+// UDP flow 池 & 回包 socket 池
+// ============================================================================
+
+/// 一个 UDP relay flow：SOCKS5 UDP ASSOCIATE 会话 + 专属 reader 任务。
+///
+/// reader 任务持续从中继 socket 读取响应（SOCKS5 UDP header + payload），
+/// 解析后通过池化的透明回包 socket 发回对应客户端。这样发送方在 `send()`
+/// 后立即返回，同一 flow 的并发包不会被互斥锁串行化。
+struct UdpRelayFlow {
+    session: Arc<UdpAssociateSession>,
+    /// reader 任务句柄（空闲超时或出错时自行从池中移除自己）
+    #[allow(dead_code)]
+    reader: tokio::task::JoinHandle<()>,
+}
+
+/// SOCKS5 UDP flow 池，按 (原始目标地址, 客户端地址) 复用会话。
+///
+/// 以 (dest, peer) 为键是因为中继响应的 SOCKS5 header 中只有目标地址，
+/// 没有客户端信息；一个 flow 对应一个客户端，响应才能准确回发。
+struct UdpFlowPool {
+    inner: tokio::sync::Mutex<HashMap<(SocketAddr, Option<SocketAddr>), UdpRelayFlow>>,
+}
+
+impl UdpFlowPool {
+    fn new() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 获取或创建 (dest, peer) 对应的会话。
+    ///
+    /// 会话创建（TCP 握手 + ASSOCIATE）在锁外进行，仅插入时短暂持锁，
+    /// 避免并发创建同一 flow 时互相阻塞。
+    async fn get_or_create(
+        self: &Arc<Self>,
+        dest: SocketAddr,
+        peer: Option<SocketAddr>,
+        dialer: &Socks5Dialer,
+        resp_socks: &Arc<RespSocketPool>,
+        host_ns_fd: Option<RawFd>,
+    ) -> anyhow::Result<Arc<UdpAssociateSession>> {
+        let key = (dest, peer);
+        {
+            let map = self.inner.lock().await;
+            if let Some(flow) = map.get(&key) {
+                return Ok(flow.session.clone());
+            }
+        }
+
+        let session = Arc::new(dialer.udp_associate().await?);
+        let reader = Self::spawn_reader(
+            key,
+            session.clone(),
+            resp_socks.clone(),
+            host_ns_fd,
+            Arc::downgrade(self),
+        );
+        self.inner
+            .lock()
+            .await
+            .insert(key, UdpRelayFlow { session: session.clone(), reader });
+        Ok(session)
+    }
+
+    async fn remove(&self, dest: SocketAddr, peer: Option<SocketAddr>) {
+        self.inner.lock().await.remove(&(dest, peer));
+    }
+
+    /// 启动 flow 的 reader 任务：持续读取中继响应并回发客户端。
+    ///
+    /// 空闲超过 [`UDP_FLOW_IDLE_TIMEOUT`] 或中继 recv 出错时退出，并从池中
+    /// 移除自己（替代原先从未被调用的 `UdpEndpointPool::cleanup`）。
+    fn spawn_reader(
+        key: (SocketAddr, Option<SocketAddr>),
+        session: Arc<UdpAssociateSession>,
+        resp_socks: Arc<RespSocketPool>,
+        host_ns_fd: Option<RawFd>,
+        flows: std::sync::Weak<UdpFlowPool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (dest, peer) = key;
+            let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
+            loop {
+                let read = tokio::time::timeout(UDP_FLOW_IDLE_TIMEOUT, session.udp.recv(&mut recv_buf)).await;
+                let len = match read {
+                    Ok(Ok(len)) => len,
+                    Ok(Err(e)) => {
+                        debug!("UDP relay recv error for {}: {}", dest, e);
+                        break;
+                    }
+                    Err(_) => {
+                        debug!(
+                            "UDP relay flow idle, expiring: {} -> {}",
+                            peer.map(|p| p.to_string()).unwrap_or_default(),
+                            dest
+                        );
+                        break;
+                    }
+                };
+
+                if let Some((_resp_peer, payload_offset)) =
+                    UdpAssociateSession::parse_udp_response_header(&recv_buf[..len])
+                {
+                    let payload = &recv_buf[payload_offset..len];
+                    if let Some(peer) = peer {
+                        if let Some(sock) = resp_socks.get(&dest, host_ns_fd).await {
+                            if let Err(e) = sock.send_to(payload, peer).await {
+                                debug!("UDP response send failed: {}", e);
+                            }
+                        } else {
+                            debug!("UDP response: failed to get TProxy response socket for {}", dest);
+                        }
+                    }
+                }
+            }
+            // reader 退出（空闲/出错）：从池中移除自己
+            if let Some(flows) = flows.upgrade() {
+                flows.remove(dest, peer).await;
+            }
+        })
+    }
+}
+
+/// 透明回包 socket 池：按原始目标地址复用 IP_TRANSPARENT UDP socket。
+///
+/// 每个 dest 一个 socket，惰性创建（配置 host_ns_fd 时在宿主 NS 创建），
+/// LRU 容量上限防止无界增长。DNS 劫持回包与 SOCKS5 回包共用本池。
+struct RespSocketPool {
+    inner: Mutex<VecDeque<(SocketAddr, Arc<UdpSocket>)>>,
+}
+
+impl RespSocketPool {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// 获取 dest 对应的回包 socket；不存在则创建并缓存。
+    async fn get(
+        &self,
+        dest: &SocketAddr,
+        host_ns_fd: Option<RawFd>,
+    ) -> Option<Arc<UdpSocket>> {
+        // 快路径：池中已有（不持锁跨 await）
+        {
+            let mut m = self.inner.lock().unwrap();
+            if let Some(i) = m.iter().position(|(d, _)| d == dest) {
+                let (_, sock) = m.remove(i).unwrap();
+                m.push_back((*dest, sock.clone()));
+                return Some(sock);
+            }
+        }
+
+        // 慢路径：创建（可能在宿主 NS 中 setns，不能持锁）
+        let sock = Arc::new(create_marked_udp_socket(dest, host_ns_fd).await?);
+        let mut m = self.inner.lock().unwrap();
+        if let Some(i) = m.iter().position(|(d, _)| d == dest) {
+            // 并发创建竞态：其他人已插入，直接用已有的
+            return Some(m[i].1.clone());
+        }
+        m.push_back((*dest, sock.clone()));
+        while m.len() > RESP_SOCKET_POOL_CAP {
+            m.pop_front();
+        }
+        Some(sock)
+    }
+}
+
+/// 非阻塞 recvmsg：返回 `(字节数, 对端地址, 原始目标地址)`。
+///
+/// 通过辅助数据（cmsg）获取 TProxy 的原始目标地址；fd 必须是非阻塞的。
+fn recvmsg_with_cmsg(
+    fd: RawFd,
+    buf: &mut [u8],
+    cmsg_buf: &mut [u8],
+) -> std::io::Result<(usize, Option<SocketAddr>, Option<SocketAddr>)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+
+    let mut msg_name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    // 使用 zeroed + 字段赋值而不是结构体字面量：
+    // musl 的 msghdr 包含私有字段（如 x86_64 上的 __pad1/__pad2），无法用字面量构造
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &mut msg_name as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    // musl 与 glibc 的 msg_controllen 类型不同（int vs size_t），用类型推断
+    msg.msg_controllen = cmsg_buf.len() as _;
+    msg.msg_flags = 0;
+
+    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let n = n as usize;
+
+    let peer_addr = match msg.msg_namelen {
+        0 => None,
+        _ => {
+            let ss_ptr = msg.msg_name as *const libc::sockaddr_storage;
+            let storage = unsafe { &*ss_ptr };
+            match storage.ss_family as libc::c_int {
+                libc::AF_INET => {
+                    let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+                    let ip = std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+                    let port = u16::from_be_bytes(addr.sin_port.to_ne_bytes());
+                    Some(SocketAddr::new(ip.into(), port))
+                }
+                libc::AF_INET6 => {
+                    let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+                    let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+                    let port = u16::from_be_bytes(addr.sin6_port.to_ne_bytes());
+                    Some(SocketAddr::new(ip.into(), port))
+                }
+                _ => None,
+            }
+        }
+    };
+
+    let orig_dst = parse_orig_dst_from_cmsg(&cmsg_buf[..msg.msg_controllen as usize]);
+    Ok((n, peer_addr, orig_dst))
 }
 
 /// Convert an IPv4-mapped IPv6 socket address back to a pure IPv4 address.

@@ -2383,18 +2383,38 @@ impl EbpfManager {
     /// BPF ARRAY maps are zero-initialized, but `wan_outbound_is_alive()` in
     /// tproxy.c treats 0 as dead. Without this initialization, ALL proxied
     /// traffic is SHOT (dropped) until the first connectivity check writes 1.
+    ///
+    /// Uses the ARRAY whole-map update (key = -1) to write all 1536 entries
+    /// with a single syscall instead of 1536 individual updates; falls back
+    /// to per-key updates if the kernel rejects the batch write.
     pub fn init_outbound_connectivity_map(&mut self) -> Result<()> {
         let start = std::time::Instant::now();
         let map = self.get_map_mut("outbound_connectivity_map")?;
-        let one: u32 = 1;
-        // Initialize all 1536 entries (256 outbounds * 3 domains * 2 ipversions)
-        for key in 0u32..1536 {
-            map.update(&key.to_ne_bytes(), &one.to_ne_bytes(), MapFlags::empty())?;
+        // 256 outbounds * 3 domains * 2 ipversions
+        let whole: [u32; 1536] = [1; 1536];
+        if map
+            .update(
+                &(-1i32).to_ne_bytes(),
+                bytemuck::cast_slice(&whole),
+                MapFlags::empty(),
+            )
+            .is_ok()
+        {
+            debug!(
+                "outbound_connectivity_map initialized via whole-map update (1536 entries): {}ms",
+                start.elapsed().as_millis()
+            );
+        } else {
+            // Fallback: per-key updates (older kernels / unexpected map size)
+            let one: u32 = 1;
+            for key in 0u32..1536 {
+                map.update(&key.to_ne_bytes(), &one.to_ne_bytes(), MapFlags::empty())?;
+            }
+            debug!(
+                "outbound_connectivity_map initialized via per-key updates (1536 entries): {}ms",
+                start.elapsed().as_millis()
+            );
         }
-        debug!(
-            "outbound_connectivity_map initialized (1536 entries): {}ms",
-            start.elapsed().as_millis()
-        );
         info!("Initialized outbound_connectivity_map (all outbounds alive)");
         Ok(())
     }

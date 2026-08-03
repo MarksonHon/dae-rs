@@ -52,6 +52,14 @@ const IP_TRANSPARENT: libc::c_int = 19;
 /// `IPV6_TRANSPARENT` socket 选项值（Linux）
 const IPV6_TRANSPARENT: libc::c_int = 75;
 
+/// 设置 TCP_NODELAY 禁用 Nagle 算法（代理路径小包延迟关键，失败非致命）。
+fn set_tcp_nodelay(stream: &TcpStream) {
+    use socket2::SockRef;
+    if let Err(e) = SockRef::from(stream).set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY on proxy connection: {}", e);
+    }
+}
+
 /// 在宿主网络命名空间中同步执行闭包，并在执行后恢复当前命名空间。
 ///
 /// 由于 `protocols` crate 不能依赖 `control` crate，这里使用裸 libc 调用实现，
@@ -184,10 +192,12 @@ impl Socks5Dialer {
     /// internal address `169.254.0.11`. This matches kdae's behavior.
     async fn connect_with_mark(&self) -> Result<TcpStream, Socks5Error> {
         if self.self_mark == 0 && self.host_ns_fd.is_none() {
-            return timeout(self.dial_timeout, TcpStream::connect(&self.proxy_addr))
+            let stream = timeout(self.dial_timeout, TcpStream::connect(&self.proxy_addr))
                 .await
                 .map_err(|_| Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr)))?
-                .map_err(Socks5Error::Io);
+                .map_err(Socks5Error::Io)?;
+            set_tcp_nodelay(&stream);
+            return Ok(stream);
         }
 
         let domain = if self.proxy_addr.is_ipv4() {
@@ -284,6 +294,10 @@ impl Socks5Dialer {
         if let Ok(Some(err)) = tokio_stream.take_error() {
             return Err(Socks5Error::Io(err));
         }
+
+        // 禁用 Nagle（TCP_NODELAY）：代理路径的小包（SSH、游戏、API）不受 40ms
+        // 延迟合并影响，与入站侧设置保持一致。
+        set_tcp_nodelay(&tokio_stream);
 
         Ok(tokio_stream)
     }

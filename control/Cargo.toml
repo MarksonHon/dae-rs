@@ -7,7 +7,11 @@ edition = "2021"
 # libbpf-rs: 用户空间 eBPF 管理（替代 aya）
 libbpf-rs = "0.24"
 # libbpf-sys: libbpf C 库的 Rust FFI 绑定
-libbpf-sys = "1.4"
+# 统一启用 vendored（libbpf + elfutils libelf + zlib 全部由 zig cc 从源码构建、静态链接）：
+# - 交叉编译（musl / aarch64-gnu）时宿主机的 libelf/libz 是 glibc/x86_64 的，无法使用
+# - x86_64-gnu 时系统头文件与 zig 内置 glibc 版本不一致会引发 __isoc23_* 符号缺失，
+#   因此 gnu 目标也不依赖系统 libelf，保证所有 Linux 目标构建行为一致
+libbpf-sys = { version = "1.4", features = ["vendored"] }
 # 安全地进行结构体↔字节转换
 bytemuck = { version = "1", features = ["derive"] }
 
@@ -30,6 +34,9 @@ tower-http = { version = "0.7", features = ["cors", "auth", "trace"] }
 chrono = "0.4"
 shared = { path = "../shared" }
 protocols = { path = "../protocols" }
+
+# 交叉编译需要宿主安装 autotools：autoreconf/autopoint/flex/bison/gawk（musl 构建额外需要
+# musl 版 argp/fts/obstack，见 .github/workflows/build.yml 中的 musl-deps 步骤）
 
 [build-dependencies]
 libbpf-cargo = "0.24"

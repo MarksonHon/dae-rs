@@ -43,5 +43,14 @@ control = { path = "control" }
 protocols = { path = "protocols" }
 shared = { path = "shared" }
 
+# 全局内存分配器（dae-rs 仅支持 Linux）
+# gnu 目标使用 jemalloc（多线程下性能好、碎片少）
+# musl 目标使用 mimalloc（轻量且与 musl 兼容）
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
+
+[target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [profile.release]
 strip = true

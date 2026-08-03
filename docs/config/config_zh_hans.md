@@ -109,10 +109,17 @@ dns { ... }
 
 #### 节点（nodes）
 
-每个节点是一个代理服务器条目：
+每个节点是一个代理服务器条目。有两种定义节点的方式：
+
+1. **显式字段** - 直接定义所有参数
+2. **导入（import）** - 使用订阅/链接 URL
+
+> **import 行为**：当使用 `import` 时，同一节点内的其他字段被忽略。
+> 如果同时存在 `import` 和其他字段，日志会发出警告。
 
 ```
 nodes {
+  # 显式字段
   main {
     protocol: socks5
     address: 127.0.0.1:1080
@@ -121,6 +128,7 @@ nodes {
     dial_timeout_ms: 5000
   }
 
+  # 从链接导入
   backup {
     import: 'socks5://127.0.0.1:2080'
   }
@@ -129,11 +137,33 @@ nodes {
 
 | 字段 | 说明 |
 |------|------|
-| `protocol` | 出站协议。**阶段一仅支持 `socks5`。** |
+| `protocol` | 出站协议（见下方支持的协议）。 |
 | `address` | 服务器地址 `host:port`。 |
-| `username` / `password` | 可选 SOCKS5 认证。 |
+| `username` / `password` | 可选认证（取决于协议）。 |
 | `dial_timeout_ms` | 拨号超时（毫秒），默认 `5000`。 |
-| `import` | 节点定义的简写形式，仅接受 `socks5://` / `socks://` URL；与显式字段互斥。 |
+| `import` | 节点定义的简写形式，接受协议 URL；与显式字段互斥。 |
+
+#### 支持的协议
+
+| 协议 | `protocol` 值 | 文档 |
+|------|---------------|------|
+| SOCKS5 | `socks5` | [SOCKS5](../config/config_zh_hans.md) |
+| Shadowsocks | `shadowsocks` | [Shadowsocks](../protocols/shadowsocks/shadowsocks_zh_hans.md) |
+| Trojan | `trojan` | [Trojan](../protocols/trojan/trojan_zh_hans.md) |
+| TUIC v5 | `tuic` | [TUIC](../protocols/tuic/tuic_zh_hans.md) |
+| Juicity | `juicity` | [Juicity](../protocols/juicity/juicity_zh_hans.md) |
+| VMess | `vmess` | [VMess](../protocols/vmess/vmess_zh_hans.md) |
+
+#### TLS 证书固定
+
+对于使用 TLS 的协议（Trojan、TUIC、Juicity、VMess），可以固定服务器证书
+的 SHA256 指纹：
+
+```
+ca_sha256: "fb3a01e4..."
+```
+
+**重要**：证书验证是**强制的**，无法禁用。dae-rs 中没有 `skip_cert_verify` 选项。
 
 #### 分组（groups）
 

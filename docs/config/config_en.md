@@ -116,10 +116,17 @@ The `match` block supports `comm(name1, name2)`, `pid(1234)`, `tgid(1234)`.
 
 #### Nodes
 
-Each node is a proxy server entry:
+Each node is a proxy server entry. There are two ways to define a node:
+
+1. **Explicit fields** - Define all parameters directly
+2. **Import** - Use a subscription/link URL
+
+> **Import behavior**: When `import` is used, all other fields in the same node
+> are ignored. If both `import` and other fields are present, a warning is logged.
 
 ```
 nodes {
+  # Explicit fields
   main {
     protocol: socks5
     address: 127.0.0.1:1080
@@ -128,6 +135,7 @@ nodes {
     dial_timeout_ms: 5000
   }
 
+  # Import from link
   backup {
     import: 'socks5://127.0.0.1:2080'
   }
@@ -136,11 +144,34 @@ nodes {
 
 | Field | Description |
 |-------|-------------|
-| `protocol` | Outbound protocol. **Phase 1 only supports `socks5`.** |
+| `protocol` | Outbound protocol (see Supported Protocols below). |
 | `address` | Server address `host:port`. |
-| `username` / `password` | Optional SOCKS5 auth. |
+| `username` / `password` | Optional auth (protocol-dependent). |
 | `dial_timeout_ms` | Dial timeout in milliseconds (default `5000`). |
-| `import` | Shorthand for a full node definition; only `socks5://` / `socks://` URLs are accepted. Mutually exclusive with explicit fields. |
+| `import` | Shorthand for a full node definition; accepts protocol URLs. Mutually exclusive with explicit fields. |
+
+#### Supported Protocols
+
+| Protocol | `protocol` value | Documentation |
+|----------|-----------------|---------------|
+| SOCKS5 | `socks5` | [SOCKS5](../config/config_en.md) |
+| Shadowsocks | `shadowsocks` | [Shadowsocks](../protocols/shadowsocks/shadowsocks_en.md) |
+| Trojan | `trojan` | [Trojan](../protocols/trojan/trojan_en.md) |
+| TUIC v5 | `tuic` | [TUIC](../protocols/tuic/tuic_en.md) |
+| Juicity | `juicity` | [Juicity](../protocols/juicity/juicity_en.md) |
+| VMess | `vmess` | [VMess](../protocols/vmess/vmess_en.md) |
+
+#### TLS Certificate Pinning
+
+For protocols that use TLS (Trojan, TUIC, Juicity, VMess), you can pin the
+server certificate's SHA256 fingerprint:
+
+```
+ca_sha256: "fb3a01e4..."
+```
+
+**Important**: Certificate verification is **mandatory** and cannot be disabled.
+The `skip_cert_verify` option is not available in dae-rs.
 
 #### Groups
 

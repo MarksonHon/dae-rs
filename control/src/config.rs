@@ -608,16 +608,78 @@ pub enum NodeSelector {
 pub struct OutboundNodeConfig {
     /// Node name (must be unique within the config)
     pub name: String,
-    /// Outbound protocol (Phase 1 only supports socks5)
+    /// Outbound protocol (socks5, shadowsocks, trojan, tuic, juicity, vmess)
     pub protocol: String,
     /// Node address (host:port)
     pub address: String,
+    /// Import URL (mutually exclusive with explicit fields)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<String>,
+
+    // ── SOCKS5 ──
     /// Optional SOCKS5 username
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// Optional SOCKS5 password
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+
+    // ── Shadowsocks ──
+    /// Shadowsocks cipher
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cipher: Option<String>,
+
+    // ── Trojan ──
+    /// TLS SNI
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// Certificate SHA256 fingerprint for pinning
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_sha256: Option<String>,
+
+    // ── TUIC / Juicity ──
+    /// User UUID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Congestion control (TUIC)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub congestion_control: Option<String>,
+    /// ALPN protocols
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpn: Option<Vec<String>>,
+
+    // ── VMess ──
+    /// VMess security / encryption
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<String>,
+    /// VMess alter_id
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alter_id: Option<u32>,
+    /// VMess transport network
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+
+    // ── VMess WebSocket ──
+    /// WebSocket path
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_path: Option<String>,
+    /// WebSocket headers
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_headers: Option<std::collections::HashMap<String, String>>,
+
+    // ── VMess HTTP/2 ──
+    /// HTTP/2 path
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_path: Option<String>,
+    /// HTTP/2 host
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_host: Option<String>,
+
+    // ── VMess gRPC ──
+    /// gRPC service name
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc_service_name: Option<String>,
+
     /// Dial timeout (milliseconds)
     #[serde(default = "default_dial_timeout")]
     pub dial_timeout_ms: u64,
@@ -821,8 +883,23 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
         name: String::new(),
         protocol: String::new(),
         address: String::new(),
+        import: None,
         username: None,
         password: None,
+        cipher: None,
+        sni: None,
+        ca_sha256: None,
+        uuid: None,
+        congestion_control: None,
+        alpn: None,
+        security: None,
+        alter_id: None,
+        network: None,
+        ws_path: None,
+        ws_headers: None,
+        h2_path: None,
+        h2_host: None,
+        grpc_service_name: None,
         dial_timeout_ms: 5000,
     };
     let mut current_node_has_protocol = false;
@@ -1075,8 +1152,23 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                             name: name.to_string(),
                             protocol: String::new(),
                             address: String::new(),
+                            import: None,
                             username: None,
                             password: None,
+                            cipher: None,
+                            sni: None,
+                            ca_sha256: None,
+                            uuid: None,
+                            congestion_control: None,
+                            alpn: None,
+                            security: None,
+                            alter_id: None,
+                            network: None,
+                            ws_path: None,
+                            ws_headers: None,
+                            h2_path: None,
+                            h2_host: None,
+                            grpc_service_name: None,
                             dial_timeout_ms: 5000,
                         };
                         current_node_has_protocol = false;
@@ -1100,8 +1192,23 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         name: String::new(),
                         protocol: String::new(),
                         address: String::new(),
+                        import: None,
                         username: None,
                         password: None,
+                        cipher: None,
+                        sni: None,
+                        ca_sha256: None,
+                        uuid: None,
+                        congestion_control: None,
+                        alpn: None,
+                        security: None,
+                        alter_id: None,
+                        network: None,
+                        ws_path: None,
+                        ws_headers: None,
+                        h2_path: None,
+                        h2_host: None,
+                        grpc_service_name: None,
                         dial_timeout_ms: 5000,
                     });
 

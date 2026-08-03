@@ -20,7 +20,7 @@
   "outbounds": {
     "nodes": [
       {
-        "name": "main",
+        "name": "socks5_node",
         "protocol": "socks5",
         "params": {
           "address": "127.0.0.1:1080",
@@ -30,12 +30,134 @@
         }
       },
       {
-        "name": "backup",
-        "protocol": "socks5",
+        "name": "ss2022_node",
+        "protocol": "shadowsocks",
         "params": {
-          "address": "127.0.0.1:2080",
-          "username": "",
-          "password": "",
+          "address": "server.example.com:8388",
+          "cipher": "2022-blake3-aes-256-gcm",
+          "password": "your-psk-here",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "ss_aead_node",
+        "protocol": "shadowsocks",
+        "params": {
+          "address": "server.example.com:8388",
+          "cipher": "aes-256-gcm",
+          "password": "your-password",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "trojan_node",
+        "protocol": "trojan",
+        "params": {
+          "address": "server.example.com:443",
+          "password": "your-password",
+          "sni": "server.example.com",
+          "ca_sha256": "",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "tuic_node",
+        "protocol": "tuic",
+        "params": {
+          "address": "server.example.com:443",
+          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+          "password": "your-password",
+          "congestion_control": "bbr",
+          "alpn": ["h3"],
+          "sni": "server.example.com",
+          "ca_sha256": "",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "juicity_node",
+        "protocol": "juicity",
+        "params": {
+          "address": "server.example.com:443",
+          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+          "password": "your-password",
+          "sni": "server.example.com",
+          "ca_sha256": "",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "vmess_tcp_node",
+        "protocol": "vmess",
+        "params": {
+          "address": "server.example.com:443",
+          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+          "security": "auto",
+          "alter_id": 0,
+          "network": "tcp",
+          "sni": "server.example.com",
+          "ca_sha256": "",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "vmess_ws_node",
+        "protocol": "vmess",
+        "params": {
+          "address": "server.example.com:80",
+          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+          "security": "none",
+          "alter_id": 0,
+          "network": "ws",
+          "ws_path": "/ws",
+          "ws_headers": { "Host": "example.com" },
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "vmess_ws_tls_node",
+        "protocol": "vmess",
+        "params": {
+          "address": "server.example.com:443",
+          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+          "security": "none",
+          "alter_id": 0,
+          "network": "ws",
+          "ws_path": "/ws",
+          "ws_headers": { "Host": "example.com" },
+          "sni": "server.example.com",
+          "ca_sha256": "",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "vmess_h2_node",
+        "protocol": "vmess",
+        "params": {
+          "address": "server.example.com:443",
+          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+          "security": "none",
+          "alter_id": 0,
+          "network": "h2",
+          "h2_path": "/h2",
+          "h2_host": "example.com",
+          "sni": "server.example.com",
+          "ca_sha256": "",
+          "dial_timeout_ms": 5000
+        }
+      },
+      {
+        "name": "vmess_grpc_node",
+        "protocol": "vmess",
+        "params": {
+          "address": "server.example.com:443",
+          "uuid": "d0529668-8835-11ec-a8a3-0242ac120002",
+          "security": "none",
+          "alter_id": 0,
+          "network": "grpc",
+          "grpc_service_name": "grpc",
+          "sni": "server.example.com",
+          "ca_sha256": "",
           "dial_timeout_ms": 5000
         }
       }

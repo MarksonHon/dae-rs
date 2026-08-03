@@ -28,17 +28,155 @@ process_exclusion {
 
 outbounds {
   nodes {
-    main {
+    # ── SOCKS5 ──
+    socks5_node {
       protocol: socks5
       address: 127.0.0.1:1080
       #username: user
       #password: pass
       dial_timeout_ms: 5000
     }
+    # socks5_import {
+    #   import: 'socks5://127.0.0.1:2080'
+    # }
 
-    backup {
-      import: 'socks5://127.0.0.1:2080'
+    # ── Shadowsocks ──
+    # 2022 Edition (Recommended)
+    ss2022_node {
+      protocol: shadowsocks
+      address: server.example.com:8388
+      cipher: 2022-blake3-aes-256-gcm
+      password: your-psk-here
+      dial_timeout_ms: 5000
     }
+    # AEAD (Legacy)
+    ss_aead_node {
+      protocol: shadowsocks
+      address: server.example.com:8388
+      cipher: aes-256-gcm
+      password: your-password
+      dial_timeout_ms: 5000
+    }
+    # ss_import {
+    #   import: 'ss://2022-blake3-aes-256-gcm:password@server.example.com:8388'
+    # }
+
+    # ── Trojan ──
+    trojan_node {
+      protocol: trojan
+      address: server.example.com:443
+      password: your-password
+      sni: server.example.com
+      # ca_sha256: "fb3a01e4..." # Pin certificate SHA256 fingerprint
+      dial_timeout_ms: 5000
+    }
+    # trojan_import {
+    #   import: 'trojan://password@server.example.com:443?sni=example.com'
+    # }
+
+    # ── TUIC v5 (compatible with mihomo) ──
+    tuic_node {
+      protocol: tuic
+      address: server.example.com:443
+      uuid: d0529668-8835-11ec-a8a3-0242ac120002
+      password: your-password
+      congestion_control: bbr
+      alpn: h3
+      sni: server.example.com
+      # ca_sha256: "fb3a01e4..." # Pin certificate SHA256 fingerprint
+      dial_timeout_ms: 5000
+    }
+    # tuic_import {
+    #   import: 'tuic://uuid:password@server.example.com:443?congestion_control=bbr&alpn=h3'
+    # }
+
+    # ── Juicity ──
+    juicity_node {
+      protocol: juicity
+      address: server.example.com:443
+      uuid: d0529668-8835-11ec-a8a3-0242ac120002
+      password: your-password
+      sni: server.example.com
+      # ca_sha256: "fb3a01e4..." # Pin certificate SHA256 fingerprint
+      dial_timeout_ms: 5000
+    }
+    # juicity_import {
+    #   import: 'juicity://uuid:password@server.example.com:443'
+    # }
+
+    # ── VMess (AEAD authentication) ──
+    # TCP transport (default)
+    vmess_tcp_node {
+      protocol: vmess
+      address: server.example.com:443
+      uuid: d0529668-8835-11ec-a8a3-0242ac120002
+      security: auto  # auto | aes-128-gcm | chacha20-poly1305 | none
+      alter_id: 0
+      sni: server.example.com
+      # ca_sha256: "fb3a01e4..." # Pin certificate SHA256 fingerprint
+      dial_timeout_ms: 5000
+    }
+    # WebSocket transport
+    vmess_ws_node {
+      protocol: vmess
+      address: server.example.com:80
+      uuid: d0529668-8835-11ec-a8a3-0242ac120002
+      security: none
+      alter_id: 0
+      network: ws
+      ws_path: /ws
+      ws_headers: { "Host": "example.com" }
+      dial_timeout_ms: 5000
+    }
+    # WebSocket + TLS transport (WSS)
+    vmess_ws_tls_node {
+      protocol: vmess
+      address: server.example.com:443
+      uuid: d0529668-8835-11ec-a8a3-0242ac120002
+      security: none  # Use TLS instead of VMess encryption
+      alter_id: 0
+      network: ws
+      ws_path: /ws
+      ws_headers: { "Host": "example.com" }
+      sni: server.example.com
+      # ca_sha256: "fb3a01e4..." # Pin certificate SHA256 fingerprint
+      dial_timeout_ms: 5000
+    }
+    # HTTP/2 transport (requires TLS)
+    vmess_h2_node {
+      protocol: vmess
+      address: server.example.com:443
+      uuid: d0529668-8835-11ec-a8a3-0242ac120002
+      security: none  # Use TLS instead of VMess encryption
+      alter_id: 0
+      network: h2
+      h2_path: /h2
+      h2_host: example.com
+      sni: server.example.com
+      # ca_sha256: "fb3a01e4..." # Pin certificate SHA256 fingerprint
+      dial_timeout_ms: 5000
+    }
+    # gRPC transport (requires TLS)
+    vmess_grpc_node {
+      protocol: vmess
+      address: server.example.com:443
+      uuid: d0529668-8835-11ec-a8a3-0242ac120002
+      security: none  # Use TLS instead of VMess encryption
+      alter_id: 0
+      network: grpc
+      grpc_service_name: grpc
+      sni: server.example.com
+      # ca_sha256: "fb3a01e4..." # Pin certificate SHA256 fingerprint
+      dial_timeout_ms: 5000
+    }
+    # vmess_import {
+    #   # Standard URI format
+    #   import: 'vmess://uuid@server.example.com:443?security=auto'
+    # }
+    # vmess_import_base64 {
+    #   # v2rayN base64 format: vmess://base64(json)
+    #   import: 'vmess://eyJ2IjoiMiIsInBzIjoi5Zu95LyB5LqM5L2T5L2N572uIiwicCI6IjExMS4xMTEuMTExLjExMSIsInBvcnQiOiIzMjAwMCIsImlkIjoiMTM4NmY4NWUtNjViYi00ZTZlLTlkNTYtNzhiYWRiNzVlMWZkIiwiYWlkIjoiMTAwIiwic2N5IjoiYXV0byIsIm5ldCI6IndzIiwidHlwZSI6Im5vbmUiLCJob3N0Ijoid3d3LmJiYi5jb20iLCJwYXRoIjoiLyIsInRscyI6InRscyIsInNuaSI6Ind3dy5jY2MubmV0IiwidmVyc2lvbiI6IjIifQ=='
+    # }
   }
 
   groups {

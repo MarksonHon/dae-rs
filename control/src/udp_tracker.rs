@@ -40,10 +40,10 @@ struct TrackedFlow {
 /// Used by `UdpTproxyListener` and the domain routing system to prevent
 /// the janitor from deleting UDP entries that are still in use.
 pub struct UdpConnStateTracker {
-    /// Flows currently retained (keyed by TuplesKey bytes).
-    retained: HashMap<Vec<u8>, TrackedFlow>,
+    /// Flows currently retained (keyed by TuplesKey directly — zero-copy).
+    retained: HashMap<TuplesKey, TrackedFlow>,
     /// Flows pending release (returned from BeginRelease, awaiting FinalizeRelease).
-    pending_release: HashSet<Vec<u8>>,
+    pending_release: HashSet<TuplesKey>,
 }
 
 impl UdpConnStateTracker {
@@ -59,9 +59,8 @@ impl UdpConnStateTracker {
     /// The janitor will not delete these entries from conn_state_map.
     pub fn retain(&mut self, keys: &[TuplesKey]) {
         let now = Instant::now();
-        for key in keys {
-            let bytes = bytemuck::bytes_of(key).to_vec();
-            let entry = self.retained.entry(bytes).or_insert_with(|| TrackedFlow {
+        for &key in keys {
+            let entry = self.retained.entry(key).or_insert_with(|| TrackedFlow {
                 created: now,
                 last_active: now,
             });
@@ -71,9 +70,8 @@ impl UdpConnStateTracker {
 
     /// Remove from retention (stop protecting from janitor).
     pub fn forget(&mut self, keys: &[TuplesKey]) {
-        for key in keys {
-            let bytes = bytemuck::bytes_of(key).to_vec();
-            self.retained.remove(&bytes);
+        for &key in keys {
+            self.retained.remove(&key);
         }
     }
 
@@ -81,13 +79,12 @@ impl UdpConnStateTracker {
     ///
     /// Returns the list of entries that are safe to delete from conn_state_map.
     /// The caller MUST call `finalize_release()` after deleting from the map.
-    pub fn begin_release(&mut self, keys: &[TuplesKey]) -> Vec<(Vec<u8>, TuplesKey)> {
+    pub fn begin_release(&mut self, keys: &[TuplesKey]) -> Vec<TuplesKey> {
         let mut releases = Vec::new();
-        for key in keys {
-            let bytes = bytemuck::bytes_of(key).to_vec();
-            if self.retained.remove(&bytes).is_some() {
-                self.pending_release.insert(bytes.clone());
-                releases.push((bytes, *key));
+        for &key in keys {
+            if self.retained.remove(&key).is_some() {
+                self.pending_release.insert(key);
+                releases.push(key);
             }
         }
         releases
@@ -95,16 +92,15 @@ impl UdpConnStateTracker {
 
     /// Finalize the release — clean up pending state after the caller
     /// has deleted the entries from conn_state_map.
-    pub fn finalize_release(&mut self, releases: &[(Vec<u8>, TuplesKey)]) {
-        for (bytes, _) in releases {
-            self.pending_release.remove(bytes);
+    pub fn finalize_release(&mut self, releases: &[TuplesKey]) {
+        for &key in releases {
+            self.pending_release.remove(&key);
         }
     }
 
     /// Check if a key is currently retained.
     pub fn is_retained(&self, key: &TuplesKey) -> bool {
-        let bytes = bytemuck::bytes_of(key);
-        self.retained.contains_key(bytes)
+        self.retained.contains_key(key)
     }
 
     /// Clean up expired retained entries.
@@ -113,15 +109,12 @@ impl UdpConnStateTracker {
         let now = Instant::now();
         let mut expired = Vec::new();
 
-        self.retained.retain(|bytes, flow| {
+        self.retained.retain(|&key, flow| {
             let age = now.duration_since(flow.created).as_secs();
             let idle = now.duration_since(flow.last_active).as_secs();
 
             if age > MAX_RETAIN_SECS || idle > MIN_RETAIN_SECS {
-                // This flow has expired — decode the key for returning
-                if let Some(key) = try_decode_tuples_key(bytes) {
-                    expired.push(key);
-                }
+                expired.push(key);
                 false // remove from retained
             } else {
                 true // keep
@@ -135,20 +128,16 @@ impl UdpConnStateTracker {
     pub fn len(&self) -> usize {
         self.retained.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.retained.is_empty()
+    }
 }
 
 impl Default for UdpConnStateTracker {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Try to decode a TuplesKey from raw bytes.
-fn try_decode_tuples_key(bytes: &[u8]) -> Option<TuplesKey> {
-    if bytes.len() < std::mem::size_of::<TuplesKey>() {
-        return None;
-    }
-    Some(bytemuck::pod_read_unaligned(bytes))
 }
 
 #[cfg(test)]

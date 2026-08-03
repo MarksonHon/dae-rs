@@ -63,7 +63,7 @@ fn main() {
     );
 
     let status = Command::new(&clang)
-        .args(&cflags)
+        .args(cflags)
         .status()
         .expect("Failed to execute clang. Is clang (≥14) installed?");
 

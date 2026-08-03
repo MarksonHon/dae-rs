@@ -6,7 +6,6 @@ pub mod handler;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::config::DnsConfig;
@@ -22,7 +21,7 @@ pub struct DnsManager {
     /// Upstream connection pool (label -> pool)
     upstream_pools: HashMap<String, Arc<DnsUpstreamPool>>,
     /// DNS response cache
-    cache: Arc<RwLock<DnsCache>>,
+    cache: Arc<std::sync::RwLock<DnsCache>>,
     /// DNS router (request matching)
     router: DnsRouter,
     /// DNS listener (UDP + TCP)
@@ -37,7 +36,7 @@ pub struct DnsManager {
 impl DnsManager {
     pub fn new(config: DnsConfig) -> Self {
         let router = DnsRouter::new(&config);
-        let cache = Arc::new(RwLock::new(DnsCache::new(&config.cache)));
+        let cache = Arc::new(std::sync::RwLock::new(DnsCache::new(&config.cache)));
 
         Self {
             config,

@@ -413,7 +413,7 @@ impl ControlPlane {
     ///    - Load eBPF object from bytecode file
     /// 3. **Attach TC programs** — Call [`EbpfManager::attach_tc()`]
     ///    - Attach ingress/egress programs to the host-side veth interface
-    /// 3.5. **Write eBPF maps** — Write exclusion list and routing rules
+    ///      3.5. **Write eBPF maps** — Write exclusion list and routing rules
     ///    - Compile process exclusion list from daefile config
     ///    - Compile routing rules from daefile config
     /// 4. **Start TProxy listener** — Start TProxy inside the proxy namespace
@@ -911,7 +911,7 @@ impl ControlPlane {
         {
             let cgroup_fd = unsafe {
                 libc::open(
-                    b"/sys/fs/cgroup\0".as_ptr() as *const libc::c_char,
+                    c"/sys/fs/cgroup".as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY,
                 )
             };
@@ -940,7 +940,7 @@ impl ControlPlane {
             self.netns_mgr.join_proxy_ns()?;
             let cgroup_fd = unsafe {
                 libc::open(
-                    b"/sys/fs/cgroup\0".as_ptr() as *const libc::c_char,
+                    c"/sys/fs/cgroup".as_ptr(),
                     libc::O_RDONLY | libc::O_DIRECTORY,
                 )
             };
@@ -1104,10 +1104,7 @@ impl ControlPlane {
             ),
             Err(e) => warn!("Could not query default route: {}", e),
         }
-        match std::process::Command::new("ip").args(["link"]).output() {
-            Ok(o) => info!("Links:\n{}", String::from_utf8_lossy(&o.stdout)),
-            Err(_) => {}
-        }
+        if let Ok(o) = std::process::Command::new("ip").args(["link"]).output() { info!("Links:\n{}", String::from_utf8_lossy(&o.stdout)) }
 
         Ok(())
     }
@@ -1164,7 +1161,7 @@ impl ControlPlane {
             })?;
         debug!(listen_addr = %listen_addr, "TProxy listen address");
 
-        let socket_mark = 0x100u32;
+        let socket_mark = shared::DAE_SOCKET_MARK;
         debug!(socket_mark = format!("{:#x}", socket_mark), "Socket mark for eBPF self-exclusion");
         let tproxy_listener_mark = 0u32;
         debug!(
@@ -1280,7 +1277,7 @@ impl ControlPlane {
             // TProxy 必须运行在 daens 中，因为 eBPF 路由后的标记包
             // 通过 daens 的策略路由投递到本地 lo。
             let borrowed_fd = unsafe { BorrowedFd::borrow_raw(proxy_ns_fd) };
-            if let Err(e) = nix::sched::setns(&borrowed_fd, nix::sched::CloneFlags::CLONE_NEWNET) {
+            if let Err(e) = nix::sched::setns(borrowed_fd, nix::sched::CloneFlags::CLONE_NEWNET) {
                 error!("Failed to enter daens for TProxy listener: {}", e);
                 return;
             }
@@ -1631,7 +1628,7 @@ impl ControlPlane {
                 tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
 
                 // TCP health check: try marked (SO_MARK=0x100) first, then plain
-                let marked_result = connect_with_mark(&proxy_addr, 0x100, 5).await;
+                let marked_result = connect_with_mark(&proxy_addr, shared::DAE_SOCKET_MARK, 5).await;
                 let plain_result = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     tokio::net::TcpStream::connect(&proxy_addr),
@@ -1659,7 +1656,7 @@ impl ControlPlane {
                 if let Ok(Err(e)) = &plain_result {
                     info!("plain connect to {} err: {:?}", proxy_addr, e.kind());
                 }
-                if let Err(_) = &plain_result {
+                if plain_result.is_err() {
                     info!(
                         "plain connect to {}: timed out (network unreachable?)",
                         proxy_addr
@@ -1832,7 +1829,7 @@ impl ControlPlane {
         };
         let mut ebpf_guard = ebpf_mgr.lock().expect("ebpf lock");
         if let Ok(mut tracker_guard) = tracker.lock() {
-            tracker_guard.add_dns_result(domain, ip, ttl_secs, &mut *ebpf_guard)?;
+            tracker_guard.add_dns_result(domain, ip, ttl_secs, &mut ebpf_guard)?;
         }
         Ok(())
     }
@@ -1844,7 +1841,7 @@ impl ControlPlane {
         // because dae0peer interface only exists in proxy NS
         if let Ok(()) = self.netns_mgr.join_proxy_ns() {
             debug!("Detaching proxy NS hooks...");
-            let _ = self.ebpf().detach_by_iface(&self.netns_mgr.peer_if());
+            let _ = self.ebpf().detach_by_iface(self.netns_mgr.peer_if());
             let _ = self.netns_mgr.join_host_ns();
         } else {
             debug!("Could not join proxy NS for detach (may not exist)");

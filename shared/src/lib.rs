@@ -7,6 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// dae-rs 内部 socket 的 fwmark 值。
+///
+/// eBPF 程序通过 `pid_is_control_plane()` 和该 mark 识别代理自身发出的
+/// socket 流量并跳过（防止自我转发死循环）。必须与 TProxy（`SO_MARK`）和
+/// SOCKS5 拨号器使用的 mark 值保持一致。原版 dae 使用 `0x100`。
+pub const DAE_SOCKET_MARK: u32 = 0x100;
+
 /// 分流动作
 ///
 /// 规则匹配后的执行动作，决定流量去向。

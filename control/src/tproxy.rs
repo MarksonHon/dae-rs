@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
@@ -122,7 +121,7 @@ pub struct TproxyListener {
     /// 监听地址（在代理命名空间内，如 `0.0.0.0:15080`）
     listen_addr: SocketAddr,
     /// 出站拨号器
-    dialer: Arc<RwLock<Socks5Dialer>>,
+    dialer: Arc<Socks5Dialer>,
     /// 运行标记
     running: Arc<AtomicBool>,
     /// socket 标记值（用于 eBPF 自排除，默认 0x100）
@@ -141,9 +140,9 @@ impl TproxyListener {
     pub fn new(listen_addr: SocketAddr, dialer: Socks5Dialer) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(RwLock::new(dialer)),
+            dialer: Arc::new(dialer),
             running: Arc::new(AtomicBool::new(false)),
-            socket_mark: 0x100, // 原版 dae 默认值
+            socket_mark: shared::DAE_SOCKET_MARK, // 原版 dae 默认值
             stop_signal: Arc::new(Notify::new()),
         }
     }
@@ -152,7 +151,7 @@ impl TproxyListener {
     pub fn new_with_mark(listen_addr: SocketAddr, dialer: Socks5Dialer, socket_mark: u32) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(RwLock::new(dialer)),
+            dialer: Arc::new(dialer),
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
@@ -165,7 +164,7 @@ impl TproxyListener {
     }
 
     /// 获取出站拨号器的引用
-    pub fn dialer(&self) -> &Arc<RwLock<Socks5Dialer>> {
+    pub fn dialer(&self) -> &Arc<Socks5Dialer> {
         &self.dialer
     }
 
@@ -331,11 +330,7 @@ impl TproxyListener {
     /// [`stop()`](TproxyListener::stop) is called.
     pub async fn serve(&self, listener_v4: TcpListener, listener_v6: TcpListener) -> Result<()> {
         self.running.store(true, Ordering::SeqCst);
-        let proxy_addr = self
-            .dialer
-            .try_read()
-            .map(|d| d.proxy_addr.to_string())
-            .unwrap_or_else(|_| "locked".to_string());
+        let proxy_addr = self.dialer.proxy_addr.to_string();
         info!(
             listen_addr = %self.listen_addr,
             proxy_addr = %proxy_addr,
@@ -481,7 +476,7 @@ impl std::fmt::Debug for TproxyListener {
 /// # 参数
 ///
 /// * `inbound` — 从 TProxy 接收的客户端连接
-/// * `dialer` — SOCKS5 出站拨号器（受 Arc<RwLock<>> 保护）
+/// * `dialer` — SOCKS5 出站拨号器
 ///
 /// # 错误处理
 ///
@@ -491,7 +486,7 @@ impl std::fmt::Debug for TproxyListener {
 /// * 单个连接的错误不会影响监听器的其他连接
 async fn handle_connection(
     mut inbound: TcpStream,
-    dialer: Arc<RwLock<Socks5Dialer>>,
+    dialer: Arc<Socks5Dialer>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let peer_addr = inbound.peer_addr().ok();
@@ -509,10 +504,8 @@ async fn handle_connection(
     debug!(orig_dst = %orig_dst, "handle_connection: got original destination");
 
     // ---- 步骤 2：通过 SOCKS5 拨号到目标 ----
-    let dialer_guard = dialer.read().await;
-    let proxy_addr = dialer_guard.proxy_addr;
-    let dial_result = dialer_guard.dial(&orig_dst.to_string()).await;
-    drop(dialer_guard);
+    let proxy_addr = dialer.proxy_addr;
+    let dial_result = dialer.dial(&orig_dst.to_string()).await;
 
     debug!(
         orig_dst = %orig_dst,
@@ -731,6 +724,7 @@ pub fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::net::SocketAddr;
@@ -990,7 +984,7 @@ pub struct UdpTproxyListener {
     /// 监听地址（如 `0.0.0.0:15080` 或 `[::]:15080`）
     listen_addr: SocketAddr,
     /// 出站拨号器
-    dialer: Arc<RwLock<Socks5Dialer>>,
+    dialer: Arc<Socks5Dialer>,
     /// 运行标记
     running: Arc<AtomicBool>,
     /// socket 标记值（用于 eBPF 自排除，默认 0x100）
@@ -1014,9 +1008,9 @@ impl UdpTproxyListener {
     pub fn new(listen_addr: SocketAddr, dialer: Socks5Dialer) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(RwLock::new(dialer)),
+            dialer: Arc::new(dialer),
             running: Arc::new(AtomicBool::new(false)),
-            socket_mark: 0x100,
+            socket_mark: shared::DAE_SOCKET_MARK,
             stop_signal: Arc::new(Notify::new()),
             dns_forward_addr: None,
             host_ns_fd: None,
@@ -1027,7 +1021,7 @@ impl UdpTproxyListener {
     pub fn new_with_mark(listen_addr: SocketAddr, dialer: Socks5Dialer, socket_mark: u32) -> Self {
         Self {
             listen_addr,
-            dialer: Arc::new(RwLock::new(dialer)),
+            dialer: Arc::new(dialer),
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
@@ -1411,67 +1405,67 @@ impl UdpTproxyListener {
             // second IP_TRANSPARENT socket bound to the original destination
             // (the DNS server the client queried) so the response reaches the
             // client with the expected source address.
-            if is_dns && dns_forward_addr.is_some() {
-                let handler_addr = dns_forward_addr.unwrap();
-                let peer = peer_addr;
-                let dest = dest;
-                let pkt = pkt_buf.clone();
+            if is_dns {
+                if let Some(handler_addr) = dns_forward_addr {
+                    let peer = peer_addr;
+                    let pkt = pkt_buf.clone();
 
-                tokio::spawn(async move {
-                    // The TProxy UDP listener is dual-stack (AF_INET6), so an
-                    // IPv4 client appears as IPv4-mapped IPv6 (::ffff:...).
-                    // Canonicalize to a real IPv4/IPv6 SocketAddr so the
-                    // response socket family matches.
-                    let peer = peer.map(canonicalize_socket_addr);
+                    tokio::spawn(async move {
+                        // The TProxy UDP listener is dual-stack (AF_INET6), so an
+                        // IPv4 client appears as IPv4-mapped IPv6 (::ffff:...).
+                        // Canonicalize to a real IPv4/IPv6 SocketAddr so the
+                        // response socket family matches.
+                        let peer = peer.map(canonicalize_socket_addr);
 
-                    // 1. Send the query to the internal DNS handler. The handler
-                    //    is IPv4-only, so use an IPv4 socket bound to any port.
-                    let query_bind: SocketAddr = "0.0.0.0:0".parse().expect("valid IPv4 any addr");
-                    let query_socket = match create_marked_udp_socket(&query_bind, host_ns_fd).await {
-                        Some(s) => s,
-                        None => {
-                            warn!("DNS hijack: failed to create query socket for handler {}", handler_addr);
-                            return;
-                        }
-                    };
-
-                    if let Err(e) = query_socket.send_to(&pkt, handler_addr).await {
-                        debug!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
-                        return;
-                    }
-
-                    // Wait for the handler's DNS response.
-                    let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
-                    let recv_fut = query_socket.recv_from(&mut recv_buf);
-                    let len = match tokio::time::timeout(std::time::Duration::from_secs(5), recv_fut).await {
-                        Ok(Ok((len, _))) => len,
-                        Ok(Err(e)) => {
-                            debug!("DNS hijack: recv from handler error: {}", e);
-                            return;
-                        }
-                        Err(_) => {
-                            debug!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
-                            return;
-                        }
-                    };
-                    recv_buf.truncate(len);
-
-                    // 2. Send the response back to the client from the original
-                    //    destination address (the DNS server it queried).
-                    if let Some(peer) = peer {
-                        let resp_socket = match create_marked_udp_socket(&dest, host_ns_fd).await {
+                        // 1. Send the query to the internal DNS handler. The handler
+                        //    is IPv4-only, so use an IPv4 socket bound to any port.
+                        let query_bind: SocketAddr = "0.0.0.0:0".parse().expect("valid IPv4 any addr");
+                        let query_socket = match create_marked_udp_socket(&query_bind, host_ns_fd).await {
                             Some(s) => s,
                             None => {
-                                debug!("DNS hijack: failed to create response socket for {}", dest);
+                                warn!("DNS hijack: failed to create query socket for handler {}", handler_addr);
                                 return;
                             }
                         };
-                        if let Err(e) = resp_socket.send_to(&recv_buf, peer).await {
-                            debug!("DNS hijack: response send_to client {} failed: {}", peer, e);
+
+                        if let Err(e) = query_socket.send_to(&pkt, handler_addr).await {
+                            debug!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
+                            return;
                         }
-                    }
-                });
-                continue; // Skip SOCKS5 path for hijacked DNS
+
+                        // Wait for the handler's DNS response.
+                        let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
+                        let recv_fut = query_socket.recv_from(&mut recv_buf);
+                        let len = match tokio::time::timeout(std::time::Duration::from_secs(5), recv_fut).await {
+                            Ok(Ok((len, _))) => len,
+                            Ok(Err(e)) => {
+                                debug!("DNS hijack: recv from handler error: {}", e);
+                                return;
+                            }
+                            Err(_) => {
+                                debug!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
+                                return;
+                            }
+                        };
+                        recv_buf.truncate(len);
+
+                        // 2. Send the response back to the client from the original
+                        //    destination address (the DNS server it queried).
+                        if let Some(peer) = peer {
+                            let resp_socket = match create_marked_udp_socket(&dest, host_ns_fd).await {
+                                Some(s) => s,
+                                None => {
+                                    debug!("DNS hijack: failed to create response socket for {}", dest);
+                                    return;
+                                }
+                            };
+                            if let Err(e) = resp_socket.send_to(&recv_buf, peer).await {
+                                debug!("DNS hijack: response send_to client {} failed: {}", peer, e);
+                            }
+                        }
+                    });
+                    continue; // Skip SOCKS5 path for hijacked DNS
+                }
             }
 
             // ---- SOCKS5 UDP ASSOCIATE path (non-DNS traffic) ----
@@ -1482,11 +1476,10 @@ impl UdpTproxyListener {
             let dest_str = dest.to_string();
 
             tokio::spawn(async move {
-                let d = dialer.read().await;
                 let target = &dest_str;
 
                 // Get or create a UDP ASSOCIATE session for this destination
-                let session_result = pool.get_or_create(target, &d).await;
+                let session_result = pool.get_or_create(target, &dialer).await;
                 let session = match session_result {
                     Ok(s) => s,
                     Err(e) => {
@@ -1625,7 +1618,7 @@ async fn create_marked_udp_socket(
         }
 
         let one: libc::c_int = 1;
-        let mark_val: libc::c_int = 0x100;
+        let mark_val: libc::c_int = shared::DAE_SOCKET_MARK as libc::c_int;
 
         unsafe {
             // Set IP_TRANSPARENT / IPV6_TRANSPARENT to allow binding to non-local

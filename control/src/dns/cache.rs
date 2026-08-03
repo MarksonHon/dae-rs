@@ -129,4 +129,117 @@ impl DnsCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_cache_config() -> DnsCacheConfig {
+        DnsCacheConfig {
+            enabled: true,
+            max_size: 10,
+            max_ttl: 3600,
+            min_ttl: 10,
+            optimistic_cache: false,
+            optimistic_cache_ttl: 60,
+        }
+    }
+
+    #[test]
+    fn test_cache_hit_and_miss() {
+        let mut cache = DnsCache::new(&default_cache_config());
+        let key = DnsCache::cache_key("example.com", 1, 1);
+
+        // Miss
+        assert!(cache.lookup(key).is_none());
+
+        // Insert with TTL 60
+        cache.insert(key, vec![1, 2, 3, 4], 60);
+
+        // Hit
+        assert!(cache.lookup(key).is_some());
+        assert_eq!(cache.lookup(key).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_ttl_clamping() {
+        let config = DnsCacheConfig {
+            max_ttl: 100,
+            min_ttl: 20,
+            ..default_cache_config()
+        };
+        let mut cache = DnsCache::new(&config);
+        let key = DnsCache::cache_key("example.com", 1, 1);
+
+        // TTL 5 should be clamped to min_ttl=20
+        cache.insert(key, vec![1], 5);
+        let entry = cache.entries.get(&key).unwrap();
+        let ttl_secs = entry.deadline.duration_since(entry.created_at).as_secs();
+        assert!(ttl_secs >= 20 && ttl_secs <= 21);
+
+        // TTL 500 should be clamped to max_ttl=100
+        let key2 = DnsCache::cache_key("example.com", 28, 1);
+        cache.insert(key2, vec![2], 500);
+        let entry2 = cache.entries.get(&key2).unwrap();
+        let ttl2 = entry2.deadline.duration_since(entry2.created_at).as_secs();
+        assert!(ttl2 >= 100 && ttl2 <= 101);
+    }
+
+    #[test]
+    fn test_eviction_at_capacity() {
+        let config = DnsCacheConfig {
+            max_size: 3,
+            ..default_cache_config()
+        };
+        let mut cache = DnsCache::new(&config);
+
+        // Fill to capacity
+        for i in 0..3 {
+            let key = DnsCache::cache_key(&format!("host{}.com", i), 1, 1);
+            cache.insert(key, vec![i as u8], 60);
+        }
+        assert_eq!(cache.len(), 3);
+
+        // Insert one more — should evict oldest
+        let key_new = DnsCache::cache_key("new.com", 1, 1);
+        cache.insert(key_new, vec![99], 60);
+        assert_eq!(cache.len(), 3);
+        assert!(cache.lookup(key_new).is_some());
+    }
+
+    #[test]
+    fn test_cleanup_expired() {
+        let mut cache = DnsCache::new(&default_cache_config());
+        let key = DnsCache::cache_key("example.com", 1, 1);
+
+        // Insert with min TTL (10s) — it will expire quickly in cleanup
+        cache.insert(key, vec![1], 10);
+
+        // Force expiry by backdating created_at
+        if let Some(entry) = cache.entries.get_mut(&key) {
+            entry.created_at = Instant::now() - Duration::from_secs(60);
+            entry.deadline = Instant::now() - Duration::from_secs(1);
+        }
+
+        cache.cleanup_expired();
+        assert!(cache.lookup(key).is_none());
+    }
+
+    #[test]
+    fn test_disabled_cache() {
+        let config = DnsCacheConfig {
+            enabled: false,
+            ..default_cache_config()
+        };
+        let mut cache = DnsCache::new(&config);
+        let key = DnsCache::cache_key("example.com", 1, 1);
+
+        cache.insert(key, vec![1, 2, 3], 60);
+        assert!(cache.lookup(key).is_none());
+    }
 }

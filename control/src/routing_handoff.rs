@@ -164,7 +164,7 @@ impl RoutingHandoffConsumer {
                 }
             }
 
-            if entries.len() > 0 {
+            if !entries.is_empty() {
                 info!(
                     "RoutingHandoffConsumer: processed {} handoff entries",
                     entries.len()

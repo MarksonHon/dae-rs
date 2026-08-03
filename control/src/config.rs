@@ -390,6 +390,7 @@ pub struct DnsGroupConfig {
 /// Top-level DNS routing: which group handles which query
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub struct DnsRoutingConfig {
     /// Ordered list of DNS routing rules
     #[serde(default)]
@@ -398,14 +399,6 @@ pub struct DnsRoutingConfig {
     pub fallback: String,
 }
 
-impl Default for DnsRoutingConfig {
-    fn default() -> Self {
-        Self {
-            rules: Vec::new(),
-            fallback: String::new(),
-        }
-    }
-}
 
 /// DNS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,24 +630,23 @@ fn default_dial_timeout() -> u64 {
 /// Outbound group type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum GroupType {
     /// Auto-select nodes
+    #[default]
     Auto,
     /// Manually select nodes
     Select,
 }
 
-impl Default for GroupType {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 /// Outbound group node selection policy
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PolicyType {
     /// Always select the first alive node
+    #[default]
     Fixed,
     /// Randomly select an alive node
     Random,
@@ -666,11 +658,6 @@ pub enum PolicyType {
     MinMovingAvg,
 }
 
-impl Default for PolicyType {
-    fn default() -> Self {
-        Self::Fixed
-    }
-}
 
 /// Outbound group configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -694,6 +681,7 @@ pub struct OutboundGroupConfig {
 /// Outbound configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub struct OutboundsConfig {
     /// List of outbound nodes
     #[serde(default)]
@@ -703,14 +691,6 @@ pub struct OutboundsConfig {
     pub groups: Vec<OutboundGroupConfig>,
 }
 
-impl Default for OutboundsConfig {
-    fn default() -> Self {
-        Self {
-            nodes: Vec::new(),
-            groups: Vec::new(),
-        }
-    }
-}
 
 /// Single routing rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1802,11 +1782,7 @@ where
 /// Parse an import line: `import: 'url'` or `import: "url"`
 fn parse_import_line(line: &str) -> Option<String> {
     let line = line.trim();
-    if let Some(rest) = line.strip_prefix("import:").map(|s| s.trim()) {
-        Some(unquote(rest).to_string())
-    } else {
-        None
-    }
+    line.strip_prefix("import:").map(|s| s.trim()).map(|rest| unquote(rest).to_string())
 }
 
 /// Parse nodes(selector) syntax
@@ -1950,9 +1926,9 @@ fn preprocess_multiline(input: &str) -> String {
         let line = lines[i];
         let trimmed = line.trim_end();
 
-        if trimmed.ends_with('\\') {
+        if let Some(stripped) = trimmed.strip_suffix('\\') {
             // Remove the trailing backslash and merge with the next line(s)
-            result.push_str(&trimmed[..trimmed.len() - 1]);
+            result.push_str(stripped);
             i += 1;
         } else {
             result.push_str(line);
@@ -1964,12 +1940,6 @@ fn preprocess_multiline(input: &str) -> String {
     }
 
     result
-}
-
-/// Parse a hex string (e.g., `0x02000000`) to u32
-fn parse_hex(s: &str) -> std::result::Result<u32, std::num::ParseIntError> {
-    let s = s.trim().strip_prefix("0x").unwrap_or(s.trim());
-    u32::from_str_radix(s, 16)
 }
 
 /// Parse a boolean value
@@ -2317,11 +2287,10 @@ fn validate_api(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
             }
 
             // When tls: true, cert and key are required
-            if api.tls {
-                if api.cert.is_none() || api.key.is_none() {
+            if api.tls
+                && (api.cert.is_none() || api.key.is_none()) {
                     return Err(ConfigError::ApiTlsMissingCertKey);
                 }
-            }
         }
     }
     Ok(())
@@ -2418,13 +2387,12 @@ fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
     }
 
     // Validate top-level DNS routing references
-    if !dns.routing.fallback.is_empty() {
-        if !dns_group_names.contains(dns.routing.fallback.as_str()) {
+    if !dns.routing.fallback.is_empty()
+        && !dns_group_names.contains(dns.routing.fallback.as_str()) {
             return Err(ConfigError::DnsFallbackUnknownGroup {
                 group: dns.routing.fallback.clone(),
             });
         }
-    }
     for rule in &dns.routing.rules {
         if !dns_group_names.contains(rule.action.as_str()) {
             return Err(ConfigError::DnsUnknownGroup {
@@ -3023,14 +2991,6 @@ routing {
     }
 
     // ── Helper Function Tests ──
-
-    #[test]
-    fn test_parse_hex() {
-        assert_eq!(parse_hex("0x02000000").unwrap(), 0x02000000);
-        assert_eq!(parse_hex("0x0f000000").unwrap(), 0x0f000000);
-        assert_eq!(parse_hex("0xff").unwrap(), 255);
-        assert!(parse_hex("not_hex").is_err());
-    }
 
     #[test]
     fn test_parse_bool() {

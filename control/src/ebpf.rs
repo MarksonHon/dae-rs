@@ -114,7 +114,7 @@ impl Default for Daeparam {
             datapath_generation: 0,
             // 原版 dae 使用 0x100 作为内部 socket 标记
             // 用于 bpf_sock_is_dae_socket() 和 pid_is_control_plane() 中的 mark 检查
-            dae_socket_mark: 0x100,
+            dae_socket_mark: shared::DAE_SOCKET_MARK,
         }
     }
 }
@@ -1319,6 +1319,7 @@ impl EbpfManager {
     /// 与原始 dae Go 行为对齐：
     /// - Ingress 方向优先级 2，handle sub = 4
     /// - Egress 方向优先级 1，handle sub = 2
+    ///
     /// 注意：与 WAN 相反，LAN 的 Egress 优先级更高。
     pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
         let link_h_len = Self::get_link_header_len(ifname)?;
@@ -1668,11 +1669,10 @@ impl EbpfManager {
         let empty = MatchSet::zeroed();
         for i in match_sets.len()..MAX_MATCH_SET_LEN {
             let key = (slot_base + i as u32).to_ne_bytes();
-            let _ = map.update(&key, bytemuck::bytes_of(&empty), MapFlags::empty())?;
+            map.update(&key, bytemuck::bytes_of(&empty), MapFlags::empty())?;
         }
 
         // Update routing_meta_map[epoch_slot] with active rule count
-        drop(map);
         let meta_map = self.get_map_mut("routing_meta_map")?;
         let meta_key = epoch_slot.to_ne_bytes();
         let active_len = match_sets.len() as u32;
@@ -1750,9 +1750,11 @@ impl EbpfManager {
             // lpm_array_map is BPF_MAP_TYPE_ARRAY_OF_MAPS; each slot must hold
             // an inner map FD before entries can be written to it.
             let inner_map_name = format!("lpm_{}", array_idx);
-            let mut create_opts = libbpf_sys::bpf_map_create_opts::default();
-            create_opts.sz = std::mem::size_of::<libbpf_sys::bpf_map_create_opts>() as u64;
-            create_opts.map_flags = libbpf_sys::BPF_F_NO_PREALLOC as u32;
+            let create_opts = libbpf_sys::bpf_map_create_opts {
+                sz: std::mem::size_of::<libbpf_sys::bpf_map_create_opts>() as u64,
+                map_flags: libbpf_sys::BPF_F_NO_PREALLOC,
+                ..Default::default()
+            };
 
             let inner_map = libbpf_rs::MapHandle::create(
                 libbpf_rs::MapType::LpmTrie,

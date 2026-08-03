@@ -216,7 +216,7 @@ where
 
     // 2. 切换到宿主 NS
     let borrowed = unsafe { BorrowedFd::borrow_raw(host_ns_fd) };
-    nix::sched::setns(&borrowed, nix::sched::CloneFlags::CLONE_NEWNET)
+    nix::sched::setns(borrowed, nix::sched::CloneFlags::CLONE_NEWNET)
         .context("Failed to switch to host netns")?;
 
     // 3. 执行闭包（捕获 panic 以确保恢复命名空间）
@@ -337,8 +337,7 @@ fn kernel_version() -> (u32, u32) {
         .to_string_lossy()
         .to_string();
     let parts: Vec<&str> = release.split('.').collect();
-    let major = parts
-        .get(0)
+    let major = parts.first()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
     let minor = parts
@@ -397,6 +396,12 @@ pub struct NetnsManager {
     destroyed: bool,
     /// 是否使用 netkit（false 则回退到 veth）
     use_netkit: bool,
+}
+
+impl Default for NetnsManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NetnsManager {
@@ -863,7 +868,7 @@ impl NetnsManager {
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
                 if let Some(line) = stdout.lines().find(|l| l.trim().starts_with("link/ether")) {
-                    let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                    let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 {
                         let mac_str = parts[1];
                         let bytes: Vec<u8> = mac_str
@@ -1007,6 +1012,7 @@ impl NetnsManager {
     /// 2. 删除 netkit pair
     /// 3. 删除命名网络命名空间
     /// 4. 关闭持有 netns 的 fd
+    ///
     /// 销毁网络命名空间和 netkit pair
     ///
     /// Uses synchronous cleanup only — avoids `tokio::task::block_in_place`
@@ -1032,6 +1038,7 @@ impl NetnsManager {
     }
 
     /// 异步销毁（由 destroy() 在 tokio runtime 中调用）
+    #[allow(dead_code)]
     async fn destroy_async(&self) -> Result<()> {
         let (host_task, host_handle) =
             create_host_handle().context("Failed to create host netlink connection for destroy")?;
@@ -1163,6 +1170,7 @@ fn get_host_ifindex_sync(ifname: &str) -> Result<u32> {
     get_ifindex_in_ns(ifname)
 }
 
+#[allow(dead_code)]
 fn get_peer_ifindex_sync(ifname: &str) -> Result<u32> {
     get_ifindex_in_ns(ifname)
 }
@@ -1259,7 +1267,7 @@ async fn configure_dae0peer_async(
         .parse()
         .context("Failed to parse NEXTHOP_ADDR")?;
     let mut nexthop_route = RouteMessage::default();
-    nexthop_route.header.address_family = AddressFamily::Inet.into();
+    nexthop_route.header.address_family = AddressFamily::Inet;
     nexthop_route.header.destination_prefix_length = 32;
     nexthop_route.header.scope = RouteScope::Link;
     nexthop_route.header.kind = RouteType::Unicast;

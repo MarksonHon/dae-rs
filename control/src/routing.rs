@@ -368,6 +368,12 @@ pub struct FunctionLowering {
     pub match_sets: Vec<MatchSet>,
 }
 
+impl Default for FunctionLowering {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FunctionLowering {
     pub fn new() -> Self {
         Self {
@@ -507,7 +513,7 @@ fn group_params_by_key(raw_params: &[String]) -> (HashMap<String, Vec<String>>, 
 
         let entry = key_to_values.entry(key.clone());
         let inserted = matches!(&entry, std::collections::hash_map::Entry::Vacant(_));
-        let values = entry.or_insert_with(Vec::new);
+        let values = entry.or_default();
         values.push(val);
         if inserted && !key.is_empty() {
             key_order.push(key);
@@ -602,7 +608,7 @@ pub mod domain_key {
 }
 
 /// Built-in function parsers. These mirror dae's `routing_matcher_builder.go` callbacks.
-
+///
 /// Parser for `dip(...)` / `ip(...)` — destination IP set.
 pub fn parse_dip_fn(
     f: &Function,
@@ -1091,7 +1097,7 @@ pub struct CompiledRouting {
 /// Returns a dynamically-sized bitmap where bit N is set if `domain` matches
 /// `domain_sets[N]`. The bitmap length is `(domain_sets.len() + 31) / 32` words.
 pub fn build_domain_routing_bitmap(domain: &str, domain_sets: &[Vec<String>]) -> Vec<u32> {
-    let num_words = (domain_sets.len() + 31) / 32;
+    let num_words = domain_sets.len().div_ceil(32);
     let mut bitmap = vec![0u32; num_words];
     let domain_lower = domain.to_lowercase();
 
@@ -1541,12 +1547,12 @@ impl RoutingMatcher {
                     false
                 }
             }
-            t if t == match_type::IP_SET => params.dst_ip.map_or(false, |ip| {
+            t if t == match_type::IP_SET => params.dst_ip.is_some_and(|ip| {
                 let idx = unsafe { ms.value.index } as usize;
                 idx < self.lpm_tries.len()
                     && self.lpm_tries[idx].iter().any(|cidr| cidr.contains(&ip))
             }),
-            t if t == match_type::SOURCE_IP_SET => params.src_ip.map_or(false, |ip| {
+            t if t == match_type::SOURCE_IP_SET => params.src_ip.is_some_and(|ip| {
                 let idx = unsafe { ms.value.index } as usize;
                 idx < self.lpm_tries.len()
                     && self.lpm_tries[idx].iter().any(|cidr| cidr.contains(&ip))
@@ -1558,26 +1564,26 @@ impl RoutingMatcher {
             }
             t if t == match_type::PORT => {
                 let port_range = unsafe { ms.value.port_range };
-                params.dst_port.map_or(false, |p| {
+                params.dst_port.is_some_and(|p| {
                     p >= port_range.port_start && p <= port_range.port_end
                 })
             }
             t if t == match_type::SOURCE_PORT => {
                 let port_range = unsafe { ms.value.port_range };
-                params.src_port.map_or(false, |p| {
+                params.src_port.is_some_and(|p| {
                     p >= port_range.port_start && p <= port_range.port_end
                 })
             }
             t if t == match_type::L4_PROTO => {
                 let proto = unsafe { ms.value.l4proto_type };
-                params.l4proto.map_or(false, |p| (p & proto) != 0)
+                params.l4proto.is_some_and(|p| (p & proto) != 0)
             }
             t if t == match_type::IP_VERSION => {
                 let version = unsafe { ms.value.ip_version };
                 params
                     .dst_ip
                     .or(params.src_ip)
-                    .map_or(false, |ip| match ip {
+                    .is_some_and(|ip| match ip {
                         std::net::IpAddr::V4(_) => (version & 0x01) != 0,
                         std::net::IpAddr::V6(_) => (version & 0x02) != 0,
                     })
@@ -1589,12 +1595,11 @@ impl RoutingMatcher {
                     .trim_end_matches('\0');
                 params
                     .process_name
-                    .as_deref()
-                    .map_or(false, |pn| pn == pname_str)
+                    .as_deref() == Some(pname_str)
             }
             t if t == match_type::DSCP => {
                 let dscp = unsafe { ms.value.dscp };
-                params.dscp.map_or(false, |d| d == dscp)
+                params.dscp == Some(dscp)
             }
             t if t == match_type::FALLBACK => true,
             _ => false,

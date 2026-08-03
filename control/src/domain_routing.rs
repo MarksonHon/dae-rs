@@ -173,6 +173,10 @@ impl DomainRoutingTracker {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Convert an IpAddr to a 16-byte array (IPv4-mapped IPv6 for IPv4).
@@ -192,7 +196,6 @@ fn ip_to_16_bytes(ip: IpAddr) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing;
 
     #[test]
     fn test_build_domain_routing_bitmap() {

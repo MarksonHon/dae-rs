@@ -141,14 +141,16 @@ pub async fn run(
     // Set eBPF PARAM global variable
     // This must be done after netns creation but before eBPF loading
     // We'll set it in start() after netns is created
-    let mut ebpf_param = control::ebpf::Daeparam::default();
-    ebpf_param.tproxy_port = cp.config.tproxy_port as u32;
-    ebpf_param.control_plane_pid = std::process::id();
-    // dae_socket_mark: used by eBPF pid_is_control_plane() to identify
-    // dae-rs's own sockets and skip them (prevents self-loop).
-    // Must match socket_mark (0x100) used by TProxy and SOCKS5 dialers.
-    ebpf_param.dae_socket_mark = 0x100;
-    // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
+    let ebpf_param = control::ebpf::Daeparam {
+        tproxy_port: cp.config.tproxy_port as u32,
+        control_plane_pid: std::process::id(),
+        // dae_socket_mark: used by eBPF pid_is_control_plane() to identify
+        // dae-rs's own sockets and skip them (prevents self-loop).
+        // Must match socket_mark used by TProxy and SOCKS5 dialers.
+        dae_socket_mark: shared::DAE_SOCKET_MARK,
+        // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
+        ..Default::default()
+    };
     cp.ebpf_param = Some(ebpf_param);
     debug!(
         tproxy_port = ebpf_param.tproxy_port,

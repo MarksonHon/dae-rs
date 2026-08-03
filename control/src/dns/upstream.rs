@@ -3,10 +3,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
-/// SO_MARK value for control plane sockets (must match dae_socket_mark in eBPF PARAM).
-/// Setting this mark on all dae-rs internal sockets ensures `pid_is_control_plane()`
-/// in the eBPF program returns true, bypassing the proxy pipeline for dae-rs's own traffic.
-const DAE_SOCKET_MARK: u32 = 0x100;
+// SO_MARK value for control plane sockets (must match dae_socket_mark in eBPF PARAM).
+// Setting this mark on all dae-rs internal sockets ensures `pid_is_control_plane()`
+// in the eBPF program returns true, bypassing the proxy pipeline for dae-rs's own traffic.
 
 /// DNS upstream connection pool
 ///
@@ -83,7 +82,7 @@ impl DnsUpstreamPool {
             .context("Failed to create marked UDP socket")?;
         let fd = socket.as_raw_fd();
 
-        let mark_val = DAE_SOCKET_MARK as libc::c_int;
+        let mark_val = shared::DAE_SOCKET_MARK as libc::c_int;
         unsafe {
             libc::setsockopt(
                 fd,
@@ -156,7 +155,7 @@ impl DnsUpstreamPool {
         if fd < 0 {
             return Err(anyhow::anyhow!("failed to create marked TCP socket: {}", std::io::Error::last_os_error()));
         }
-        let mark_val = DAE_SOCKET_MARK as libc::c_int;
+        let mark_val = shared::DAE_SOCKET_MARK as libc::c_int;
         unsafe {
             libc::setsockopt(
                 fd,

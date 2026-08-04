@@ -1,6 +1,9 @@
 use anyhow::Context;
 use protocols::{OutboundDialer, UdpSession};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::debug;
@@ -26,6 +29,12 @@ pub struct DnsUpstreamPool {
     transport: DnsTransport,
     /// Connection timeout
     timeout: Duration,
+    /// Reusable UDP socket pool (lazily created on first UDP query).
+    ///
+    /// Instead of creating a fresh marked socket per query, the pool keeps one
+    /// socket per upstream and multiplexes concurrent queries by rewriting the
+    /// DNS transaction ID (RFC-style, same technique as kixdns).
+    udp_pool: Mutex<Option<Arc<UdpPool>>>,
 }
 
 /// DNS transport protocol
@@ -74,17 +83,8 @@ impl DnsUpstreamPool {
             address,
             transport,
             timeout: Duration::from_secs(5),
+            udp_pool: Mutex::new(None),
         }
-    }
-
-    /// Create a raw UDP socket bound to an ephemeral port with
-    /// SO_MARK=DAE_SOCKET_MARK for eBPF self-exclusion.
-    ///
-    /// 通过 [`protocols::hostns::create_udp`] 统一实现“dae-rs 自身流量必须直连”
-    /// convention (control plane mark + host NS), ensuring DNS queries bypass the transparent proxy pipeline.
-    fn create_marked_udp_socket(addr: &SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
-        protocols::hostns::create_udp(*addr, &protocols::hostns::DirectSocket::control_plane(None))
-            .context("Failed to create marked UDP socket")
     }
 
     /// Send a DNS query and receive response
@@ -108,19 +108,26 @@ impl DnsUpstreamPool {
     }
 
     async fn query_udp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // Create UDP socket with SO_MARK=0x100 to bypass eBPF proxy pipeline.
-        // This is critical: without the mark, dae-rs's own DNS queries would be
-        // intercepted by the transparent proxy, creating a DNS resolution loop.
-        let std_socket = Self::create_marked_udp_socket(&self.address)?;
-        std_socket.set_nonblocking(true)?;
-        let socket = UdpSocket::from_std(std_socket)?;
-        socket.connect(self.address).await?;
-        socket.send(request).await?;
+        let pool = self.ensure_udp_pool()?;
+        pool.query(request, self.timeout).await
+    }
 
-        let mut buf = vec![0u8; 4096];
-        let len = tokio::time::timeout(self.timeout, socket.recv(&mut buf)).await??;
-        buf.truncate(len);
-        Ok(buf)
+    /// Lazily create the shared UDP pool for this upstream.
+    ///
+    /// The pool owns a single marked socket (SO_MARK=0x100 so the eBPF program
+    /// lets dae-rs's own queries pass — critical to avoid a DNS hijack loop)
+    /// and multiplexes concurrent queries via TXID rewriting.
+    fn ensure_udp_pool(&self) -> anyhow::Result<Arc<UdpPool>> {
+        let mut guard = self.udp_pool.lock().unwrap();
+        if let Some(pool) = guard.as_ref() {
+            return Ok(pool.clone());
+        }
+        let pool = Arc::new(UdpPool::new_with_socket(
+            self.address,
+            &protocols::hostns::DirectSocket::control_plane(None),
+        )?);
+        guard.replace(pool.clone());
+        Ok(pool)
     }
 
     async fn query_tcp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -162,6 +169,159 @@ impl DnsUpstreamPool {
     }
 }
 
+// ============================================================================
+// Reusable UDP socket pool (kixdns-style)
+// ============================================================================
+
+/// In-flight UDP request: (original TXID, upstream addr, response sender).
+type UdpInflight =
+    (u16, SocketAddr, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>);
+
+/// RAII guard that removes the in-flight entry on drop, so timeouts,
+/// cancellation and early returns never leak entries or hang waiters.
+struct UdpInflightGuard {
+    inflight: Arc<Mutex<HashMap<u16, UdpInflight>>>,
+    id: u16,
+}
+
+impl Drop for UdpInflightGuard {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// A shared UDP socket multiplexing concurrent DNS queries to one upstream.
+///
+/// Each query's transaction ID is rewritten to a locally-unique ID before
+/// sending; a background reader matches responses by ID and restores the
+/// original TXID. The socket is `connect()`ed to the upstream, so the kernel
+/// filters out spoofed/foreign packets (only the connected peer is accepted).
+///
+/// This replaces the previous per-query socket creation: one marked socket per
+/// upstream serves all concurrent queries.
+struct UdpPool {
+    socket: Arc<UdpSocket>,
+    /// upstream address (for logging only; the socket is connected).
+    upstream: SocketAddr,
+    /// new_id → (original_id, upstream, tx)
+    inflight: Arc<Mutex<HashMap<u16, UdpInflight>>>,
+    next_id: AtomicU16,
+}
+
+impl UdpPool {
+    /// Create the marked, connected UDP socket and start the response reader.
+    fn new(upstream: SocketAddr) -> anyhow::Result<Self> {
+        Self::new_with_socket(
+            upstream,
+            &protocols::hostns::DirectSocket::control_plane(None),
+        )
+    }
+
+    /// Create the UDP pool socket using an explicit [`protocols::hostns::DirectSocket`]
+    /// configuration (tests pass `plain()` to avoid requiring `CAP_NET_ADMIN`).
+    fn new_with_socket(upstream: SocketAddr, sock: &protocols::hostns::DirectSocket) -> anyhow::Result<Self> {
+        let std_socket = protocols::hostns::create_udp(upstream, sock)
+            .context("Failed to create marked UDP pool socket")?;
+        std_socket.set_nonblocking(true)?;
+        std_socket
+            .connect(upstream)
+            .context("Failed to connect UDP pool socket")?;
+        let socket = Arc::new(UdpSocket::from_std(std_socket)?);
+        let pool = Self {
+            socket: socket.clone(),
+            upstream,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU16::new(0),
+        };
+        pool.spawn_reader();
+        Ok(pool)
+    }
+
+    /// Background reader: dispatches responses to the matching in-flight query.
+    fn spawn_reader(&self) {
+        let socket = self.socket.clone();
+        let inflight = self.inflight.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let len = match socket.recv(&mut buf).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        debug!("UDP pool recv error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                if len < 2 {
+                    continue;
+                }
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                // Extract the waiter before touching buf (avoids holding the
+                // lock across the restore/send).
+                let entry = inflight.lock().unwrap().remove(&id);
+                let Some((original_id, _upstream, tx)) = entry else {
+                    debug!(id, "UDP pool response with unknown TXID (ignored)");
+                    continue;
+                };
+                // Restore the original TXID so the response matches the client's query.
+                let mut response = buf[..len].to_vec();
+                response[0..2].copy_from_slice(&original_id.to_be_bytes());
+                let _ = tx.send(Ok(response));
+            }
+        });
+    }
+
+    /// Send `request` and await the matched response.
+    async fn query(&self, request: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+        if request.len() < 2 {
+            anyhow::bail!("DNS query too short");
+        }
+        let original_id = u16::from_be_bytes([request[0], request[1]]);
+
+        // Register the in-flight entry with a fresh local ID.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let new_id = {
+            let mut map = self.inflight.lock().unwrap();
+            let mut attempts = 0;
+            loop {
+                let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if !map.contains_key(&cand) {
+                    map.insert(cand, (original_id, self.upstream, tx));
+                    break cand;
+                }
+                attempts += 1;
+                if attempts > 1000 {
+                    anyhow::bail!("UDP pool exhausted (too many concurrent queries)");
+                }
+            }
+        };
+        // Guard guarantees the entry is removed on timeout/cancel/early-return.
+        let _guard = UdpInflightGuard {
+            inflight: self.inflight.clone(),
+            id: new_id,
+        };
+
+        // Rewrite the TXID in a copy and send.
+        let mut pkt = request.to_vec();
+        pkt[0..2].copy_from_slice(&new_id.to_be_bytes());
+        if let Err(e) = self.socket.send(&pkt).await {
+            return Err(e.into());
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "UDP upstream {}: response channel closed",
+                self.upstream
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "UDP upstream {}: query timed out",
+                self.upstream
+            )),
+        }
+    }
+}
+
 /// Send a DNS query through a proxy dialer, respecting the upstream's
 /// configured transport type:
 ///
@@ -184,11 +344,12 @@ pub async fn query_dns_via_proxy(
         // fall back to TCP if UDP relay is unsupported/unreachable (e.g. some
         // Shadowsocks servers only implement TCP). DNS servers commonly serve
         // both UDP and TCP on port 53, so the TCP fallback keeps DNS working.
-        // The UDP attempt uses a short budget so an unresponsive relay fails
-        // over to TCP quickly instead of stalling the whole DNS query.
+        // The UDP attempt gets most of the timeout budget (leaving some margin
+        // for the TCP fallback) instead of a hard 2s cap, so a working but
+        // slow relay is not forced over to TCP unnecessarily.
         DnsTransport::Udp => {
-            let udp_budget = timeout.min(Duration::from_secs(2));
-            let session = match dialer.udp_dial().await {
+            let udp_budget = (timeout * 3 / 4).max(Duration::from_secs(2));
+            let session = match udp_dial_with_timeout(dialer, timeout).await {
                 Ok(s) => s,
                 Err(e) => {
                     debug!(
@@ -213,8 +374,8 @@ pub async fn query_dns_via_proxy(
         }
         DnsTransport::Tcp => query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await,
         DnsTransport::TcpUdp => {
-            let udp_budget = timeout.min(Duration::from_secs(2));
-            let session = match dialer.udp_dial().await {
+            let udp_budget = (timeout * 3 / 4).max(Duration::from_secs(2));
+            let session = match udp_dial_with_timeout(dialer, timeout).await {
                 Ok(s) => s,
                 Err(_) => {
                     return query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await
@@ -231,6 +392,20 @@ pub async fn query_dns_via_proxy(
             "DoH/DoT through proxy not implemented; use udp://, tcp://, or tcp+udp://"
         )),
     }
+}
+
+/// Open a proxy UDP relay session, bounded by `timeout`.
+///
+/// `udp_dial()` performs the protocol handshake (e.g. SOCKS5 UDP ASSOCIATE is a
+/// full TCP connection + handshake). Without a bound here, a stuck handshake
+/// could hold up the whole DNS query past the client's own deadline.
+async fn udp_dial_with_timeout(
+    dialer: &dyn OutboundDialer,
+    timeout: Duration,
+) -> anyhow::Result<Box<dyn UdpSession>> {
+    tokio::time::timeout(timeout, dialer.udp_dial())
+        .await
+        .map_err(|_| anyhow::anyhow!("UDP relay session establishment timed out"))?
 }
 
 /// Send a DNS query over TCP through a proxy dialer.
@@ -462,6 +637,43 @@ pub fn skip_question_section(response: &[u8], mut pos: usize) -> usize {
     }
 }
 
+/// Decrement the TTL of every resource record in a DNS response by `elapsed`
+/// seconds (RFC 1035 §5.2). Used on cache hits so the reply reports its true
+/// remaining lifetime. TTLs are clamped at 0 (never negative).
+pub fn patch_ttls(response: &mut [u8], elapsed: u32) {
+    if response.len() < 12 || elapsed == 0 {
+        return;
+    }
+    let ancount = u16::from_be_bytes([response[6], response[7]]);
+    let nscount = u16::from_be_bytes([response[8], response[9]]);
+    let arcount = u16::from_be_bytes([response[10], response[11]]);
+    let total_rrs = ancount as usize + nscount as usize + arcount as usize;
+    if total_rrs == 0 {
+        return;
+    }
+
+    let mut pos = skip_question_section(response, 12);
+    for _ in 0..total_rrs {
+        if pos >= response.len() {
+            return;
+        }
+        pos = skip_name(response, pos);
+        if pos + 10 > response.len() {
+            return;
+        }
+        let ttl = u32::from_be_bytes([
+            response[pos + 4],
+            response[pos + 5],
+            response[pos + 6],
+            response[pos + 7],
+        ]);
+        let new_ttl = ttl.saturating_sub(elapsed);
+        response[pos + 4..pos + 8].copy_from_slice(&new_ttl.to_be_bytes());
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10 + rdlength;
+    }
+}
+
 /// Skip a possibly-compressed DNS name at `pos`, returning the next offset.
 pub fn skip_name(response: &[u8], mut pos: usize) -> usize {
     loop {
@@ -567,5 +779,123 @@ mod tests {
         // Truncated: header only, no question section
         let addrs = parse_answers_for_addr(&[0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
         assert!(addrs.is_empty());
+    }
+
+    /// Build a synthetic DNS response echoing a query, with a single A answer.
+    fn make_response(txid: u16, qname: &str, ttl: u32) -> Vec<u8> {
+        let query = build_dns_query(qname, 1);
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&txid.to_be_bytes());
+        resp.extend_from_slice(&[0x81, 0x80]);
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        resp.extend_from_slice(&query[12..]); // question
+        resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01]);
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        resp.extend_from_slice(&[0x00, 0x04]);
+        resp.extend_from_slice(&[93, 184, 216, 34]);
+        resp
+    }
+
+    #[test]
+    fn test_patch_ttls_decrements() {
+        let mut resp = make_response(0x1234, "example.com", 300);
+        patch_ttls(&mut resp, 30);
+        // TTL should be 300 - 30 = 270 at answer offset.
+        // Answer NAME is a compression pointer (0xc00c) → skip 2, then type(2) class(2) ttl(4).
+        let mut pos = crate::dns::upstream::skip_question_section(&resp, 12);
+        pos = crate::dns::upstream::skip_name(&resp, pos);
+        let ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
+        assert_eq!(ttl, 270);
+    }
+
+    #[test]
+    fn test_patch_ttls_clamps_at_zero() {
+        let mut resp = make_response(1, "example.com", 10);
+        patch_ttls(&mut resp, 1000);
+        let mut pos = crate::dns::upstream::skip_question_section(&resp, 12);
+        pos = crate::dns::upstream::skip_name(&resp, pos);
+        let ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
+        assert_eq!(ttl, 0);
+    }
+
+    #[tokio::test]
+    async fn test_udp_pool_txid_roundtrip() {
+        // Mock upstream: echoes every query back as a response (carrying the
+        // pool's rewritten TXID), for a short window.
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let (len, peer) = tokio::select! {
+                    _ = done_rx.recv() => break,
+                    r = upstream.recv_from(&mut buf) => match r {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    },
+                };
+                // Respond with the same query bytes (already carries the rewritten TXID).
+                if upstream.send_to(&buf[..len], peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let pool = UdpPool::new_with_socket(
+            upstream_addr,
+            &protocols::hostns::DirectSocket::plain(),
+        )
+        .unwrap();
+        // Two different queries both with TXID 0x1111 — must each get back a
+        // response with TXID 0x1111 restored (not the pool's internal IDs).
+        let q1 = build_dns_query("a.com", 1);
+        let q2 = build_dns_query("b.com", 1);
+        let mut q1 = q1;
+        let mut q2 = q2;
+        q1[0..2].copy_from_slice(&0x1111u16.to_be_bytes());
+        q2[0..2].copy_from_slice(&0x1111u16.to_be_bytes());
+
+        let (r1, r2) = tokio::join!(
+            pool.query(&q1, Duration::from_secs(5)),
+            pool.query(&q2, Duration::from_secs(5)),
+        );
+        let r1 = r1.expect("query1 ok");
+        let r2 = r2.expect("query2 ok");
+        // TXID restored to the original.
+        assert_eq!(&r1[0..2], &0x1111u16.to_be_bytes());
+        assert_eq!(&r2[0..2], &0x1111u16.to_be_bytes());
+        // Each response carries its own question (length-prefixed qname).
+        assert!(r1.windows(5).any(|w| w == b"a\x03com"));
+        assert!(r2.windows(5).any(|w| w == b"b\x03com"));
+
+        let _ = done_tx.send(()).await;
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_udp_pool_timeout_removes_inflight() {
+        // Upstream that never responds.
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let _upstream_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                if upstream.recv_from(&mut buf).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let pool = UdpPool::new_with_socket(
+            upstream_addr,
+            &protocols::hostns::DirectSocket::plain(),
+        )
+        .unwrap();
+        let q = build_dns_query("timeout.com", 1);
+        let err = pool.query(&q, Duration::from_millis(200)).await;
+        assert!(err.is_err(), "query should time out");
+        // In-flight entry must be cleaned up.
+        assert_eq!(pool.inflight.lock().unwrap().len(), 0);
     }
 }

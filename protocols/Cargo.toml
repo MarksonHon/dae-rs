@@ -59,7 +59,7 @@ base64 = { version = "0.22", optional = true }
 [features]
 default = ["shadowsocks", "trojan", "tuic", "juicity", "vmess"]
 socks = []
-shadowsocks = ["dep:shadowsocks-crypto"]
+shadowsocks = ["dep:shadowsocks-crypto", "dep:aes"]
 trojan = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 tuic = ["dep:rustls", "dep:quinn", "dep:base64"]
 juicity = ["dep:rustls", "dep:quinn"]

@@ -49,18 +49,29 @@ impl DnsCache {
 
     /// Look up a cached response for a specific DNS group.
     pub fn lookup(&self, group: &str, key: u64) -> Option<&[u8]> {
+        self.lookup_with_age(group, key).map(|(bytes, _)| bytes)
+    }
+
+    /// Look up a cached response for a specific DNS group, returning the
+    /// response bytes and the seconds elapsed since insertion.
+    ///
+    /// The elapsed time is used by the caller to decrement TTLs per
+    /// RFC 1035 §5.2 so cached responses report their true remaining lifetime.
+    pub fn lookup_with_age(&self, group: &str, key: u64) -> Option<(&[u8], u32)> {
         let entry = self.entries.get(group)?.get(&key)?;
         let now = Instant::now();
 
         if now < entry.deadline {
             // Fresh entry
-            Some(&entry.raw_response)
+            let elapsed = now.duration_since(entry.created_at).as_secs() as u32;
+            Some((&entry.raw_response, elapsed))
         } else if self.config.optimistic_cache && entry.stale {
             // Stale entry but optimistic cache enabled
             let stale_deadline =
                 entry.deadline + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
             if now < stale_deadline {
-                Some(&entry.raw_response)
+                let elapsed = now.duration_since(entry.created_at).as_secs() as u32;
+                Some((&entry.raw_response, elapsed))
             } else {
                 None
             }

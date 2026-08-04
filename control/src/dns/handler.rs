@@ -41,6 +41,87 @@ use crate::dns::upstream::DnsUpstreamPool;
 /// Used to feed the domain_routing_map eBPF map for domain-based routing.
 pub type DnsResolveCallback = Arc<dyn Fn(&str, IpAddr, u32) + Send + Sync>;
 
+/// Singleflight key: (DNS group, qname, qtype). Concurrent identical queries
+/// (same group + name + type) share a single upstream lookup.
+type InflightKey = (String, String, u16);
+
+/// Singleflight result. `Arc<anyhow::Error>` makes the value `Clone` so waiters
+/// can copy it out of the watch channel.
+type InflightResult = Result<Vec<u8>, Arc<anyhow::Error>>;
+
+/// In-flight request deduplication map.
+///
+/// Key → watch sender. The first query for a key becomes the "leader" and
+/// inserts its sender; concurrent identical queries subscribe and wait for the
+/// leader's result instead of querying upstream again (prevents cache stampede).
+type InflightMap =
+    std::sync::Mutex<std::collections::HashMap<InflightKey, tokio::sync::watch::Sender<InflightResult>>>;
+
+/// Try to join an in-flight query for `key`.
+///
+/// Returns `Some(receiver)` if another query with the same key is in progress
+/// (caller should await the result), `None` if this query becomes the leader
+/// (caller must insert its own result via [`notify_inflight`]).
+fn try_join_inflight(
+    inflight: &Arc<InflightMap>,
+    key: &InflightKey,
+) -> Option<tokio::sync::watch::Receiver<InflightResult>> {
+    let mut map = inflight.lock().unwrap();
+    if let Some(tx) = map.get(key) {
+        Some(tx.subscribe())
+    } else {
+        let (tx, _rx) = tokio::sync::watch::channel::<InflightResult>(Err(Arc::new(
+            anyhow::anyhow!("pending"),
+        )));
+        map.insert(key.clone(), tx);
+        None
+    }
+}
+
+/// Remove the in-flight entry for `key` and publish `result` to waiters.
+fn notify_inflight(
+    inflight: &Arc<InflightMap>,
+    key: &InflightKey,
+    result: anyhow::Result<Vec<u8>>,
+) {
+    if let Some(tx) = inflight.lock().unwrap().remove(key) {
+        let _ = tx.send(result.map_err(Arc::new));
+    }
+}
+
+/// RAII guard for the singleflight leader.
+///
+/// The leader MUST publish a result before returning (otherwise waiters hang on
+/// `rx.changed()`). This guard publishes the result on Drop if the leader
+/// hasn't notified explicitly (covers early returns and `?` error paths).
+struct LeaderNotify {
+    inflight: Arc<InflightMap>,
+    key: InflightKey,
+    defused: bool,
+}
+
+impl LeaderNotify {
+    /// Publish `result` to waiters (idempotent).
+    fn notify(&mut self, result: anyhow::Result<Vec<u8>>) {
+        if !self.defused {
+            self.defused = true;
+            notify_inflight(&self.inflight, &self.key, result);
+        }
+    }
+}
+
+impl Drop for LeaderNotify {
+    fn drop(&mut self) {
+        if !self.defused {
+            notify_inflight(
+                &self.inflight,
+                &self.key,
+                Err(anyhow::anyhow!("singleflight leader dropped")),
+            );
+        }
+    }
+}
+
 /// DNS Listener — handles incoming DNS queries (UDP + TCP)
 pub struct DnsListener {
     /// Bind address
@@ -67,6 +148,8 @@ pub struct DnsListener {
     /// Outbound dialers keyed by proxy **group name**, used for proxied DNS
     /// upstream queries (`send_by` names an outbound group).
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
+    /// In-flight request deduplication map (singleflight).
+    inflight: Arc<InflightMap>,
 }
 
 impl DnsListener {
@@ -92,6 +175,7 @@ impl DnsListener {
             on_resolve,
             rule_set_cache,
             dialers,
+            inflight: Arc::new(InflightMap::default()),
         }
     }
 
@@ -112,6 +196,7 @@ impl DnsListener {
         let router = Arc::new(self.router.clone());
         let on_resolve = self.on_resolve.clone();
         let rule_set_cache = self.rule_set_cache.clone();
+        let inflight = self.inflight.clone();
 
         debug!(bind = %bind, "DNS listener starting");
 
@@ -127,6 +212,7 @@ impl DnsListener {
         let u_router = router.clone();
         let u_on_resolve = on_resolve.clone();
         let u_ruleset = rule_set_cache.clone();
+        let u_inflight = inflight.clone();
         let udp_handle = tokio::spawn(async move {
             run_udp_listener(
                 udp_socket,
@@ -137,6 +223,7 @@ impl DnsListener {
                 u_on_resolve,
                 u_ruleset,
                 u_dialers,
+                u_inflight,
             )
             .await;
         });
@@ -147,6 +234,7 @@ impl DnsListener {
             anyhow::anyhow!("failed to bind DNS TCP listener on {}: {}", bind, e)
         })?;
         let tcp_dialers = self.dialers.clone();
+        let tcp_inflight = inflight.clone();
         let tcp_handle = tokio::spawn(async move {
             run_tcp_listener(
                 tcp_listener,
@@ -157,6 +245,7 @@ impl DnsListener {
                 on_resolve,
                 rule_set_cache,
                 tcp_dialers,
+                tcp_inflight,
             )
             .await;
         });
@@ -187,6 +276,7 @@ impl DnsListener {
                 let i_router = Arc::new(self.router.clone());
                 let i_on_resolve = self.on_resolve.clone();
                 let i_ruleset = self.rule_set_cache.clone();
+                let i_inflight = inflight.clone();
                 tokio::spawn(async move {
                     run_udp_listener(
                         internal_socket,
@@ -197,6 +287,7 @@ impl DnsListener {
                         i_on_resolve,
                         i_ruleset,
                         i_dialers,
+                        i_inflight,
                     )
                     .await;
                 });
@@ -208,6 +299,46 @@ impl DnsListener {
             Err(e) => {
                 warn!(
                     "Failed to bind DNS internal listener on {}: {} (cross-namespace DNS may not work)",
+                    internal_addr, e
+                );
+            }
+        }
+
+        // TCP cross-namespace listener: receives DNS-over-TCP sessions forwarded
+        // by the TProxy TCP DNS hijack (orig_dst port 53). Same address family
+        // (IPv4 169.254.0.1) as the UDP internal listener.
+        match bind_tcp_with_reuseaddr(internal_addr).await {
+            Ok(internal_tcp) => {
+                let t_dialers = self.dialers.clone();
+                let t_config = Arc::new(self.config.clone());
+                let t_pools = self.upstream_pools.clone();
+                let t_cache = self.cache.clone();
+                let t_router = Arc::new(self.router.clone());
+                let t_on_resolve = self.on_resolve.clone();
+                let t_ruleset = self.rule_set_cache.clone();
+                let t_inflight = inflight.clone();
+                tokio::spawn(async move {
+                    run_tcp_listener(
+                        internal_tcp,
+                        t_config,
+                        t_pools,
+                        t_cache,
+                        t_router,
+                        t_on_resolve,
+                        t_ruleset,
+                        t_dialers,
+                        t_inflight,
+                    )
+                    .await;
+                });
+                info!(
+                    "DNS internal TCP listener started on {} for cross-namespace forwarding",
+                    internal_addr
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to bind DNS internal TCP listener on {}: {} (TCP DNS hijack may not work)",
                     internal_addr, e
                 );
             }
@@ -250,6 +381,7 @@ async fn run_udp_listener(
     on_resolve: Option<DnsResolveCallback>,
     rule_set_cache: RuleSetCache,
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
+    inflight: Arc<InflightMap>,
 ) {
     let mut buf = vec![0u8; 4096];
     loop {
@@ -286,6 +418,7 @@ async fn run_udp_listener(
         let on_resolve = on_resolve.clone();
         let rule_set_cache = rule_set_cache.clone();
         let dialers = dialers.clone();
+        let inflight = inflight.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_dns_query(
@@ -298,6 +431,7 @@ async fn run_udp_listener(
                 &on_resolve,
                 &rule_set_cache,
                 dialers,
+                inflight,
             )
             .await
             {
@@ -317,6 +451,7 @@ async fn run_tcp_listener(
     on_resolve: Option<DnsResolveCallback>,
     rule_set_cache: RuleSetCache,
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
+    inflight: Arc<InflightMap>,
 ) {
     loop {
         let result = listener.accept().await;
@@ -334,6 +469,7 @@ async fn run_tcp_listener(
         let on_resolve = on_resolve.clone();
         let rule_set_cache = rule_set_cache.clone();
         let dialers = dialers.clone();
+        let inflight = inflight.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -367,6 +503,7 @@ async fn run_tcp_listener(
                 &on_resolve,
                 &rule_set_cache,
                 &dialers,
+                &inflight,
             )
             .await
             {
@@ -403,6 +540,7 @@ async fn handle_dns_query(
     on_resolve: &Option<DnsResolveCallback>,
     rule_set_cache: &RuleSetCache,
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
+    inflight: Arc<InflightMap>,
 ) -> anyhow::Result<()> {
     let (response, upstream_addr) = handle_dns_internal(
         request,
@@ -413,6 +551,7 @@ async fn handle_dns_query(
         on_resolve,
         rule_set_cache,
         &dialers,
+        &inflight,
     )
     .await?;
 
@@ -460,6 +599,7 @@ async fn handle_dns_internal(
     on_resolve: &Option<DnsResolveCallback>,
     rule_set_cache: &RuleSetCache,
     dialers: &HashMap<String, Arc<dyn OutboundDialer>>,
+    inflight: &Arc<InflightMap>,
 ) -> anyhow::Result<(Vec<u8>, Option<SocketAddr>)> {
     // Parse query name and type
     let (qname, qtype) = parse_dns_question(request);
@@ -475,7 +615,7 @@ async fn handle_dns_internal(
     let cache_key = DnsCache::cache_key(&qname, qtype, 1); // class IN = 1
     {
         let cache_guard = cache.read().unwrap();
-        if let Some(cached) = cache_guard.lookup(&group_name, cache_key) {
+        if let Some((cached, elapsed_secs)) = cache_guard.lookup_with_age(&group_name, cache_key) {
             debug!("DNS cache hit: {} type={} group={}", qname, qtype, group_name);
             let mut response = cached.to_vec();
             // Patch transaction ID to match the current query — DNS clients
@@ -483,9 +623,66 @@ async fn handle_dns_internal(
             if response.len() >= 2 && request.len() >= 2 {
                 response[0..2].copy_from_slice(&request[0..2]);
             }
+            // RFC 1035 §5.2: decrement TTLs by residence time so the cached
+            // reply reports its true remaining lifetime.
+            if elapsed_secs > 0 {
+                crate::dns::upstream::patch_ttls(&mut response, elapsed_secs);
+            }
             return Ok((response, None));
         }
     }
+
+    // Singleflight: if an identical query is already in flight, wait for its
+    // result instead of querying upstream again (prevents cache stampede when
+    // many clients resolve the same name concurrently).
+    let inflight_key: InflightKey = (group_name.clone(), qname.clone(), qtype);
+    if let Some(mut rx) = try_join_inflight(inflight, &inflight_key) {
+        // Fast path: leader already finished before we subscribed.
+        if let Ok(resp) = (*rx.borrow()).clone() {
+            debug!(
+                "DNS singleflight join (already finished): {} type={} group={}",
+                qname, qtype, group_name
+            );
+            let mut response = resp;
+            if response.len() >= 2 && request.len() >= 2 {
+                response[0..2].copy_from_slice(&request[0..2]);
+            }
+            return Ok((response, None));
+        }
+        // Wait for the leader's result.
+        if rx.changed().await.is_ok() {
+            match (*rx.borrow()).clone() {
+                Ok(resp) => {
+                    debug!(
+                        "DNS singleflight join: {} type={} group={}",
+                        qname, qtype, group_name
+                    );
+                    let mut response = resp;
+                    if response.len() >= 2 && request.len() >= 2 {
+                        response[0..2].copy_from_slice(&request[0..2]);
+                    }
+                    return Ok((response, None));
+                }
+                Err(e) => {
+                    // Leader failed; share the failure rather than re-querying.
+                    debug!("DNS singleflight leader failed ({}), returning SERVFAIL", e);
+                    return Ok((build_empty_response(request), None));
+                }
+            }
+        }
+        // Channel closed without a value: leader vanished; fall through and
+        // query upstream ourselves.
+        debug!("DNS singleflight channel closed, querying upstream ourselves");
+    }
+
+    // We are the leader for this query. Must publish a result before returning
+    // so waiters don't hang.
+    let mut leader =
+        LeaderNotify {
+            inflight: inflight.clone(),
+            key: inflight_key,
+            defused: false,
+        };
 
     // Resolve the dialer for this group's `send_by` (an outbound group name).
     // None → direct connection; Some(d) → proxied through that group.
@@ -511,7 +708,9 @@ async fn handle_dns_internal(
 
     if candidates.is_empty() {
         warn!("DNS group '{}' has no available upstreams", route.group.name);
-        return Ok((build_empty_response(request), None));
+        let empty = build_empty_response(request);
+        leader.notify(Ok(empty.clone()));
+        return Ok((empty, None));
     }
 
     // Query one upstream candidate (direct or via proxy), returning
@@ -641,7 +840,9 @@ async fn handle_dns_internal(
         Ok(r) => r,
         Err(e) => {
             warn!("DNS group '{}' {} query failed: {}", route.group.name, query_mode_label(query_mode), e);
-            return Ok((build_empty_response(request), None));
+            let empty = build_empty_response(request);
+            leader.notify(Ok(empty.clone()));
+            return Ok((empty, None));
         }
     };
 
@@ -665,9 +866,14 @@ async fn handle_dns_internal(
             // Feed accepted resolutions into the domain routing tracker so the
             // eBPF domain_routing_map is populated for domain-based routing.
             notify_resolve(on_resolve, &qname, &response);
+            leader.notify(Ok(response.clone()));
             Ok((response, Some(upstream_addr)))
         }
-        DnsResponseAction::Reject => Ok((build_empty_response(request), Some(upstream_addr))),
+        DnsResponseAction::Reject => {
+            let empty = build_empty_response(request);
+            leader.notify(Ok(empty.clone()));
+            Ok((empty, Some(upstream_addr)))
+        }
         DnsResponseAction::Requery(new_upstream) => {
             let new_pool_key = format!("{}__{}", route.group.name, new_upstream);
             if let Some(new_pool) = upstream_pools.get(&new_pool_key) {
@@ -683,7 +889,9 @@ async fn handle_dns_internal(
                         )
                         .await?
                     } else {
-                        return Ok((build_empty_response(request), None));
+                        let empty = build_empty_response(request);
+                        leader.notify(Ok(empty.clone()));
+                        return Ok((empty, None));
                     }
                 } else {
                     new_pool.query(request).await?
@@ -692,6 +900,7 @@ async fn handle_dns_internal(
                 let mut cache_guard = cache.write().unwrap();
                 cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
                 notify_resolve(on_resolve, &qname, &response);
+                leader.notify(Ok(response.clone()));
                 Ok((response, Some(new_upstream_addr)))
             } else {
                 // Fallback: accept original response
@@ -699,6 +908,7 @@ async fn handle_dns_internal(
                 let mut cache_guard = cache.write().unwrap();
                 cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
                 notify_resolve(on_resolve, &qname, &response);
+                leader.notify(Ok(response.clone()));
                 Ok((response, Some(upstream_addr)))
             }
         }
@@ -1065,90 +1275,86 @@ fn parse_dns_question(packet: &[u8]) -> (String, u16) {
     (labels.join("."), qtype)
 }
 
-/// Extract minimum TTL from DNS response
+/// Extract the cache TTL from a DNS response.
+///
+/// RFC 1035 §5.2: for positive responses use the minimum TTL of the answer
+/// RRset.
+///
+/// RFC 2308 §5 (negative caching): for negative responses (NXDOMAIN/NODATA,
+/// no answers) use `min(SOA.ttl, SOA.minimum)` from the authority section.
+/// Without an SOA the response MUST NOT be cached (return 0).
+///
+/// Returns 0 when the response must not be cached.
 fn extract_min_ttl(response: &[u8]) -> u32 {
+    use crate::dns::upstream::{skip_name, skip_question_section};
+
     if response.len() < 12 {
-        return 60;
+        return 0;
     }
+    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
+    let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
 
-    let ancount = u16::from_be_bytes([response[6], response[7]]);
-    let nscount = u16::from_be_bytes([response[8], response[9]]);
-    let arcount = u16::from_be_bytes([response[10], response[11]]);
-    let total_rrs = ancount as usize + nscount as usize + arcount as usize;
-
-    if total_rrs == 0 {
-        return 60;
-    }
-
-    // Skip question section
-    let mut pos = 12usize;
-    loop {
-        if pos >= response.len() {
-            return 60;
-        }
-        let len = response[pos] as usize;
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            // Compression pointer in question name — skip 2 bytes
-            pos += 2;
-            break;
-        }
-        pos += 1 + len;
-    }
-    // Skip qtype + qclass
-    pos += 4;
-
-    let mut min_ttl = u32::MAX;
-    for _ in 0..total_rrs {
-        if pos >= response.len() {
-            break;
-        }
-
-        // Skip NAME field (variable length or compression pointer)
-        loop {
+    // Positive response: min TTL over the answer section only.
+    if ancount > 0 {
+        let mut min_ttl = u32::MAX;
+        let mut pos = skip_question_section(response, 12);
+        for _ in 0..ancount {
             if pos >= response.len() {
-                return if min_ttl == u32::MAX { 60 } else { min_ttl };
-            }
-            let len = response[pos] as usize;
-            if len == 0 {
-                pos += 1;
                 break;
             }
-            if len & 0xC0 == 0xC0 {
-                // Compression pointer (2 bytes)
-                pos += 2;
+            pos = skip_name(response, pos);
+            if pos + 10 > response.len() {
                 break;
             }
-            pos += 1 + len;
+            let ttl = u32::from_be_bytes([
+                response[pos + 4],
+                response[pos + 5],
+                response[pos + 6],
+                response[pos + 7],
+            ]);
+            if ttl < min_ttl {
+                min_ttl = ttl;
+            }
+            let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+            pos += 10 + rdlength;
         }
+        return if min_ttl == u32::MAX { 0 } else { min_ttl };
+    }
 
-        // Now at TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) + RDATA
+    // Negative response (no answers): RFC 2308 — SOA in authority section.
+    let mut pos = skip_question_section(response, 12);
+    for _ in 0..nscount {
+        if pos >= response.len() {
+            break;
+        }
+        pos = skip_name(response, pos);
         if pos + 10 > response.len() {
             break;
         }
-
+        let rtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
         let ttl = u32::from_be_bytes([
             response[pos + 4],
             response[pos + 5],
             response[pos + 6],
             response[pos + 7],
         ]);
-        if ttl < min_ttl {
-            min_ttl = ttl;
-        }
-
         let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
-        pos += 10 + rdlength;
+        let rdata_start = pos + 10;
+        let rdata_end = rdata_start + rdlength;
+        if rtype == 6 && rdata_end <= response.len() && rdlength >= 4 {
+            // SOA: MINIMUM is the last 4 bytes of the rdata.
+            let minimum = u32::from_be_bytes([
+                response[rdata_end - 4],
+                response[rdata_end - 3],
+                response[rdata_end - 2],
+                response[rdata_end - 1],
+            ]);
+            return ttl.min(minimum);
+        }
+        pos = rdata_end;
     }
-
-    if min_ttl == u32::MAX {
-        60
-    } else {
-        min_ttl
-    }
+    // No SOA: must not cache (RFC 2308 §4).
+    0
 }
 
 /// Build an empty DNS response (SERVFAIL or NXDOMAIN-like)
@@ -1443,5 +1649,50 @@ mod tests {
         // Single negation
         assert!(!eval("!ip(geoip:cn)", "www.google.com", &resp, "u1"));
         assert!(eval("!qname(geosite:cn)", "www.google.com", &resp, "u1"));
+    }
+
+    #[test]
+    fn test_extract_min_ttl_positive_uses_answer_ttl() {
+        let resp = make_a_response("www.test.com", &["1.2.3.4".parse().unwrap()]);
+        assert_eq!(extract_min_ttl(&resp), 60);
+    }
+
+    #[test]
+    fn test_extract_min_ttl_negative_soa_rfc2308() {
+        // NXDOMAIN with SOA in authority. RFC 2308 §5:
+        // negative TTL = min(SOA.ttl, SOA.minimum).
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&[0x12, 0x34, 0x81, 0x83]); // ID + NXDOMAIN
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
+        // Question: example.com A IN
+        resp.extend_from_slice(&[
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ]);
+        // Authority: name ptr 0xc00c, SOA(6), IN, ttl=300, rdlen=56
+        resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x06, 0x00, 0x01]);
+        resp.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]);
+        resp.extend_from_slice(&[0x00, 0x38]);
+        // SOA rdata: MNAME ns1.example.com, RNAME admin.example.com,
+        // serial/refresh/retry/expire (4x4=16), minimum=60 → rdlen 17+19+20=56
+        resp.extend_from_slice(&[0x03, b'n', b's', b'1', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00]);
+        resp.extend_from_slice(&[0x05, b'a', b'd', b'm', b'i', b'n', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00]);
+        resp.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        resp.extend_from_slice(&60u32.to_be_bytes()); // minimum
+
+        assert_eq!(extract_min_ttl(&resp), 60);
+    }
+
+    #[test]
+    fn test_extract_min_ttl_negative_no_soa_not_cacheable() {
+        // NXDOMAIN without SOA: must not be cached (RFC 2308 §4).
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&[0x12, 0x34, 0x81, 0x83]);
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        resp.extend_from_slice(&[
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
+            0x00, 0x01, 0x00, 0x01,
+        ]);
+        assert_eq!(extract_min_ttl(&resp), 0);
     }
 }

@@ -158,6 +158,14 @@ pub struct TproxyListener {
     socket_mark: u32,
     /// 停止信号（通知 accept 循环退出，无需轮询）
     stop_signal: Arc<Notify>,
+    /// 内部 DNS handler 地址（跨 namespace DNS 劫持用）。
+    ///
+    /// 当 TCP 连接原始目标为 53 端口时，不再走代理 Dialer，而是把
+    /// DNS-over-TCP 会话转发到此地址的 DNS handler（与 UDP 劫持一致）。
+    /// `None` 表示不劫持 TCP DNS。
+    dns_forward_addr: Option<SocketAddr>,
+    /// Host network namespace fd（DNS 劫持上游 socket 在宿主 NS 创建）。
+    host_ns_fd: Option<RawFd>,
 }
 
 impl TproxyListener {
@@ -174,6 +182,8 @@ impl TproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark: shared::DAE_SOCKET_MARK, // 原版 dae 默认值
             stop_signal: Arc::new(Notify::new()),
+            dns_forward_addr: None,
+            host_ns_fd: None,
         }
     }
 
@@ -189,7 +199,26 @@ impl TproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
+            dns_forward_addr: None,
+            host_ns_fd: None,
         }
+    }
+
+    /// 设置 TCP DNS 劫持目标（内部 DNS handler 地址）。
+    ///
+    /// 设置后，原始目标为 53 端口的 TCP 连接会被转发到该 DNS handler，
+    /// 而不是走代理。与 UDP 劫持的 `169.254.0.1:<port>` 保持一致。
+    pub fn set_dns_forward_addr(&mut self, addr: SocketAddr) {
+        self.dns_forward_addr = Some(addr);
+        tracing::info!(
+            "DNS hijacking enabled: TCP TProxy will forward DNS queries to {}",
+            addr
+        );
+    }
+
+    /// 设置宿主网络命名空间 fd（DNS 劫持上游连接在宿主 NS 创建）。
+    pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) {
+        self.host_ns_fd = host_ns_fd;
     }
 
     /// Get listen address
@@ -425,9 +454,18 @@ impl TproxyListener {
                                 "Accepted new TCP connection"
                             );
                             let dialer = self.dialer.clone();
+                            let dns_forward_addr = self.dns_forward_addr;
+                            let host_ns_fd = self.host_ns_fd;
                             tokio::spawn(async move {
                                 let start = std::time::Instant::now();
-                                if let Err(e) = handle_connection(stream, dialer).await {
+                                if let Err(e) = handle_connection(
+                                    stream,
+                                    dialer,
+                                    dns_forward_addr,
+                                    host_ns_fd,
+                                )
+                                .await
+                                {
                                     error!(
                                         peer_addr = %peer_addr,
                                         elapsed_ms = %start.elapsed().as_millis(),
@@ -521,6 +559,8 @@ impl std::fmt::Debug for TproxyListener {
 async fn handle_connection(
     mut inbound: TcpStream,
     dialer: Arc<dyn OutboundDialer>,
+    dns_forward_addr: Option<SocketAddr>,
+    host_ns_fd: Option<RawFd>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let peer_addr = inbound.peer_addr().ok();
@@ -537,7 +577,28 @@ async fn handle_connection(
     )?;
     debug!(orig_dst = %orig_dst, "handle_connection: got original destination");
 
-    // ---- 步骤 1.5：禁用 Nagle（TCP_NODELAY），降低交互式小包延迟 ----
+    // ---- 步骤 1.5：TCP DNS 劫持 ----
+    // eBPF 已把 TCP 53 查询重定向到控制平面（ROUTE_STATE_DNS_QUERY）。
+    // 这里把 DNS-over-TCP 会话转发给内部 DNS handler，而不是走代理，
+    // 与 UDP 劫持（dns_forward_addr）保持一致。这样 TCP DNS 也能进入
+    // DNS 模块的缓存/防污染/代理逻辑。
+    if orig_dst.port() == 53 {
+        if let Some(handler_addr) = dns_forward_addr {
+            info!(
+                "TCP DNS hijack: {} -> {} (querying {})",
+                peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+                orig_dst,
+                handler_addr,
+            );
+            return handle_dns_tcp_connection(inbound, handler_addr, host_ns_fd).await;
+        }
+        warn!(
+            orig_dst = %orig_dst,
+            "TCP DNS connection to port 53 but no DNS forward addr configured; proxying directly"
+        );
+    }
+
+    // ---- 步骤 2：禁用 Nagle（TCP_NODELAY），降低交互式小包延迟 ----
     // 入站连接由内核 accept 默认开启 Nagle；出站连接在 SOCKS5 Dialer中设置。
     set_tcp_nodelay(&inbound);
 
@@ -649,6 +710,42 @@ async fn handle_connection(
         }
     }
 
+    Ok(())
+}
+
+/// 转发一个 DNS-over-TCP 会话到内部 DNS handler。
+///
+/// DNS-over-TCP 使用 2 字节长度前缀帧（RFC 1035 §4.2.2）。这里把客户端
+/// 连接与内部 DNS handler 之间的字节流双向转发即可：查询帧发给 handler，
+/// 响应帧回传客户端。由于客户端连接是 IP_TRANSPARENT 的 TProxy socket
+/// （本地地址 = 原始目标 DNS 服务器），回程数据源地址正确，客户端不会丢弃。
+///
+/// 上游 socket 在宿主 NS 创建（`host_ns_fd`）并打 SO_MARK=DAE_SOCKET_MARK，
+/// 与 UDP 劫持路径保持一致，确保 eBPF 放行（防劫持循环）。
+async fn handle_dns_tcp_connection(
+    mut inbound: TcpStream,
+    handler_addr: SocketAddr,
+    host_ns_fd: Option<RawFd>,
+) -> Result<()> {
+    let timeout = Duration::from_secs(5);
+    let mut upstream = protocols::hostns::connect_tcp(
+        handler_addr,
+        &protocols::hostns::DirectSocket::control_plane(host_ns_fd),
+        false,
+        timeout,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to connect to internal DNS handler {}: {}", handler_addr, e))?;
+
+    set_tcp_nodelay(&upstream);
+    // 纯字节中继：长度前缀帧原样透传，无需在此解析 DNS。
+    let (a, b) = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await?;
+    debug!(
+        handler_addr = %handler_addr,
+        up_bytes = a,
+        down_bytes = b,
+        "TCP DNS hijack session completed"
+    );
     Ok(())
 }
 

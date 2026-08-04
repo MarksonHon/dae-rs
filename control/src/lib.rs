@@ -1406,11 +1406,26 @@ impl ControlPlane {
             })?;
         debug!(listen_addr = %listen_addr, "TProxy listen address");
 
-        let tproxy_tcp = Arc::new(TproxyListener::new_with_mark(
-            listen_addr,
-            dialer.clone(),
-            tproxy_listener_mark,
-        ));
+        let tproxy_tcp = {
+            let mut tcp = TproxyListener::new_with_mark(
+                listen_addr,
+                dialer.clone(),
+                tproxy_listener_mark,
+            );
+            // TCP DNS 劫持：原始目标为 53 端口的连接转发到内部 DNS handler
+            // （与 UDP 劫持一致），上游连接在宿主 NS 创建。
+            tcp.set_host_ns_fd(host_ns_fd);
+            if let Some(ref dns_cfg) = self.config.dns_config {
+                if let Ok(dns_bind) = dns_cfg.bind.parse::<std::net::SocketAddr>() {
+                    let dns_forward: std::net::SocketAddr =
+                        format!("169.254.0.1:{}", dns_bind.port())
+                            .parse()
+                            .expect("invalid DNS forward address");
+                    tcp.set_dns_forward_addr(dns_forward);
+                }
+            }
+            Arc::new(tcp)
+        };
         let tproxy_udp = {
             let mut udp = UdpTproxyListener::new_with_mark(
                 listen_addr,

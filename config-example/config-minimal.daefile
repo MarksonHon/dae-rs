@@ -18,11 +18,16 @@ outbounds {
       password: password123
       dial_timeout_ms: 5000
     }
+    fallback {
+      protocol: socks5
+      address: 192.168.12.1:9696
+      dial_timeout_ms: 5000
+    }
   }
   groups {
     proxy {
-      policy: fixed
-      nodes(main)
+      policy: min_avg10
+      nodes(regex: '*')
     }
   }
 }

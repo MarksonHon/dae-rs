@@ -52,6 +52,14 @@ const MAX_PAYLOAD: usize = 0x3FFF;
 /// BLAKE3 derive-key context for the AEAD-2022 identity key (SIP022)
 const BLAKE3_IDENTITY_CONTEXT: &str = "shadowsocks 2022 identity";
 
+/// Generate a random AEAD 2022 UDP client session ID (shadowsocks-rust uses a
+/// stable per-relay-socket session ID; each `udp_dial` gets its own).
+fn random_session_id() -> u64 {
+    let mut buf = [0u8; 8];
+    random_iv_or_salt(&mut buf);
+    u64::from_be_bytes(buf)
+}
+
 /// Shadowsocks Dialer
 pub struct ShadowsocksDialer {
     /// Upstream Shadowsocks proxy server address
@@ -299,8 +307,9 @@ impl OutboundDialer for ShadowsocksDialer {
 
     /// Establish Shadowsocks UDP relay session.
     ///
-    /// Each datagram independently salted encrypted: `[salt][AEAD(addr + payload)]`,
-    /// no handshake needed, sent directly to proxy server.
+    /// Legacy AEAD: each datagram independently salted encrypted
+    /// (`[salt][AEAD(addr + payload)]`). AEAD 2022: SIP022 UDP wire format.
+    /// No handshake needed; datagrams go straight to the proxy server.
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
         let kind = self.cipher_kind()?;
         let key = Self::master_key(kind, &self.password);
@@ -318,6 +327,9 @@ impl OutboundDialer for ShadowsocksDialer {
             socket,
             kind,
             key,
+            is_2022: kind.is_aead_2022(),
+            client_session_id: random_session_id(),
+            packet_id: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
@@ -335,72 +347,278 @@ impl OutboundDialer for ShadowsocksDialer {
 
 /// Shadowsocks UDP relay session.
 ///
-/// Each datagram = `[salt][AEAD(addr + payload)]`; legacy uses HKDF-SHA1 to derive
-/// session sub-key, 2022 uses BLAKE3 (session_id = 0).
+/// Legacy AEAD datagram: `[salt][AEAD(addr + payload)]` (each datagram
+/// independently salted; key = master key, nonce derived from salt).
+///
+/// AEAD 2022 (SIP022) datagram — matches shadowsocks-rust's
+/// `relay/udprelay/aead_2022.rs`:
+///
+/// AES-*-GCM:
+/// ```text
+/// [AES-ECB(PSK, SessionID||PacketID)] [TYPE][Timestamp][PadLen][Padding][Addr][Payload][TAG]
+///     ^^^^^^^^^ 16 bytes ^^^^^^^^^^         ^^^^^^^^  AEAD message ^^^^^^^^
+/// AEAD nonce  = header[4..16];  session key = derive(master_key, SessionID)
+/// ```
+///
+/// ChaCha20-Poly1305: same body but nonce (24B) is prepended and the PSK is
+/// used directly as the AEAD key (no derived session key).
 struct SsUdpSession {
     socket: tokio::net::UdpSocket,
     kind: CipherKind,
     key: Vec<u8>,
+    /// Whether this session uses the AEAD 2022 wire format.
+    is_2022: bool,
+    /// Client session ID (2022): random per session, echoed by the server.
+    client_session_id: u64,
+    /// Per-packet monotonically increasing ID (2022).
+    packet_id: std::sync::atomic::AtomicU64,
 }
 
+const SS_UDP_TAG_LEN: usize = 16;
+/// Server->client socket type marker (AEAD 2022).
+const SS_UDP_SERVER_SOCKET_TYPE: u8 = 1;
+
 impl SsUdpSession {
-    fn salt_len(&self) -> usize {
-        self.kind.salt_len()
+    /// Build a legacy AEAD UDP datagram: `[salt][AEAD(addr + payload)]`.
+    fn build_legacy_packet(
+        &self,
+        dest: &std::net::SocketAddr,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ShadowsocksError> {
+        let mut salt = vec![0u8; self.kind.salt_len()];
+        random_iv_or_salt(&mut salt);
+
+        let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
+        let mut pkt = vec![0u8; addr.len() + payload.len() + SS_UDP_TAG_LEN];
+        pkt[..addr.len()].copy_from_slice(&addr);
+        pkt[addr.len()..addr.len() + payload.len()].copy_from_slice(payload);
+
+        let mut cipher = V1Cipher::new(self.kind, &self.key, &salt);
+        cipher.encrypt_packet(&mut pkt);
+
+        let mut datagram = salt;
+        datagram.extend_from_slice(&pkt);
+        Ok(datagram)
     }
 
-    fn encrypt(&self, addr_and_payload: &mut [u8], salt: &[u8]) -> Result<(), ShadowsocksError> {
-        match self.kind.category() {
-            CipherCategory::Aead => {
-                let mut cipher = V1Cipher::new(self.kind, &self.key, salt);
-                cipher.encrypt_packet(addr_and_payload);
-            }
-            CipherCategory::Aead2022 => {
-                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(self.kind, &self.key, 0);
-                cipher.encrypt_packet(salt, addr_and_payload);
-            }
-            other => {
-                return Err(ShadowsocksError::InvalidCipher(format!(
-                    "cipher '{}' category {:?} not supported for UDP",
-                    self.kind, other
-                )))
-            }
-        }
-        Ok(())
-    }
+    /// Build an AEAD 2022 UDP datagram (client -> server).
+    fn build_2022_packet(
+        &self,
+        dest: &std::net::SocketAddr,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ShadowsocksError> {
+        let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
+        let packet_id = self.packet_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| ShadowsocksError::Other(format!("system clock before epoch: {}", e)))?
+            .as_secs();
 
-    fn decrypt(&self, data: &mut [u8], salt: &[u8]) -> Result<bool, ShadowsocksError> {
-        match self.kind.category() {
-            CipherCategory::Aead => {
-                let mut cipher = V1Cipher::new(self.kind, &self.key, salt);
-                Ok(cipher.decrypt_packet(data))
+        match self.kind {
+            CipherKind::AEAD2022_BLAKE3_AES_128_GCM | CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+                // [SessionID(8)][PacketID(8)] ECB-encrypted header + AEAD body
+                let body_len = 1 + 8 + 2 + addr.len() + payload.len();
+                let mut buf = vec![0u8; 16 + body_len + SS_UDP_TAG_LEN];
+                buf[0..8].copy_from_slice(&self.client_session_id.to_be_bytes());
+                buf[8..16].copy_from_slice(&packet_id.to_be_bytes());
+
+                // AEAD nonce is the plaintext header[4..16] — capture before ECB.
+                let nonce: [u8; 12] = buf[4..16].try_into().expect("12-byte nonce");
+                {
+                    let body = &mut buf[16..16 + body_len];
+                    body[0] = 0; // client socket type
+                    body[1..9].copy_from_slice(&now.to_be_bytes());
+                    body[9..11].copy_from_slice(&0u16.to_be_bytes()); // padding size
+                    body[11..11 + addr.len()].copy_from_slice(&addr);
+                    body[11 + addr.len()..].copy_from_slice(payload);
+                }
+
+                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(
+                    self.kind,
+                    &self.key,
+                    self.client_session_id,
+                );
+                cipher.encrypt_packet(&nonce, &mut buf[16..]);
+
+                aes_ecb_2022(self.kind, &self.key, &mut buf[0..16], true)
+                    .map_err(ShadowsocksError::ProtocolError)?;
+                Ok(buf)
             }
-            CipherCategory::Aead2022 => {
-                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(self.kind, &self.key, 0);
-                Ok(cipher.decrypt_packet(salt, data))
+            CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => {
+                let nonce_size = shadowsocks_crypto::v2::udp::ChaCha20Poly1305Cipher::nonce_size();
+                let body_len = 8 + 8 + 1 + 8 + 2 + addr.len() + payload.len();
+                let mut buf = vec![0u8; nonce_size + body_len + SS_UDP_TAG_LEN];
+                let mut nonce = vec![0u8; nonce_size];
+                random_iv_or_salt(&mut nonce);
+                buf[..nonce_size].copy_from_slice(&nonce);
+
+                let body = &mut buf[nonce_size..nonce_size + body_len];
+                body[0..8].copy_from_slice(&self.client_session_id.to_be_bytes());
+                body[8..16].copy_from_slice(&packet_id.to_be_bytes());
+                body[16] = 0; // client socket type
+                body[17..25].copy_from_slice(&now.to_be_bytes());
+                body[25..27].copy_from_slice(&0u16.to_be_bytes()); // padding size
+                body[27..27 + addr.len()].copy_from_slice(&addr);
+                body[27 + addr.len()..].copy_from_slice(payload);
+
+                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(
+                    self.kind,
+                    &self.key,
+                    self.client_session_id,
+                );
+                cipher.encrypt_packet(&nonce, &mut buf[nonce_size..]);
+                Ok(buf)
             }
             other => Err(ShadowsocksError::InvalidCipher(format!(
-                "cipher '{}' category {:?} not supported for UDP",
+                "cipher '{}' category {:?} not supported for UDP 2022",
                 self.kind, other
             ))),
         }
     }
+
+    /// Decrypt and parse a server (server -> client) AEAD 2022 datagram.
+    fn recv_2022(&self, data: &[u8]) -> Result<(std::net::SocketAddr, Vec<u8>), ShadowsocksError> {
+        let mut buf = data.to_vec();
+
+        // Decrypted server body differs by kind:
+        //  - AES-GCM: body starts with TYPE (header `[SessionID||PacketID]` is the ECB block)
+        //  - ChaCha:  body starts with `[server_session_id||packet_id]`, TYPE follows
+        // `skip` = offset of the TYPE byte within the body.
+        let (body, skip) = match self.kind {
+            CipherKind::AEAD2022_BLAKE3_AES_128_GCM | CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+                if buf.len() < 16 + 1 + 8 + 8 + 2 + SS_UDP_TAG_LEN {
+                    return Err(ShadowsocksError::ProtocolError(
+                        "short AEAD 2022 server UDP packet".into(),
+                    ));
+                }
+                let header_len = 16;
+                aes_ecb_2022(self.kind, &self.key, &mut buf[0..header_len], false)
+                    .map_err(ShadowsocksError::ProtocolError)?;
+                let server_session_id = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+                let nonce: [u8; 12] = buf[4..16].try_into().expect("12-byte nonce");
+                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(
+                    self.kind,
+                    &self.key,
+                    server_session_id,
+                );
+                // decrypt_packet takes the full ciphertext (payload + tag) and
+                // strips the tag internally.
+                if !cipher.decrypt_packet(&nonce, &mut buf[header_len..]) {
+                    return Err(ShadowsocksError::ProtocolError(
+                        "AEAD 2022 UDP decrypt failed".into(),
+                    ));
+                }
+                (buf[header_len..buf.len() - SS_UDP_TAG_LEN].to_vec(), 0usize)
+            }
+            CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => {
+                let nonce_size = shadowsocks_crypto::v2::udp::ChaCha20Poly1305Cipher::nonce_size();
+                if buf.len() < nonce_size + 8 + 8 + 1 + 8 + 8 + 2 + SS_UDP_TAG_LEN {
+                    return Err(ShadowsocksError::ProtocolError(
+                        "short AEAD 2022 server UDP packet".into(),
+                    ));
+                }
+                let (nonce, msg) = buf.split_at_mut(nonce_size);
+                let session_id = u64::from_be_bytes(msg[0..8].try_into().unwrap());
+                let cipher =
+                    shadowsocks_crypto::v2::udp::UdpCipher::new(self.kind, &self.key, session_id);
+                if !cipher.decrypt_packet(nonce, msg) {
+                    return Err(ShadowsocksError::ProtocolError(
+                        "AEAD 2022 UDP decrypt failed".into(),
+                    ));
+                }
+                (msg[..msg.len() - SS_UDP_TAG_LEN].to_vec(), 16usize)
+            }
+            other => {
+                return Err(ShadowsocksError::InvalidCipher(format!(
+                    "cipher '{}' category {:?} not supported for UDP 2022",
+                    self.kind, other
+                )))
+            }
+        };
+
+        // Server payload layout (fields after TYPE):
+        // [TYPE(1)][timestamp(8)][client_session_id(8)][pad_len(2)][padding][addr][payload]
+        if body.len() < skip + 1 + 8 + 8 + 2 {
+            return Err(ShadowsocksError::ProtocolError(
+                "short AEAD 2022 server UDP body".into(),
+            ));
+        }
+        let socket_type = body[skip];
+        if socket_type != SS_UDP_SERVER_SOCKET_TYPE {
+            return Err(ShadowsocksError::ProtocolError(format!(
+                "invalid AEAD 2022 server socket type {}",
+                socket_type
+            )));
+        }
+        let client_session_id =
+            u64::from_be_bytes(body[skip + 9..skip + 17].try_into().unwrap());
+        if client_session_id != self.client_session_id {
+            return Err(ShadowsocksError::ProtocolError(format!(
+                "AEAD 2022 server echoed unknown client session id {}",
+                client_session_id
+            )));
+        }
+        let padding_len = u16::from_be_bytes(body[skip + 17..skip + 19].try_into().unwrap()) as usize;
+        let pos = skip + 19 + padding_len;
+        if pos >= body.len() {
+            return Err(ShadowsocksError::ProtocolError(
+                "AEAD 2022 server UDP body too short for address".into(),
+            ));
+        }
+        let (dest, consumed) = decode_addr(&body[pos..])?;
+        let payload = body[pos + consumed..].to_vec();
+        Ok((dest, payload))
+    }
+}
+
+/// AES-ECB encrypt/decrypt a single 16-byte block for the AEAD 2022 UDP header
+/// (`[SessionID||PacketID]`). Uses the master key directly (single-key setup,
+/// matching shadowsocks-rust where `ipsk == key` when no identity keys).
+fn aes_ecb_2022(kind: CipherKind, key: &[u8], block: &mut [u8], encrypt: bool) -> Result<(), String> {
+    use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+    match kind {
+        CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
+            let cipher =
+                aes::Aes128::new_from_slice(key).map_err(|e| format!("AES-128 key init: {}", e))?;
+            let b = aes::Block::from_mut_slice(block);
+            if encrypt {
+                cipher.encrypt_block(b);
+            } else {
+                cipher.decrypt_block(b);
+            }
+        }
+        CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+            let cipher =
+                aes::Aes256::new_from_slice(key).map_err(|e| format!("AES-256 key init: {}", e))?;
+            let b = aes::Block::from_mut_slice(block);
+            if encrypt {
+                cipher.encrypt_block(b);
+            } else {
+                cipher.decrypt_block(b);
+            }
+        }
+        other => {
+            return Err(format!(
+                "AES-ECB header block only valid for AES-GCM 2022, got {}",
+                other
+            ))
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
 impl crate::UdpSession for SsUdpSession {
     async fn send(&self, dest: &std::net::SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
-        let mut salt = vec![0u8; self.salt_len()];
-        random_iv_or_salt(&mut salt);
-
-        // [addr][payload] encrypted as a whole
-        let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
-        let mut pkt = vec![0u8; addr.len() + payload.len() + 16];
-        pkt[..addr.len()].copy_from_slice(&addr);
-        pkt[addr.len()..addr.len() + payload.len()].copy_from_slice(payload);
-        self.encrypt(&mut pkt, &salt)?;
-
-        let mut datagram = salt;
-        datagram.extend_from_slice(&pkt);
+        let datagram = if self.is_2022 {
+            self.build_2022_packet(dest, payload).map_err(|e| {
+                anyhow::anyhow!("ss udp 2022: failed to build packet: {}", e)
+            })?
+        } else {
+            self.build_legacy_packet(dest, payload).map_err(|e| {
+                anyhow::anyhow!("ss udp: failed to build packet: {}", e)
+            })?
+        };
         self.socket.send(&datagram).await?;
         Ok(())
     }
@@ -408,14 +626,27 @@ impl crate::UdpSession for SsUdpSession {
     async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Vec<u8>)> {
         let mut buf = vec![0u8; 65535];
         let len = self.socket.recv(&mut buf).await?;
-        let salt_len = self.salt_len();
+        if self.is_2022 {
+            return self
+                .recv_2022(&buf[..len])
+                .map_err(|e| anyhow::anyhow!("ss udp 2022: recv failed: {}", e));
+        }
+
+        // Legacy AEAD: [salt][AEAD(addr + payload + tag)]
+        let salt_len = self.kind.salt_len();
         if len < salt_len {
             return Err(anyhow::anyhow!("ss udp: packet too short for salt"));
         }
         let (salt, data) = buf[..len].split_at_mut(salt_len);
-        if !self.decrypt(data, salt)? {
+        let mut cipher = V1Cipher::new(self.kind, &self.key, salt);
+        if !cipher.decrypt_packet(data) {
             return Err(anyhow::anyhow!("ss udp: decrypt failed"));
         }
+        let tag_len = cipher.tag_len();
+        if data.len() < tag_len {
+            return Err(anyhow::anyhow!("ss udp: packet too short for tag"));
+        }
+        let data = &data[..data.len() - tag_len];
         let (dest, consumed) = decode_addr(data)?;
         let payload = data[consumed..].to_vec();
         Ok((dest, payload))
@@ -966,5 +1197,225 @@ mod tests {
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf[..], plain);
         server_task.await.unwrap();
+    }
+
+    // ==========================================================================
+    // AEAD 2022 UDP wire-format regression tests
+    //
+    // These verify dae-rs's SsUdpSession speaks the standard SIP022 UDP protocol
+    // as implemented by shadowsocks-rust (relay/udprelay/aead_2022.rs). A
+    // reference-style "server" encoder/decoder is used to prove interop:
+    //   - dae-rs client packet  -> reference-style server decrypts correctly
+    //   - reference-style server response -> dae-rs recv_2022 decrypts correctly
+    // ==========================================================================
+
+    fn make_2022_session(kind: CipherKind) -> SsUdpSession {
+        let key = ShadowsocksDialer::master_key(kind, "password");
+        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        std_socket.set_nonblocking(true).unwrap();
+        let socket = tokio::net::UdpSocket::from_std(std_socket).unwrap();
+        SsUdpSession {
+            socket,
+            kind,
+            key,
+            is_2022: true,
+            client_session_id: 0xdead_beef_cafe_babe,
+            packet_id: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Reference-style server decryption of a client->server AEAD 2022 packet.
+    fn server_decrypt_client_2022(
+        key: &[u8],
+        kind: CipherKind,
+        packet: &[u8],
+    ) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
+        let tag = SS_UDP_TAG_LEN;
+        let mut buf = packet.to_vec();
+        match kind {
+            CipherKind::AEAD2022_BLAKE3_AES_128_GCM | CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+                if buf.len() < 16 + 11 + tag {
+                    anyhow::bail!("packet too short");
+                }
+                aes_ecb_2022(kind, key, &mut buf[0..16], false)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let session_id = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+                let nonce: [u8; 12] = buf[4..16].try_into().unwrap();
+                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(kind, key, session_id);
+                if !cipher.decrypt_packet(&nonce, &mut buf[16..]) {
+                    anyhow::bail!("decrypt failed");
+                }
+                parse_client_body(&buf[16..buf.len() - tag], 0)
+            }
+            CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => {
+                let nonce_size =
+                    shadowsocks_crypto::v2::udp::ChaCha20Poly1305Cipher::nonce_size();
+                if buf.len() < nonce_size + 8 + 8 + 1 + 8 + 2 + tag {
+                    anyhow::bail!("packet too short");
+                }
+                let (nonce, msg) = buf.split_at_mut(nonce_size);
+                let session_id = u64::from_be_bytes(msg[0..8].try_into().unwrap());
+                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(kind, key, session_id);
+                if !cipher.decrypt_packet(nonce, msg) {
+                    anyhow::bail!("decrypt failed");
+                }
+                parse_client_body(&msg[..msg.len() - tag], 16)
+            }
+            _ => anyhow::bail!("not a 2022 kind"),
+        }
+    }
+
+    /// Parse a decrypted client->server body. `skip` = 0 for AES-GCM (body starts
+    /// with TYPE), 16 for ChaCha (body starts with SessionID||PacketID).
+    fn parse_client_body(body: &[u8], skip: usize) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
+        if body.len() < skip + 11 {
+            anyhow::bail!("short client body");
+        }
+        if body[skip] != 0 {
+            anyhow::bail!("expected client socket type, got {}", body[skip]);
+        }
+        let pad_len = u16::from_be_bytes(body[skip + 9..skip + 11].try_into().unwrap()) as usize;
+        let pos = skip + 11 + pad_len;
+        if pos >= body.len() {
+            anyhow::bail!("short client body for address");
+        }
+        let (dest, consumed) = decode_addr(&body[pos..])?;
+        Ok((dest, body[pos + consumed..].to_vec()))
+    }
+
+    /// Reference-style server encryption of a server->client AEAD 2022 packet.
+    fn server_encrypt_response_2022(
+        key: &[u8],
+        kind: CipherKind,
+        client_session_id: u64,
+        dest: &SocketAddr,
+        payload: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
+        let server_session_id = 0x1111_2222_3333_4444u64;
+        let packet_id = 1u64;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        match kind {
+            CipherKind::AEAD2022_BLAKE3_AES_128_GCM | CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+                let body_len = 1 + 8 + 8 + 2 + addr.len() + payload.len();
+                let mut buf = vec![0u8; 16 + body_len + SS_UDP_TAG_LEN];
+                buf[0..8].copy_from_slice(&server_session_id.to_be_bytes());
+                buf[8..16].copy_from_slice(&packet_id.to_be_bytes());
+                let nonce: [u8; 12] = buf[4..16].try_into().unwrap();
+                let body = &mut buf[16..16 + body_len];
+                body[0] = SS_UDP_SERVER_SOCKET_TYPE;
+                body[1..9].copy_from_slice(&now.to_be_bytes());
+                body[9..17].copy_from_slice(&client_session_id.to_be_bytes());
+                body[17..19].copy_from_slice(&0u16.to_be_bytes());
+                body[19..19 + addr.len()].copy_from_slice(&addr);
+                body[19 + addr.len()..].copy_from_slice(payload);
+                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(kind, key, server_session_id);
+                cipher.encrypt_packet(&nonce, &mut buf[16..]);
+                aes_ecb_2022(kind, key, &mut buf[0..16], true).map_err(|e| anyhow::anyhow!(e))?;
+                Ok(buf)
+            }
+            CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305 => {
+                let nonce_size =
+                    shadowsocks_crypto::v2::udp::ChaCha20Poly1305Cipher::nonce_size();
+                let body_len = 8 + 8 + 1 + 8 + 8 + 2 + addr.len() + payload.len();
+                let mut buf = vec![0u8; nonce_size + body_len + SS_UDP_TAG_LEN];
+                let mut nonce = vec![0u8; nonce_size];
+                random_iv_or_salt(&mut nonce);
+                buf[..nonce_size].copy_from_slice(&nonce);
+                let body = &mut buf[nonce_size..nonce_size + body_len];
+                body[0..8].copy_from_slice(&server_session_id.to_be_bytes());
+                body[8..16].copy_from_slice(&packet_id.to_be_bytes());
+                body[16] = SS_UDP_SERVER_SOCKET_TYPE;
+                body[17..25].copy_from_slice(&now.to_be_bytes());
+                body[25..33].copy_from_slice(&client_session_id.to_be_bytes());
+                body[33..35].copy_from_slice(&0u16.to_be_bytes());
+                body[35..35 + addr.len()].copy_from_slice(&addr);
+                body[35 + addr.len()..].copy_from_slice(payload);
+                let cipher = shadowsocks_crypto::v2::udp::UdpCipher::new(kind, key, server_session_id);
+                cipher.encrypt_packet(&nonce, &mut buf[nonce_size..]);
+                Ok(buf)
+            }
+            _ => anyhow::bail!("not a 2022 kind"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_udp_2022_aes_gcm_interop() {
+        for cipher in ["2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"] {
+            let kind = CipherKind::from_str(cipher).unwrap();
+            let session = make_2022_session(kind);
+            let dest: SocketAddr = "1.1.1.1:53".parse().unwrap();
+            let payload = b"hello dns payload";
+
+            // client -> server
+            let packet = session.build_2022_packet(&dest, payload).unwrap();
+            let (got_dest, got_payload) =
+                server_decrypt_client_2022(&session.key, kind, &packet).unwrap();
+            assert_eq!(got_dest, dest, "{}", cipher);
+            assert_eq!(got_payload, payload, "{}", cipher);
+
+            // server -> client
+            let resp =
+                server_encrypt_response_2022(&session.key, kind, session.client_session_id, &dest, payload).unwrap();
+            let (got_dest2, got_payload2) = session.recv_2022(&resp).unwrap();
+            assert_eq!(got_dest2, dest, "{}", cipher);
+            assert_eq!(got_payload2, payload, "{}", cipher);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_udp_2022_chacha20_poly1305_interop() {
+        let kind = CipherKind::from_str("2022-blake3-chacha20-poly1305").unwrap();
+        let session = make_2022_session(kind);
+        let dest: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let payload = b"hello dns payload v6";
+
+        let packet = session.build_2022_packet(&dest, payload).unwrap();
+        let (got_dest, got_payload) =
+            server_decrypt_client_2022(&session.key, kind, &packet).unwrap();
+        assert_eq!(got_dest, dest);
+        assert_eq!(got_payload, payload);
+
+        let resp = server_encrypt_response_2022(&session.key, kind, session.client_session_id, &dest, payload).unwrap();
+        let (got_dest2, got_payload2) = session.recv_2022(&resp).unwrap();
+        assert_eq!(got_dest2, dest);
+        assert_eq!(got_payload2, payload);
+    }
+
+    #[tokio::test]
+    async fn test_udp_legacy_aead_roundtrip() {
+        // Legacy AEAD: dae-rs build + decrypt must round-trip (regression guard).
+        for cipher in ["aes-256-gcm", "chacha20-ietf-poly1305"] {
+            let kind = CipherKind::from_str(cipher).unwrap();
+            let key = ShadowsocksDialer::master_key(kind, "password");
+            let std_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            std_socket.set_nonblocking(true).unwrap();
+            let session = SsUdpSession {
+                socket: tokio::net::UdpSocket::from_std(std_socket).unwrap(),
+                kind,
+                key,
+                is_2022: false,
+                client_session_id: 0,
+                packet_id: std::sync::atomic::AtomicU64::new(0),
+            };
+            let dest: SocketAddr = "8.8.8.8:53".parse().unwrap();
+            let payload = b"legacy dns payload";
+
+            let packet = session.build_legacy_packet(&dest, payload).unwrap();
+            // Simulate server decrypt: split salt, V1Cipher decrypt, strip tag, decode addr
+            let salt_len = kind.salt_len();
+            let (salt, data) = packet.split_at(salt_len);
+            let mut cipher = V1Cipher::new(kind, &session.key, salt);
+            let mut data = data.to_vec();
+            assert!(cipher.decrypt_packet(&mut data));
+            let tag_len = cipher.tag_len();
+            let data = &data[..data.len() - tag_len];
+            let (got_dest, consumed) = decode_addr(data).unwrap();
+            assert_eq!(got_dest, dest);
+            assert_eq!(&data[consumed..], payload);
+        }
     }
 }

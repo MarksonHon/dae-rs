@@ -302,14 +302,7 @@ mod tests {
                 rules: routing_rules,
                 fallback: fallback.to_string(),
             },
-            cache: config::DnsCacheConfig {
-                enabled: true,
-                max_size: 1024,
-                max_ttl: 86400,
-                min_ttl: 60,
-                optimistic_cache: false,
-                optimistic_cache_ttl: 3600,
-            },
+            cache: config::DnsCacheConfig::default(),
         }
     }
 

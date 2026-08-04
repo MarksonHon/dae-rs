@@ -35,6 +35,12 @@ pub struct DnsUpstreamPool {
     /// socket per upstream and multiplexes concurrent queries by rewriting the
     /// DNS transaction ID (RFC-style, same technique as kixdns).
     udp_pool: Mutex<Option<Arc<UdpPool>>>,
+    /// Reusable TCP multiplexer (lazily created on first TCP query).
+    ///
+    /// One persistent marked connection per upstream carries all concurrent
+    /// DNS-over-TCP queries (pipelined, TXID-rewritten) instead of opening a
+    /// fresh connection per query.
+    tcp_mux: Mutex<Option<Arc<TcpMux>>>,
 }
 
 /// DNS transport protocol
@@ -84,6 +90,7 @@ impl DnsUpstreamPool {
             transport,
             timeout: Duration::from_secs(5),
             udp_pool: Mutex::new(None),
+            tcp_mux: Mutex::new(None),
         }
     }
 
@@ -131,17 +138,19 @@ impl DnsUpstreamPool {
     }
 
     async fn query_tcp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // TCP query socket: uniformly uses hostns::connect_tcp (control plane mark → direct)
-        let mut stream = protocols::hostns::connect_tcp(
-            self.address,
-            &protocols::hostns::DirectSocket::control_plane(None),
-            false,
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to create marked TCP socket: {}", e))?;
+        let mux = self.ensure_tcp_mux()?;
+        mux.query(request, self.timeout).await
+    }
 
-        Self::send_tcp_dns_query(&mut stream, request, self.timeout).await
+    /// Lazily create the shared TCP multiplexer for this upstream.
+    fn ensure_tcp_mux(&self) -> anyhow::Result<Arc<TcpMux>> {
+        let mut guard = self.tcp_mux.lock().unwrap();
+        if let Some(mux) = guard.as_ref() {
+            return Ok(mux.clone());
+        }
+        let mux = Arc::new(TcpMux::new(self.address));
+        guard.replace(mux.clone());
+        Ok(mux)
     }
 
     /// Send a DNS query over an existing TCP stream (2-byte length prefix framing).
@@ -319,6 +328,248 @@ impl UdpPool {
                 self.upstream
             )),
         }
+    }
+}
+
+// ============================================================================
+// Reusable TCP multiplexer (kixdns-style)
+// ============================================================================
+
+/// Pending TCP request: (original TXID, response sender).
+type TcpPending = (u16, tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>);
+
+/// RAII guard that removes the pending entry on drop.
+///
+/// Uses a `std::sync::Mutex` (never held across await) so Drop can be sync.
+struct TcpPendingGuard {
+    pending: Arc<std::sync::Mutex<HashMap<u16, TcpPending>>>,
+    id: u16,
+}
+
+impl Drop for TcpPendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// A persistent TCP connection multiplexing concurrent DNS-over-TCP queries to
+/// one upstream (RFC 7766 pipelining).
+///
+/// - One marked connection per upstream, created in the host NS with
+///   SO_MARK=DAE_SOCKET_MARK (eBPF self-exclusion).
+/// - Each query's TXID is rewritten to a locally-unique ID; a background reader
+///   matches length-prefixed responses by ID and restores the original TXID.
+/// - On transport error the connection is reset and all pending queries fail
+///   fast; the next query transparently reconnects.
+struct TcpMux {
+    upstream: SocketAddr,
+    /// Write half (owns the connection); `None` when disconnected.
+    write: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+    /// rewritten_id → (original_id, sender)
+    pending: Arc<std::sync::Mutex<HashMap<u16, TcpPending>>>,
+    next_id: AtomicU16,
+    /// Generation counter: a reader from an old (reset) connection must not
+    /// tear down the new one.
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Socket configuration (mark + host NS) for the upstream connection.
+    sock: protocols::hostns::DirectSocket,
+}
+
+impl TcpMux {
+    fn new(upstream: SocketAddr) -> Self {
+        Self::new_with_socket(upstream, &protocols::hostns::DirectSocket::control_plane(None))
+    }
+
+    /// Create a multiplexer using an explicit [`protocols::hostns::DirectSocket`]
+    /// configuration (tests pass `plain()` to avoid requiring `CAP_NET_ADMIN`).
+    fn new_with_socket(upstream: SocketAddr, sock: &protocols::hostns::DirectSocket) -> Self {
+        let write = Arc::new(tokio::sync::Mutex::new(None));
+        Self {
+            upstream,
+            write,
+            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_id: AtomicU16::new(0),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sock: *sock,
+        }
+    }
+
+    /// Ensure a live connection exists, reconnecting if the previous one died.
+    async fn ensure_conn(&self) -> anyhow::Result<()> {
+        let mut guard = self.write.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let stream = protocols::hostns::connect_tcp(
+            self.upstream,
+            &self.sock,
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to connect TCP upstream {}: {}", self.upstream, e))?;
+        set_tcp_nodelay(&stream);
+        let (read, write) = stream.into_split();
+        let my_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.spawn_reader(read, my_gen);
+        *guard = Some(write);
+        Ok(())
+    }
+
+    /// Background reader: dispatches length-prefixed responses to pending queries.
+    fn spawn_reader(&self, mut read: tokio::net::tcp::OwnedReadHalf, my_gen: u64) {
+        use tokio::io::AsyncReadExt;
+
+        let upstream = self.upstream;
+        let pending = self.pending.clone();
+        let write = self.write.clone();
+        let generation = self.generation.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(512);
+            loop {
+                // 2-byte length prefix
+                let mut len_buf = [0u8; 2];
+                if let Err(e) = read.read_exact(&mut len_buf).await {
+                    Self::on_conn_error(&pending, &write, &generation, my_gen, upstream, &e).await;
+                    return;
+                }
+                let resp_len = u16::from_be_bytes(len_buf) as usize;
+                if resp_len == 0 || resp_len > 65535 {
+                    Self::on_conn_error(
+                        &pending,
+                        &write,
+                        &generation,
+                        my_gen,
+                        upstream,
+                        &std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("invalid DNS TCP length {}", resp_len),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                if buf.capacity() < resp_len {
+                    buf = vec![0u8; resp_len];
+                }
+                buf.resize(resp_len, 0);
+                if let Err(e) = read.read_exact(&mut buf[..resp_len]).await {
+                    Self::on_conn_error(&pending, &write, &generation, my_gen, upstream, &e).await;
+                    return;
+                }
+                if resp_len < 2 {
+                    continue;
+                }
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let entry = pending.lock().unwrap().remove(&id);
+                let Some((original_id, tx)) = entry else {
+                    debug!(upstream = %upstream, id, "TCP mux response with unknown TXID (ignored)");
+                    continue;
+                };
+                let mut response = buf[..resp_len].to_vec();
+                response[0..2].copy_from_slice(&original_id.to_be_bytes());
+                let _ = tx.send(Ok(response));
+            }
+        });
+    }
+
+    /// Fail all pending queries and drop the connection, but only if this
+    /// reader still belongs to the current generation.
+    async fn on_conn_error(
+        pending: &Arc<std::sync::Mutex<HashMap<u16, TcpPending>>>,
+        write: &Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+        generation: &std::sync::atomic::AtomicU64,
+        my_gen: u64,
+        upstream: SocketAddr,
+        err: &std::io::Error,
+    ) {
+        if generation.load(Ordering::Relaxed) != my_gen {
+            return; // stale reader from a replaced connection
+        }
+        debug!(upstream = %upstream, error = %err, "TCP mux connection failed, resetting");
+        let entries: Vec<(u16, TcpPending)> =
+            pending.lock().unwrap().drain().collect();
+        for (_, (_, tx)) in entries {
+            let _ = tx.send(Err(anyhow::anyhow!(
+                "TCP upstream {} reset: {}",
+                upstream,
+                err
+            )));
+        }
+        // Drop the write half → the connection is gone; next query reconnects.
+        write.lock().await.take();
+    }
+
+    /// Send `request` and await the matched response, multiplexed over the
+    /// persistent connection.
+    async fn query(&self, request: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+        use tokio::io::AsyncWriteExt;
+
+        if request.len() < 2 {
+            anyhow::bail!("DNS query too short");
+        }
+        self.ensure_conn().await?;
+        let original_id = u16::from_be_bytes([request[0], request[1]]);
+
+        // Register pending with a fresh local ID.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let new_id = {
+            let mut map = self.pending.lock().unwrap();
+            let mut attempts = 0;
+            loop {
+                let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if !map.contains_key(&cand) {
+                    map.insert(cand, (original_id, tx));
+                    break cand;
+                }
+                attempts += 1;
+                if attempts > 1000 {
+                    anyhow::bail!("TCP mux pending full (upstream {})", self.upstream);
+                }
+            }
+        };
+        let _guard = TcpPendingGuard {
+            pending: self.pending.clone(),
+            id: new_id,
+        };
+
+        // Build the length-prefixed frame with the rewritten TXID.
+        let mut frame = Vec::with_capacity(2 + request.len());
+        frame.extend_from_slice(&(request.len() as u16).to_be_bytes());
+        frame.extend_from_slice(request);
+        frame[2..4].copy_from_slice(&new_id.to_be_bytes());
+
+        // Serialize writes (multiplexing requires atomic frames). The tokio
+        // Mutex is async-aware, so this is safe to hold across the await.
+        {
+            let mut guard = self.write.lock().await;
+            let stream = guard.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("TCP upstream {}: connection lost", self.upstream)
+            })?;
+            tokio::time::timeout(timeout, stream.write_all(&frame))
+                .await
+                .map_err(|_| anyhow::anyhow!("TCP upstream {}: write timed out", self.upstream))??;
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(anyhow::anyhow!(
+                "TCP upstream {}: response channel closed",
+                self.upstream
+            )),
+            Err(_) => Err(anyhow::anyhow!(
+                "TCP upstream {}: query timed out",
+                self.upstream
+            )),
+        }
+    }
+}
+
+/// Enable TCP_NODELAY (DNS-over-TCP latency is sensitive to small packets).
+fn set_tcp_nodelay(stream: &tokio::net::TcpStream) {
+    use socket2::SockRef;
+    if let Err(e) = SockRef::from(stream).set_nodelay(true) {
+        tracing::warn!("Failed to set TCP_NODELAY on DNS TCP upstream: {}", e);
     }
 }
 
@@ -674,6 +925,38 @@ pub fn patch_ttls(response: &mut [u8], elapsed: u32) {
     }
 }
 
+/// Set the TTL of every resource record in a DNS response to a fixed value.
+///
+/// Used when serving stale (expired) cache entries (RFC 8767 §4): the reply is
+/// served with a short TTL (e.g. 30s) so downstream resolvers do not cache it
+/// for the original long lifetime.
+pub fn set_all_ttls(response: &mut [u8], ttl: u32) {
+    if response.len() < 12 {
+        return;
+    }
+    let ancount = u16::from_be_bytes([response[6], response[7]]);
+    let nscount = u16::from_be_bytes([response[8], response[9]]);
+    let arcount = u16::from_be_bytes([response[10], response[11]]);
+    let total_rrs = ancount as usize + nscount as usize + arcount as usize;
+    if total_rrs == 0 {
+        return;
+    }
+
+    let mut pos = skip_question_section(response, 12);
+    for _ in 0..total_rrs {
+        if pos >= response.len() {
+            return;
+        }
+        pos = skip_name(response, pos);
+        if pos + 10 > response.len() {
+            return;
+        }
+        response[pos + 4..pos + 8].copy_from_slice(&ttl.to_be_bytes());
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10 + rdlength;
+    }
+}
+
 /// Skip a possibly-compressed DNS name at `pos`, returning the next offset.
 pub fn skip_name(response: &[u8], mut pos: usize) -> usize {
     loop {
@@ -816,6 +1099,79 @@ mod tests {
         pos = crate::dns::upstream::skip_name(&resp, pos);
         let ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
         assert_eq!(ttl, 0);
+    }
+
+    #[test]
+    fn test_set_all_ttls() {
+        let mut resp = make_response(0x2222, "example.com", 300);
+        set_all_ttls(&mut resp, 30);
+        let mut pos = crate::dns::upstream::skip_question_section(&resp, 12);
+        pos = crate::dns::upstream::skip_name(&resp, pos);
+        let ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
+        assert_eq!(ttl, 30);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_mux_multiplexes_concurrent_queries() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Mock TCP DNS upstream: reads length-prefixed frames and echoes them
+        // back (carrying the mux's rewritten TXID), for a short window.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::with_capacity(512);
+            loop {
+                let mut len_buf = [0u8; 2];
+                let len = tokio::select! {
+                    _ = done_rx.recv() => break,
+                    r = stream.read_exact(&mut len_buf) => match r {
+                        Ok(_) => u16::from_be_bytes(len_buf) as usize,
+                        Err(_) => break,
+                    },
+                };
+                if buf.capacity() < len {
+                    buf = vec![0u8; len];
+                }
+                buf.resize(len, 0);
+                if stream.read_exact(&mut buf[..len]).await.is_err() {
+                    break;
+                }
+                // Echo back length-prefixed, carrying the (rewritten) TXID.
+                let mut framed = Vec::with_capacity(2 + len);
+                framed.extend_from_slice(&(len as u16).to_be_bytes());
+                framed.extend_from_slice(&buf[..len]);
+                if stream.write_all(&framed).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mux = TcpMux::new_with_socket(upstream_addr, &protocols::hostns::DirectSocket::plain());
+        let q1 = build_dns_query("a.com", 1);
+        let q2 = build_dns_query("b.com", 1);
+        let mut q1 = q1;
+        let mut q2 = q2;
+        q1[0..2].copy_from_slice(&0x3333u16.to_be_bytes());
+        q2[0..2].copy_from_slice(&0x3333u16.to_be_bytes());
+
+        let (r1, r2) = tokio::join!(
+            mux.query(&q1, Duration::from_secs(5)),
+            mux.query(&q2, Duration::from_secs(5)),
+        );
+        let r1 = r1.expect("query1 ok");
+        let r2 = r2.expect("query2 ok");
+        // Both responses carry the original TXID restored.
+        assert_eq!(&r1[0..2], &0x3333u16.to_be_bytes());
+        assert_eq!(&r2[0..2], &0x3333u16.to_be_bytes());
+        // Each response carries its own question (length-prefixed qname).
+        assert!(r1.windows(5).any(|w| w == b"a\x03com"));
+        assert!(r2.windows(5).any(|w| w == b"b\x03com"));
+
+        let _ = done_tx.send(()).await;
+        server_task.abort();
     }
 
     #[tokio::test]

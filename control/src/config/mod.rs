@@ -356,12 +356,24 @@ pub struct DnsCacheConfig {
     /// How long expired entries are served during refresh (seconds)
     #[serde(default = "default_dns_optimistic_cache_ttl")]
     pub optimistic_cache_ttl: u32,
+    /// Whether to asynchronously refresh cache entries that are near expiry
+    #[serde(default)]
+    pub background_refresh: bool,
+    /// Refresh a cached entry when its remaining TTL drops below this percentage
+    /// of the original TTL (1-99)
+    #[serde(default = "default_dns_refresh_threshold_percent")]
+    pub refresh_threshold_percent: u8,
+    /// TTL served for stale (expired) entries while a refresh is in flight
+    #[serde(default = "default_dns_serve_stale_ttl")]
+    pub serve_stale_ttl: u32,
 }
 
 fn default_dns_cache_max_size() -> u32 { 4096 }
 fn default_dns_cache_max_ttl() -> u32 { 86400 }
 fn default_dns_cache_min_ttl() -> u32 { 60 }
 fn default_dns_optimistic_cache_ttl() -> u32 { 3600 }
+fn default_dns_refresh_threshold_percent() -> u8 { 20 }
+fn default_dns_serve_stale_ttl() -> u32 { 30 }
 
 impl Default for DnsCacheConfig {
     fn default() -> Self {
@@ -372,6 +384,9 @@ impl Default for DnsCacheConfig {
             min_ttl: 60,
             optimistic_cache: false,
             optimistic_cache_ttl: 3600,
+            background_refresh: false,
+            refresh_threshold_percent: 20,
+            serve_stale_ttl: 30,
         }
     }
 }

@@ -877,6 +877,27 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                                     message: format!("cannot parse as integer: '{}'", value),
                                 })?;
                             }
+                            "background_refresh" => {
+                                dns.cache.background_refresh = parse_bool(value).map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as boolean: '{}'", value),
+                                })?;
+                            }
+                            "refresh_threshold_percent" => {
+                                dns.cache.refresh_threshold_percent = value.parse().map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as integer: '{}'", value),
+                                })?;
+                            }
+                            "serve_stale_ttl" => {
+                                dns.cache.serve_stale_ttl = value.parse().map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as integer: '{}'", value),
+                                })?;
+                            }
                             _ => {
                                 return Err(ConfigError::Syntax {
                                     line: line_number,

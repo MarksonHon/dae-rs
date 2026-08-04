@@ -13,8 +13,26 @@ struct CachedResponse {
     original_ttl: u32,
     /// Effective deadline (after min/max TTL clamping)
     deadline: Instant,
-    /// Whether this entry is stale (being refreshed)
-    stale: bool,
+}
+
+/// Result of a cache lookup: fresh entry or an expired (stale) entry that is
+/// still servable within the optimistic (RFC 8767) window.
+pub enum CacheLookup<'a> {
+    /// Valid, unexpired entry.
+    Fresh {
+        /// Response bytes
+        bytes: &'a [u8],
+        /// Seconds since insertion (for RFC 1035 §5.2 TTL decrement)
+        elapsed_secs: u32,
+        /// Seconds remaining until expiry (for background-refresh decisions)
+        remaining_ttl: u32,
+    },
+    /// Expired entry within the serve-stale window. The caller should serve it
+    /// with a low TTL and trigger a background refresh.
+    Stale {
+        /// Response bytes
+        bytes: &'a [u8],
+    },
 }
 
 /// DNS response cache, partitioned per DNS group.
@@ -49,7 +67,10 @@ impl DnsCache {
 
     /// Look up a cached response for a specific DNS group.
     pub fn lookup(&self, group: &str, key: u64) -> Option<&[u8]> {
-        self.lookup_with_age(group, key).map(|(bytes, _)| bytes)
+        match self.lookup_state(group, key) {
+            Some(CacheLookup::Fresh { bytes, .. }) => Some(bytes),
+            _ => None,
+        }
     }
 
     /// Look up a cached response for a specific DNS group, returning the
@@ -57,21 +78,46 @@ impl DnsCache {
     ///
     /// The elapsed time is used by the caller to decrement TTLs per
     /// RFC 1035 §5.2 so cached responses report their true remaining lifetime.
+    /// Only fresh entries are returned (stale entries are handled via
+    /// [`DnsCache::lookup_state`]).
     pub fn lookup_with_age(&self, group: &str, key: u64) -> Option<(&[u8], u32)> {
+        match self.lookup_state(group, key) {
+            Some(CacheLookup::Fresh {
+                bytes,
+                elapsed_secs,
+                ..
+            }) => Some((bytes, elapsed_secs)),
+            _ => None,
+        }
+    }
+
+    /// Look up a cached response, distinguishing fresh vs. serve-stale.
+    ///
+    /// - Fresh: within the entry's TTL.
+    /// - Stale: expired but still inside the optimistic (`optimistic_cache_ttl`)
+    ///   window when `optimistic_cache` is enabled.
+    /// - None: miss or stale data outside the servable window.
+    pub fn lookup_state(&self, group: &str, key: u64) -> Option<CacheLookup<'_>> {
         let entry = self.entries.get(group)?.get(&key)?;
         let now = Instant::now();
 
         if now < entry.deadline {
             // Fresh entry
             let elapsed = now.duration_since(entry.created_at).as_secs() as u32;
-            Some((&entry.raw_response, elapsed))
-        } else if self.config.optimistic_cache && entry.stale {
-            // Stale entry but optimistic cache enabled
-            let stale_deadline =
-                entry.deadline + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
+            let remaining_ttl = entry.deadline.duration_since(now).as_secs() as u32;
+            Some(CacheLookup::Fresh {
+                bytes: &entry.raw_response,
+                elapsed_secs: elapsed,
+                remaining_ttl,
+            })
+        } else if self.config.optimistic_cache {
+            // Serve-stale (RFC 8767): keep expired entries within the window.
+            let stale_deadline = entry.deadline
+                + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
             if now < stale_deadline {
-                let elapsed = now.duration_since(entry.created_at).as_secs() as u32;
-                Some((&entry.raw_response, elapsed))
+                Some(CacheLookup::Stale {
+                    bytes: &entry.raw_response,
+                })
             } else {
                 None
             }
@@ -110,20 +156,8 @@ impl DnsCache {
                 created_at: Instant::now(),
                 original_ttl: ttl_secs,
                 deadline: Instant::now() + Duration::from_secs(ttl as u64),
-                stale: false,
             },
         );
-    }
-
-    /// Mark an entry as stale (for optimistic cache refresh)
-    pub fn mark_stale(&mut self, group: &str, key: u64) {
-        if let Some(entry) = self
-            .entries
-            .get_mut(group)
-            .and_then(|m| m.get_mut(&key))
-        {
-            entry.stale = true;
-        }
     }
 
     /// Remove expired entries across all groups.
@@ -177,6 +211,9 @@ mod tests {
             min_ttl: 10,
             optimistic_cache: false,
             optimistic_cache_ttl: 60,
+            background_refresh: false,
+            refresh_threshold_percent: 20,
+            serve_stale_ttl: 30,
         }
     }
 
@@ -289,5 +326,64 @@ mod tests {
 
         cache.insert("g1", key, vec![1, 2, 3], 60);
         assert!(cache.lookup("g1", key).is_none());
+    }
+
+    #[test]
+    fn test_lookup_state_serve_stale() {
+        let config = DnsCacheConfig {
+            optimistic_cache: true,
+            optimistic_cache_ttl: 3600,
+            ..default_cache_config()
+        };
+        let mut cache = DnsCache::new(&config);
+        let key = DnsCache::cache_key("example.com", 1, 1);
+
+        cache.insert("g1", key, vec![1, 2, 3], 60);
+        // Fresh within TTL
+        assert!(matches!(
+            cache.lookup_state("g1", key),
+            Some(CacheLookup::Fresh { .. })
+        ));
+
+        // Force expiry: backdate deadline into the past but inside the
+        // optimistic window (expired 10s ago, window 3600s).
+        if let Some(entry) = cache
+            .entries
+            .get_mut("g1")
+            .and_then(|m| m.get_mut(&key))
+        {
+            entry.deadline = Instant::now() - Duration::from_secs(10);
+        }
+        assert!(matches!(
+            cache.lookup_state("g1", key),
+            Some(CacheLookup::Stale { .. })
+        ));
+
+        // Beyond the serve-stale window → miss
+        if let Some(entry) = cache
+            .entries
+            .get_mut("g1")
+            .and_then(|m| m.get_mut(&key))
+        {
+            entry.deadline = Instant::now() - Duration::from_secs(3601);
+        }
+        assert!(cache.lookup_state("g1", key).is_none());
+        assert!(cache.lookup("g1", key).is_none());
+    }
+
+    #[test]
+    fn test_lookup_state_serve_stale_disabled() {
+        // optimistic_cache = false → expired entries are a miss.
+        let mut cache = DnsCache::new(&default_cache_config());
+        let key = DnsCache::cache_key("example.com", 1, 1);
+        cache.insert("g1", key, vec![1], 60);
+        if let Some(entry) = cache
+            .entries
+            .get_mut("g1")
+            .and_then(|m| m.get_mut(&key))
+        {
+            entry.deadline = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(cache.lookup_state("g1", key).is_none());
     }
 }

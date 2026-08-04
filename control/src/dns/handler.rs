@@ -33,7 +33,7 @@ const IPV6_TRANSPARENT: libc::c_int = 75;
 const SO_MARK: libc::c_int = 36;
 
 use crate::config::DnsConfig;
-use crate::dns::cache::DnsCache;
+use crate::dns::cache::{CacheLookup, DnsCache};
 use crate::dns::router::{DnsResponseAction, DnsRouter};
 use crate::dns::upstream::DnsUpstreamPool;
 
@@ -56,6 +56,9 @@ type InflightResult = Result<Vec<u8>, Arc<anyhow::Error>>;
 /// leader's result instead of querying upstream again (prevents cache stampede).
 type InflightMap =
     std::sync::Mutex<std::collections::HashMap<InflightKey, tokio::sync::watch::Sender<InflightResult>>>;
+
+/// Keys currently being background-refreshed (dedup for refresh tasks).
+type RefreshSet = std::sync::Mutex<std::collections::HashSet<InflightKey>>;
 
 /// Try to join an in-flight query for `key`.
 ///
@@ -150,6 +153,8 @@ pub struct DnsListener {
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     /// In-flight request deduplication map (singleflight).
     inflight: Arc<InflightMap>,
+    /// Keys currently being background-refreshed (dedup for refresh tasks).
+    refreshing: Arc<std::sync::Mutex<std::collections::HashSet<InflightKey>>>,
 }
 
 impl DnsListener {
@@ -176,6 +181,7 @@ impl DnsListener {
             rule_set_cache,
             dialers,
             inflight: Arc::new(InflightMap::default()),
+            refreshing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -197,6 +203,7 @@ impl DnsListener {
         let on_resolve = self.on_resolve.clone();
         let rule_set_cache = self.rule_set_cache.clone();
         let inflight = self.inflight.clone();
+        let refreshing = self.refreshing.clone();
 
         debug!(bind = %bind, "DNS listener starting");
 
@@ -213,6 +220,7 @@ impl DnsListener {
         let u_on_resolve = on_resolve.clone();
         let u_ruleset = rule_set_cache.clone();
         let u_inflight = inflight.clone();
+        let u_refreshing = refreshing.clone();
         let udp_handle = tokio::spawn(async move {
             run_udp_listener(
                 udp_socket,
@@ -224,6 +232,7 @@ impl DnsListener {
                 u_ruleset,
                 u_dialers,
                 u_inflight,
+                u_refreshing,
             )
             .await;
         });
@@ -235,6 +244,7 @@ impl DnsListener {
         })?;
         let tcp_dialers = self.dialers.clone();
         let tcp_inflight = inflight.clone();
+        let tcp_refreshing = refreshing.clone();
         let tcp_handle = tokio::spawn(async move {
             run_tcp_listener(
                 tcp_listener,
@@ -246,6 +256,7 @@ impl DnsListener {
                 rule_set_cache,
                 tcp_dialers,
                 tcp_inflight,
+                tcp_refreshing,
             )
             .await;
         });
@@ -277,6 +288,7 @@ impl DnsListener {
                 let i_on_resolve = self.on_resolve.clone();
                 let i_ruleset = self.rule_set_cache.clone();
                 let i_inflight = inflight.clone();
+                let i_refreshing = refreshing.clone();
                 tokio::spawn(async move {
                     run_udp_listener(
                         internal_socket,
@@ -288,6 +300,7 @@ impl DnsListener {
                         i_ruleset,
                         i_dialers,
                         i_inflight,
+                        i_refreshing,
                     )
                     .await;
                 });
@@ -317,6 +330,7 @@ impl DnsListener {
                 let t_on_resolve = self.on_resolve.clone();
                 let t_ruleset = self.rule_set_cache.clone();
                 let t_inflight = inflight.clone();
+                let t_refreshing = refreshing.clone();
                 tokio::spawn(async move {
                     run_tcp_listener(
                         internal_tcp,
@@ -328,6 +342,7 @@ impl DnsListener {
                         t_ruleset,
                         t_dialers,
                         t_inflight,
+                        t_refreshing,
                     )
                     .await;
                 });
@@ -382,6 +397,7 @@ async fn run_udp_listener(
     rule_set_cache: RuleSetCache,
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     inflight: Arc<InflightMap>,
+    refreshing: Arc<RefreshSet>,
 ) {
     let mut buf = vec![0u8; 4096];
     loop {
@@ -419,6 +435,7 @@ async fn run_udp_listener(
         let rule_set_cache = rule_set_cache.clone();
         let dialers = dialers.clone();
         let inflight = inflight.clone();
+        let refreshing = refreshing.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_dns_query(
@@ -432,6 +449,7 @@ async fn run_udp_listener(
                 &rule_set_cache,
                 dialers,
                 inflight,
+                refreshing,
             )
             .await
             {
@@ -452,6 +470,7 @@ async fn run_tcp_listener(
     rule_set_cache: RuleSetCache,
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     inflight: Arc<InflightMap>,
+    refreshing: Arc<RefreshSet>,
 ) {
     loop {
         let result = listener.accept().await;
@@ -470,6 +489,7 @@ async fn run_tcp_listener(
         let rule_set_cache = rule_set_cache.clone();
         let dialers = dialers.clone();
         let inflight = inflight.clone();
+        let refreshing = refreshing.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -504,6 +524,8 @@ async fn run_tcp_listener(
                 &rule_set_cache,
                 &dialers,
                 &inflight,
+                &refreshing,
+                false,
             )
             .await
             {
@@ -541,6 +563,7 @@ async fn handle_dns_query(
     rule_set_cache: &RuleSetCache,
     dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     inflight: Arc<InflightMap>,
+    refreshing: Arc<RefreshSet>,
 ) -> anyhow::Result<()> {
     let (response, upstream_addr) = handle_dns_internal(
         request,
@@ -552,6 +575,8 @@ async fn handle_dns_query(
         rule_set_cache,
         &dialers,
         &inflight,
+        &refreshing,
+        false,
     )
     .await?;
 
@@ -592,7 +617,7 @@ async fn handle_dns_query(
 /// they are sent directly.
 async fn handle_dns_internal(
     request: &[u8],
-    #[allow(unused)] config: &Arc<DnsConfig>,
+    config: &Arc<DnsConfig>,
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
     cache: &Arc<std::sync::RwLock<DnsCache>>,
     router: &Arc<DnsRouter>,
@@ -600,6 +625,8 @@ async fn handle_dns_internal(
     rule_set_cache: &RuleSetCache,
     dialers: &HashMap<String, Arc<dyn OutboundDialer>>,
     inflight: &Arc<InflightMap>,
+    refreshing: &Arc<RefreshSet>,
+    skip_cache: bool,
 ) -> anyhow::Result<(Vec<u8>, Option<SocketAddr>)> {
     // Parse query name and type
     let (qname, qtype) = parse_dns_question(request);
@@ -611,32 +638,100 @@ async fn handle_dns_internal(
     }
     let group_name = route.group.name.clone();
 
-    // Check cache (per DNS group partition)
+    // Check cache (per DNS group partition). Background refresh calls this with
+    // `skip_cache = true` so it always queries upstream for fresh data.
     let cache_key = DnsCache::cache_key(&qname, qtype, 1); // class IN = 1
-    {
+    if !skip_cache {
         let cache_guard = cache.read().unwrap();
-        if let Some((cached, elapsed_secs)) = cache_guard.lookup_with_age(&group_name, cache_key) {
-            debug!("DNS cache hit: {} type={} group={}", qname, qtype, group_name);
-            let mut response = cached.to_vec();
-            // Patch transaction ID to match the current query — DNS clients
-            // discard responses whose ID doesn't match the outstanding query.
-            if response.len() >= 2 && request.len() >= 2 {
-                response[0..2].copy_from_slice(&request[0..2]);
+        match cache_guard.lookup_state(&group_name, cache_key) {
+            Some(CacheLookup::Fresh {
+                bytes,
+                elapsed_secs,
+                remaining_ttl,
+            }) => {
+                debug!("DNS cache hit: {} type={} group={}", qname, qtype, group_name);
+                let mut response = bytes.to_vec();
+                // Patch transaction ID to match the current query — DNS clients
+                // discard responses whose ID doesn't match the outstanding query.
+                if response.len() >= 2 && request.len() >= 2 {
+                    response[0..2].copy_from_slice(&request[0..2]);
+                }
+                // RFC 1035 §5.2: decrement TTLs by residence time so the cached
+                // reply reports its true remaining lifetime.
+                if elapsed_secs > 0 {
+                    crate::dns::upstream::patch_ttls(&mut response, elapsed_secs);
+                }
+                // Background refresh: kick an async re-query when the entry is
+                // nearing expiry so the next lookup finds fresh data.
+                if config.cache.background_refresh
+                    && config.cache.refresh_threshold_percent > 0
+                {
+                    let threshold = (remaining_ttl as u64
+                        * config.cache.refresh_threshold_percent as u64)
+                        / 100;
+                    if remaining_ttl <= threshold as u32 {
+                        debug!(
+                            "DNS background refresh trigger: {} type={} remaining={} threshold={}",
+                            qname, qtype, remaining_ttl, threshold
+                        );
+                        spawn_background_refresh(
+                            refreshing,
+                            request.to_vec(),
+                            (group_name.clone(), qname.clone(), qtype),
+                            config.clone(),
+                            upstream_pools,
+                            cache,
+                            router,
+                            on_resolve,
+                            rule_set_cache,
+                            dialers,
+                            inflight,
+                        );
+                    }
+                }
+                return Ok((response, None));
             }
-            // RFC 1035 §5.2: decrement TTLs by residence time so the cached
-            // reply reports its true remaining lifetime.
-            if elapsed_secs > 0 {
-                crate::dns::upstream::patch_ttls(&mut response, elapsed_secs);
+            Some(CacheLookup::Stale { bytes }) => {
+                // RFC 8767 serve-stale: return the expired entry with a short
+                // TTL and refresh in the background.
+                warn!(
+                    "DNS serve-stale: {} type={} group={} (upstream refresh kicked)",
+                    qname, qtype, group_name
+                );
+                let mut response = bytes.to_vec();
+                if response.len() >= 2 && request.len() >= 2 {
+                    response[0..2].copy_from_slice(&request[0..2]);
+                }
+                crate::dns::upstream::set_all_ttls(
+                    &mut response,
+                    config.cache.serve_stale_ttl.max(1),
+                );
+                spawn_background_refresh(
+                    refreshing,
+                    request.to_vec(),
+                    (group_name.clone(), qname.clone(), qtype),
+                    config.clone(),
+                    upstream_pools,
+                    cache,
+                    router,
+                    on_resolve,
+                    rule_set_cache,
+                    dialers,
+                    inflight,
+                );
+                return Ok((response, None));
             }
-            return Ok((response, None));
+            None => {}
         }
     }
 
     // Singleflight: if an identical query is already in flight, wait for its
     // result instead of querying upstream again (prevents cache stampede when
-    // many clients resolve the same name concurrently).
+    // many clients resolve the same name concurrently). Background refreshes
+    // (`skip_cache`) skip this — they must always query upstream.
     let inflight_key: InflightKey = (group_name.clone(), qname.clone(), qtype);
-    if let Some(mut rx) = try_join_inflight(inflight, &inflight_key) {
+    if !skip_cache {
+        if let Some(mut rx) = try_join_inflight(inflight, &inflight_key) {
         // Fast path: leader already finished before we subscribed.
         if let Ok(resp) = (*rx.borrow()).clone() {
             debug!(
@@ -673,6 +768,7 @@ async fn handle_dns_internal(
         // Channel closed without a value: leader vanished; fall through and
         // query upstream ourselves.
         debug!("DNS singleflight channel closed, querying upstream ourselves");
+        }
     }
 
     // We are the leader for this query. Must publish a result before returning
@@ -913,6 +1009,64 @@ async fn handle_dns_internal(
             }
         }
     }
+}
+
+/// Spawn an asynchronous background refresh for a cached entry.
+///
+/// Deduplicates concurrent refreshes for the same key. The task re-runs
+/// [`handle_dns_internal`] with `skip_cache = true` so it always queries
+/// upstream and re-populates the cache with fresh data.
+#[allow(clippy::too_many_arguments)]
+fn spawn_background_refresh(
+    refreshing: &Arc<RefreshSet>,
+    request: Vec<u8>,
+    key: InflightKey,
+    config: Arc<DnsConfig>,
+    upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
+    cache: &Arc<std::sync::RwLock<DnsCache>>,
+    router: &Arc<DnsRouter>,
+    on_resolve: &Option<DnsResolveCallback>,
+    rule_set_cache: &RuleSetCache,
+    dialers: &HashMap<String, Arc<dyn OutboundDialer>>,
+    inflight: &Arc<InflightMap>,
+) {
+    // Dedup: skip if a refresh for this key is already in flight.
+    {
+        let mut set = refreshing.lock().unwrap();
+        if !set.insert(key.clone()) {
+            return;
+        }
+    }
+
+    let refreshing = refreshing.clone();
+    let upstream_pools = upstream_pools.clone();
+    let cache = cache.clone();
+    let router = router.clone();
+    let on_resolve = on_resolve.clone();
+    let rule_set_cache = rule_set_cache.clone();
+    let dialers = dialers.clone();
+    let inflight = inflight.clone();
+
+    tokio::spawn(async move {
+        let result = handle_dns_internal(
+            &request,
+            &config,
+            &upstream_pools,
+            &cache,
+            &router,
+            &on_resolve,
+            &rule_set_cache,
+            &dialers,
+            &inflight,
+            &refreshing,
+            true, // skip_cache
+        )
+        .await;
+        if let Err(e) = result {
+            debug!("DNS background refresh failed for {:?}: {}", key, e);
+        }
+        refreshing.lock().unwrap().remove(&key);
+    });
 }
 
 /// Return a human-readable label for a DNS group query mode (used in debug logs).

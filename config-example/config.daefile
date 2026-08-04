@@ -265,8 +265,11 @@ dns {
     max_size: 4096
     max_ttl: 86400
     min_ttl: 60
-    optimistic_cache: true
-    optimistic_cache_ttl: 3600
+    optimistic_cache: true          # RFC 8767 serve-stale: serve expired entries within the window below
+    optimistic_cache_ttl: 3600      # serve-stale window (seconds past TTL expiry)
+    background_refresh: true        # async re-query entries nearing expiry
+    refresh_threshold_percent: 20   # refresh when remaining TTL < 20% of original
+    serve_stale_ttl: 30             # TTL served for stale entries (so clients don't over-cache)
   }
   groups {
     trusted_dns {

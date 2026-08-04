@@ -856,6 +856,53 @@ impl AsyncRead for SsStream {
 
         // Need to read a complete frame: length frame (2+tag) + payload frame (len+tag)
         loop {
+            // Resume an in-progress payload frame read. The length frame was
+            // already consumed, but the payload may still be arriving in
+            // multiple TCP segments (common for large responses). Restarting
+            // from the top of the loop here would misparse the partial payload
+            // bytes as a new length frame and fail AEAD tag verification.
+            if let Some(payload_len) = self.read_payload_len.take() {
+                let need_payload = payload_len + self.tag;
+                match self.poll_fill_frame(cx, need_payload) {
+                    Poll::Pending => {
+                        self.read_payload_len = Some(payload_len);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {}
+                }
+                if self.read_frame.len() < need_payload {
+                    // EOF: incomplete payload frame
+                    self.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+
+                let mut payload = vec![0u8; payload_len + self.tag];
+                payload.copy_from_slice(&self.read_frame[..need_payload]);
+                self.read_frame.drain(..need_payload);
+                if !self
+                    .dec
+                    .as_mut()
+                    .expect("dec initialized before frame reads")
+                    .decrypt_packet(&mut payload)
+                {
+                    return Poll::Ready(Err(io::Error::other("shadowsocks: payload tag verification failed")));
+                }
+                payload.truncate(payload_len);
+
+                if buf.remaining() >= payload_len {
+                    buf.put_slice(&payload);
+                    return Poll::Ready(Ok(()));
+                }
+                // User buffer too small, store remaining temporarily
+                self.read_decoded = payload;
+                self.read_decoded_pos = 0;
+                let n = buf.remaining();
+                buf.put_slice(&self.read_decoded[..n]);
+                self.read_decoded_pos = n;
+                return Poll::Ready(Ok(()));
+            }
+
             let need_len_frame = 2 + self.tag;
             match self.poll_fill_frame(cx, need_len_frame) {
                 Poll::Pending => return Poll::Pending,
@@ -1196,6 +1243,69 @@ mod tests {
         let mut buf = vec![0u8; plain.len()];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf[..], plain);
+        server_task.await.unwrap();
+    }
+
+    /// Regression test: a payload frame that arrives in multiple TCP segments,
+    /// with the reader polling `Pending` between them.
+    ///
+    /// Previously the partial payload bytes were misparsed as a new length
+    /// frame on resume, producing "length tag verification failed" and cutting
+    /// the stream (observed as TLS truncation / "unexpected eof while reading"
+    /// on large downloads). The reader must resume filling the in-progress
+    /// payload frame instead of restarting the length-frame parse.
+    #[tokio::test]
+    async fn test_read_payload_frame_split_with_delay() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let kind = CipherKind::from_str("aes-128-gcm").unwrap();
+        let key = ShadowsocksDialer::master_key(kind, "password");
+        // One full-size AEAD frame (max payload 0x3FFF). A single frame is
+        // split so that it cannot be delivered in one burst.
+        let plain = vec![0xABu8; MAX_PAYLOAD];
+        let plain_clone = plain.clone();
+
+        let server_task = tokio::spawn(async move {
+            let mut server = server;
+            let mut server_salt = vec![0u8; kind.salt_len()];
+            random_iv_or_salt(&mut server_salt);
+            let mut enc = V1Cipher::new(kind, &key, &server_salt);
+            let tag = enc.tag_len();
+            // Length frame [2-byte len][tag]
+            let mut len_buf = vec![0u8; 2 + tag];
+            len_buf[..2].copy_from_slice(&(plain_clone.len() as u16).to_be_bytes());
+            enc.encrypt_packet(&mut len_buf);
+            // Payload frame [plain][tag]
+            let mut payload = vec![0u8; plain_clone.len() + tag];
+            payload[..plain_clone.len()].copy_from_slice(&plain_clone);
+            enc.encrypt_packet(&mut payload);
+
+            // Send salt + length + FIRST HALF of the payload, then pause so the
+            // reader observes an incomplete payload frame and returns Pending.
+            let split = payload.len() / 2;
+            server.write_all(&server_salt).await.unwrap();
+            server.write_all(&len_buf).await.unwrap();
+            server.write_all(&payload[..split]).await.unwrap();
+            server.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Second half arrives after the reader already hit Pending.
+            server.write_all(&payload[split..]).await.unwrap();
+            server.flush().await.unwrap();
+        });
+
+        let d = ShadowsocksDialer::new(addr, "aes-128-gcm", "password", 5000);
+        let pair = d.new_cipher_pair().unwrap();
+        let mut stream = SsStream::new(client, pair);
+        let mut buf = vec![0u8; plain.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[..], plain);
         server_task.await.unwrap();
     }
 

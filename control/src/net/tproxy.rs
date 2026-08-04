@@ -38,6 +38,7 @@ use anyhow::{Context, Result};
 use protocols::{OutboundDialer, ProxyStream};
 use protocols::UdpSession;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +60,13 @@ const SPLICE_CHUNK: usize = 64 * 1024;
 /// splice 不可用时回退路径的双向拷贝缓冲大小（tokio 默认 copy_bidirectional 仅 8KB）
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
+/// TCP 双向中继的半关闭保护超时。
+///
+/// 当一个方向拷贝完成（源 EOF）后，给另一个方向最多这个时间优雅关闭。
+/// 超时则强制关闭整个连接，避免对端既不发送也不关闭导致的 relay 任务泄漏。
+/// 与 kdae 的 `relayHalfCloseTimeout`（10s）保持一致。
+const RELAY_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ============================================================================
 // UDP 中继常量
 // ============================================================================
@@ -71,6 +79,31 @@ const CMSG_BUFFER_SIZE: usize = 128;
 
 /// UDP relay flow 空闲超时：超过该时间没有收到中继响应则关闭会话
 const UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// DNS UDP flow 空闲超时（RFC 5452 建议 17s）
+const DNS_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(17);
+
+/// QUIC/DTLS 等长连接 UDP flow 空闲超时（与 kdae 的 QuicNatTimeout 一致）
+const QUIC_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// UDP 发送（上游转发 / 回包）写 deadline。
+///
+/// 防止代理上游停滞或客户端不读取时发送路径无限期阻塞。
+/// 与 kdae 的 `udpEndpointWriteTimeout`（10s）保持一致。
+const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 按原始目标端口选择 UDP flow 空闲超时（分级超时）。
+///
+/// * 53（DNS）→ 17s（RFC 5452）
+/// * 443（QUIC/DTLS）→ 2min
+/// * 其他 → 30s（默认）
+fn udp_flow_idle_timeout(dest: SocketAddr) -> Duration {
+    match dest.port() {
+        53 => DNS_UDP_IDLE_TIMEOUT,
+        443 => QUIC_UDP_IDLE_TIMEOUT,
+        _ => UDP_FLOW_IDLE_TIMEOUT,
+    }
+}
 
 /// 透明回包 socket 池容量上限（超出时淘汰最久未用条目）
 const RESP_SOCKET_POOL_CAP: usize = 256;
@@ -1001,6 +1034,57 @@ where
     }
 }
 
+/// 双向中继半关闭保护：当一个方向完成时，给另一方 [`RELAY_HALF_CLOSE_TIMEOUT`]
+/// 时间优雅关闭；超时则返回错误（调用方会关闭整个连接）。
+///
+/// 镜像 kdae 的 `forceClose()`：防止对端既不发送数据也不关闭连接时，另一方向
+/// 的 `read()` 永久阻塞导致 relay 任务泄漏。
+enum RelaySide {
+    /// 客户端 → 代理方向（`f1`）
+    Up,
+    /// 代理 → 客户端方向（`f2`）
+    Down,
+}
+
+/// 包装两个单向拷贝 future，提供 half-close 超时保护。
+async fn half_close_guard<F1, F2>(
+    f1: F1,
+    f2: F2,
+) -> std::io::Result<(u64, u64)>
+where
+    F1: Future<Output = std::io::Result<u64>>,
+    F2: Future<Output = std::io::Result<u64>>,
+{
+    tokio::pin!(f1);
+    tokio::pin!(f2);
+
+    let (first, side) = tokio::select! {
+        r = &mut f1 => (r, RelaySide::Up),
+        r = &mut f2 => (r, RelaySide::Down),
+    };
+    let first = first?;
+
+    let second = tokio::time::timeout(RELAY_HALF_CLOSE_TIMEOUT, async {
+        match side {
+            RelaySide::Up => (&mut f2).await,
+            RelaySide::Down => (&mut f1).await,
+        }
+    })
+    .await;
+
+    match second {
+        Ok(Ok(b)) => Ok(match side {
+            RelaySide::Up => (first, b),
+            RelaySide::Down => (b, first),
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "relay half-close timed out, forcing connection close",
+        )),
+    }
+}
+
 /// 双向 TCP 中继：优先 splice() 零拷贝路径，不可用时回退到 64KB 缓冲拷贝。
 ///
 /// 返回 `(客户端→代理 字节数, 代理→客户端 字节数)`，与 tokio
@@ -1015,15 +1099,11 @@ async fn relay_bidirectional(
             if splice_supported(&inbound, &outbound, &pipe_ab)
                 && splice_supported(&outbound, &inbound, &pipe_ba)
             {
-                let (to_up, from_up) = tokio::join!(
+                return half_close_guard(
                     splice_direction(&inbound, &outbound, &pipe_ab),
                     splice_direction(&outbound, &inbound, &pipe_ba),
-                );
-                return match (to_up, from_up) {
-                    (Err(e), _) => Err(e),
-                    (_, Err(e)) => Err(e),
-                    (Ok(a), Ok(b)) => Ok((a, b)),
-                };
+                )
+                .await;
             }
         }
     }
@@ -1031,15 +1111,11 @@ async fn relay_bidirectional(
     // ---- 64KB 缓冲回退路径（splice 不可用）----
     let (mut inbound_r, mut inbound_w) = inbound.split();
     let (mut outbound_r, mut outbound_w) = outbound.split();
-    let (to_up, from_up) = tokio::join!(
+    half_close_guard(
         buffered_copy_direction(&mut inbound_r, &mut outbound_w),
         buffered_copy_direction(&mut outbound_r, &mut inbound_w),
-    );
-    match (to_up, from_up) {
-        (Err(e), _) => Err(e),
-        (_, Err(e)) => Err(e),
-        (Ok(a), Ok(b)) => Ok((a, b)),
-    }
+    )
+    .await
 }
 
 // ============================================================================
@@ -1376,6 +1452,54 @@ mod tests {
 
         let name = extract_dns_query_name(&packet);
         assert_eq!(name.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn test_udp_flow_idle_timeout_tiers() {
+        let dns: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let quic: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let other: SocketAddr = "9.9.9.9:1234".parse().unwrap();
+
+        assert_eq!(udp_flow_idle_timeout(dns), DNS_UDP_IDLE_TIMEOUT);
+        assert_eq!(udp_flow_idle_timeout(quic), QUIC_UDP_IDLE_TIMEOUT);
+        assert_eq!(udp_flow_idle_timeout(other), UDP_FLOW_IDLE_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_half_close_guard_both_complete() {
+        // 两个方向都正常完成，返回 (up, down) 字节数。
+        let (up, down) = half_close_guard(
+            std::future::ready(Ok::<u64, std::io::Error>(10)),
+            std::future::ready(Ok::<u64, std::io::Error>(20)),
+        )
+        .await
+        .unwrap();
+        assert_eq!((up, down), (10, 20));
+    }
+
+    #[tokio::test]
+    async fn test_half_close_guard_first_error_propagates() {
+        // 第一个方向立即出错，错误应传播，不等待另一个方向。
+        let err = half_close_guard(
+            std::future::ready(Err::<u64, std::io::Error>(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken",
+            ))),
+            std::future::ready(Ok::<u64, std::io::Error>(20)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn test_half_close_guard_timeout_forces_close() {
+        // 一个方向完成后，另一个方向永不完成 → 超时强制返回 TimedOut 错误。
+        let never = std::future::pending::<std::io::Result<u64>>();
+        let err = half_close_guard(std::future::ready(Ok::<u64, std::io::Error>(10)), never)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }
 
@@ -1818,8 +1942,21 @@ impl UdpTproxyListener {
                                     if let Some(resp_sock) =
                                         resp_socks.get(&dest, host_ns_fd).await
                                     {
-                                        if let Err(e) = resp_sock.send_to(&recv_buf, peer).await {
-                                            debug!("DNS hijack: response send_to client {} failed: {}", peer, e);
+                                        match tokio::time::timeout(
+                                            UDP_WRITE_TIMEOUT,
+                                            resp_sock.send_to(&recv_buf, peer),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(_)) => {}
+                                            Ok(Err(e)) => debug!(
+                                                "DNS hijack: response send_to client {} failed: {}",
+                                                peer, e
+                                            ),
+                                            Err(_) => debug!(
+                                                "DNS hijack: response send_to client {} timed out",
+                                                peer
+                                            ),
                                         }
                                     } else {
                                         debug!("DNS hijack: failed to get response socket for {}", dest);
@@ -1859,9 +1996,18 @@ impl UdpTproxyListener {
                         };
 
                         // 通过协议的 UDP 会话转发数据报（无需锁，各协议内部处理）。
-                        if let Err(e) = session.send(&dest, &payload).await {
-                            debug!("UDP send to relay failed: {}", e);
-                            flows.remove(dest, peer).await;
+                        // 写 deadline 保护：防止上游停滞时无限期阻塞。
+                        let send_fut = session.send(&dest, &payload);
+                        match tokio::time::timeout(UDP_WRITE_TIMEOUT, send_fut).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                debug!("UDP send to relay failed: {}", e);
+                                flows.remove(dest, peer).await;
+                            }
+                            Err(_) => {
+                                debug!("UDP send to relay timed out after {}s", UDP_WRITE_TIMEOUT.as_secs());
+                                flows.remove(dest, peer).await;
+                            }
                         }
                     });
                 }
@@ -1959,8 +2105,9 @@ impl UdpFlowPool {
 
     /// 启动 flow 的 reader 任务：持续读取中继响应并回发客户端。
     ///
-    /// 空闲超过 [`UDP_FLOW_IDLE_TIMEOUT`] 或中继 recv 出错时退出，并从池中
-    /// 移除自己（替代原先从未被调用的 `UdpEndpointPool::cleanup`）。
+    /// 空闲超过分级超时（[`udp_flow_idle_timeout`]，DNS 17s / QUIC 2min /
+    /// 默认 30s）或中继 recv 出错时退出，并从池中移除自己（替代原先从未被
+    /// 调用的 `UdpEndpointPool::cleanup`）。
     fn spawn_reader(
         key: (SocketAddr, Option<SocketAddr>),
         session: Arc<dyn UdpSession>,
@@ -1970,8 +2117,9 @@ impl UdpFlowPool {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let (dest, peer) = key;
+            let idle_timeout = udp_flow_idle_timeout(dest);
             loop {
-                let read = tokio::time::timeout(UDP_FLOW_IDLE_TIMEOUT, session.recv()).await;
+                let read = tokio::time::timeout(idle_timeout, session.recv()).await;
                 let (resp_dest, payload) = match read {
                     Ok(Ok(pkt)) => pkt,
                     Ok(Err(e)) => {
@@ -1980,7 +2128,8 @@ impl UdpFlowPool {
                     }
                     Err(_) => {
                         debug!(
-                            "UDP relay flow idle, expiring: {}",
+                            "UDP relay flow idle ({}s), expiring: {}",
+                            idle_timeout.as_secs(),
                             peer.map(|p| p.to_string()).unwrap_or_default(),
                         );
                         break;
@@ -1990,8 +2139,17 @@ impl UdpFlowPool {
                 // 全锥形中继：响应可能来自任意目标，回包 socket 按响应目标地址取。
                 if let Some(peer) = peer {
                     if let Some(sock) = resp_socks.get(&resp_dest, host_ns_fd).await {
-                        if let Err(e) = sock.send_to(&payload, peer).await {
-                            debug!("UDP response send failed: {}", e);
+                        // 回包写 deadline：防止客户端不读取 UDP 时无限期阻塞 reader。
+                        match tokio::time::timeout(UDP_WRITE_TIMEOUT, sock.send_to(&payload, peer))
+                            .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => debug!("UDP response send failed: {}", e),
+                            Err(_) => debug!(
+                                "UDP response send to {} timed out after {}s",
+                                peer,
+                                UDP_WRITE_TIMEOUT.as_secs()
+                            ),
                         }
                     } else {
                         debug!(

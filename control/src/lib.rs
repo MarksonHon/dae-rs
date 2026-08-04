@@ -1715,7 +1715,7 @@ impl ControlPlane {
                 }
 
                 // ---- Step 2: Scan conn_state_map for expired entries ----
-                match mgr.janitor_scan_conn_state(now_ns) {
+                match mgr.janitor_scan_conn_state(now_ns, in_pressure) {
                     Ok((deleted, remaining)) => {
                         if deleted > 0 {
                             info!(

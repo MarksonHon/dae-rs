@@ -2508,16 +2508,34 @@ impl EbpfManager {
     ///
     /// Iterates all entries via raw BPF syscall, checks `last_seen_ns`
     /// against timeout thresholds, and deletes expired ones.
+    ///
+    /// Timeout semantics (matching the kernel in `tproxy.c`):
+    ///
+    /// * **TCP ACTIVE** — never deleted in steady state (the kernel owns the
+    ///   lifecycle; `tcp_conn_state_expired` only expires CLOSING entries).
+    ///   In pressure mode (`in_pressure = true`) stale ACTIVE entries idle
+    ///   longer than `TCP_ACTIVE_PRESSURE_TIMEOUT_NS` are reclaimed as a
+    ///   backstop to avoid unbounded map growth.
+    /// * **TCP CLOSING** — 10 s after last seen (FIN/RST observed).
+    /// * **UDP** — 120 s backstop (matches `UDP_CONN_STATE_TIMEOUT_NS`);
+    ///   primary cleanup is handled by `UdpConnStateTracker`.
+    ///
     /// Returns (deleted_count, remaining_count).
-    pub fn janitor_scan_conn_state(&mut self, now_ns: u64) -> Result<(usize, u32)> {
+    pub fn janitor_scan_conn_state(&mut self, now_ns: u64, in_pressure: bool) -> Result<(usize, u32)> {
         use std::os::fd::AsRawFd;
 
-        // Timeout constants from tproxy.c (in nanoseconds)
-        const TCP_CLOSING_TIMEOUT_NS: u64 = 10_000_000_000; // 10s
-        const DEFAULT_TIMEOUT_NS: u64 = 120_000_000_000; // 120s (UDP + TCP established)
+        // Custom conn_state.state enum (tproxy.c, NOT the linux tcp.h values).
+        const TCP_STATE_ACTIVE: u8 = 0;
+        const TCP_STATE_CLOSING: u8 = 1; // FIN or RST seen
 
-        // TCP CLOSING state (include/uapi/linux/tcp.h)
-        const TCP_CLOSING: u8 = 7;
+        // IPPROTO_* values from the tuples_key.l4proto field.
+        const IPPROTO_TCP: u8 = 6;
+        const IPPROTO_UDP: u8 = 17;
+
+        // Timeout constants (in nanoseconds).
+        const TCP_CLOSING_TIMEOUT_NS: u64 = 10_000_000_000; // 10s
+        const UDP_TIMEOUT_NS: u64 = 120_000_000_000; // 120s (kernel UDP backstop)
+        const TCP_ACTIVE_PRESSURE_TIMEOUT_NS: u64 = 600_000_000_000; // 10min, pressure-mode backstop
 
         let map = self.get_map_mut("conn_state_map")?;
         let map_fd = map.as_fd().as_raw_fd();
@@ -2570,14 +2588,23 @@ impl EbpfManager {
             if val.len() >= 16 {
                 let last_seen_ns = u64::from_ne_bytes(val[8..16].try_into().unwrap_or([0; 8]));
                 let state = val[1];
+                // tuples_key layout: sip(16) + dip(16) + sport(2) + dport(2) + l4proto(1)
+                // l4proto lives at byte offset 36.
+                let l4proto = next_key.get(36).copied().unwrap_or(0);
+                let idle_ns = now_ns.saturating_sub(last_seen_ns);
 
-                let timeout_ns = if state == TCP_CLOSING {
-                    TCP_CLOSING_TIMEOUT_NS
-                } else {
-                    DEFAULT_TIMEOUT_NS
+                let expired = match (state, l4proto) {
+                    (TCP_STATE_CLOSING, _) => idle_ns > TCP_CLOSING_TIMEOUT_NS,
+                    (TCP_STATE_ACTIVE, IPPROTO_TCP) => {
+                        // Kernel owns TCP ACTIVE lifecycle; only reclaim under pressure.
+                        in_pressure && idle_ns > TCP_ACTIVE_PRESSURE_TIMEOUT_NS
+                    }
+                    (TCP_STATE_ACTIVE, IPPROTO_UDP) => idle_ns > UDP_TIMEOUT_NS,
+                    // Unknown state/proto: fall back to the 120s backstop.
+                    _ => idle_ns > UDP_TIMEOUT_NS,
                 };
 
-                if now_ns.saturating_sub(last_seen_ns) > timeout_ns {
+                if expired {
                     expired_keys.push(next_key.clone());
                 }
             }

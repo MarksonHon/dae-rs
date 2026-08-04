@@ -1,9 +1,9 @@
-//! `/var/dae-rs/` 目录管理（设计 §4.1 / §4.3）。
+//! `/var/lib/dae-rs/` 目录管理（设计 §4.1 / §4.3）。
 //!
 //! 目录布局：
 //!
 //! ```text
-//! /var/dae-rs/
+//! /var/lib/dae-rs/
 //! ├── <name>.dat / <name>.txt        # 实际数据文件（dat→.dat，文本→.txt）
 //! ├── .tmp/                          # 临时下载文件（未校验前）
 //! ├── .checksum/<name>.sha256        # 校验和文件
@@ -21,7 +21,7 @@ use tracing::{error, warn};
 use crate::ruleset::types::{RuleSetConfig, RuleSetData, RuleSetType};
 
 /// 默认数据目录。
-pub const DEFAULT_DATA_DIR: &str = "/var/dae-rs/";
+pub const DEFAULT_DATA_DIR: &str = "/var/lib/dae-rs/";
 
 /// 存储错误。
 #[derive(Debug, Error)]
@@ -40,7 +40,7 @@ pub enum StoreError {
 
 /// 数据目录管理。
 ///
-/// 默认 [`DEFAULT_DATA_DIR`]（`/var/dae-rs/`），测试可注入临时路径。
+/// 默认 [`DEFAULT_DATA_DIR`]（`/var/lib/dae-rs/`），测试可注入临时路径。
 #[derive(Debug, Clone)]
 pub struct DataDir {
     root: PathBuf,
@@ -52,7 +52,7 @@ impl DataDir {
         Self { root: root.into() }
     }
 
-    /// 默认 `/var/dae-rs/`。
+    /// 默认 `/var/lib/dae-rs/`。
     pub fn default_dir() -> Self {
         Self::new(DEFAULT_DATA_DIR)
     }

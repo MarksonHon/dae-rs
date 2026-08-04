@@ -6,7 +6,7 @@
 //! - [`types`]：内存数据结构与规则集配置条目类型
 //! - [`decode`]：v2ray `.dat`（geoip / geosite）手写 protobuf 解码
 //! - [`list`]：文本Domain name / IP 列表解析
-//! - [`store`]：`/var/dae-rs/` 目录管理（原子替换、checksum、meta、启动扫描）
+//! - [`store`]：`/var/lib/dae-rs/` 目录管理（原子替换、checksum、meta、启动扫描）
 //! - [`download`]：下载器（直连 + 可选 SOCKS5、重试、ETag、sha256 校验）
 //!
 //! 本层**不**接入 matcher / DNS routing / 配置 parser-validator（由后续子任务负责）。

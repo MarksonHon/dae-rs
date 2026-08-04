@@ -16,7 +16,7 @@
 
 - **数据格式**：原生解析 v2ray protobuf `.dat`（对齐 Loyalsoldier/v2ray-rules-dat
   的 geoip.dat / geosite.dat），以及"每行一条"的纯文本域名/IP 列表。
-- **统一存储与生命周期**：全部数据文件存放于 `/var/dae-rs/`，由 dae-rs 自行下载、
+- **统一存储与生命周期**：全部数据文件存放于 `/var/lib/dae-rs/`，由 dae-rs 自行下载、
   校验、原子替换与损坏恢复；本地缺失时默认通过**第一个代理组**下载。
 - **配置扩展**：在 `config.daefile` 与 `config.json` 中新增规则集管理区块，每类
   文件均有**唯一名称/备注**，可配置 URL、更新时间段（`time: HH:MM` /
@@ -206,10 +206,10 @@ message GeoSiteList {
 
 ## 4. 存储与生命周期（Storage & Lifecycle）
 
-### 4.1 目录布局：`/var/dae-rs/`
+### 4.1 目录布局：`/var/lib/dae-rs/`
 
 ```
-/var/dae-rs/
+/var/lib/dae-rs/
 ├── geoip.dat                  # 实际数据文件（dat 类型，文件名=配置 name + .dat）
 ├── geosite.dat
 ├── chinaip.txt                # 文本列表（域名/IP），文件名=配置 name + .txt
@@ -227,8 +227,8 @@ message GeoSiteList {
   dae-rs 读写。
 - **命名空间隔离**：文件名 = `<唯一 name>` + 类型后缀（dat 为 `.dat`，文本为
   `.txt`）。name 由配置指定（§5），用于路由引用（`set:<name>`）与文件定位。
-- 启动时若 `/var/dae-rs/` 不存在则创建（需 root；dae-rs 以 root/特权运行）。
-- 数据文件路径可在未来通过 CLI/配置覆盖（默认 `/var/dae-rs/`）。
+- 启动时若 `/var/lib/dae-rs/` 不存在则创建（需 root；dae-rs 以 root/特权运行）。
+- 数据文件路径可在未来通过 CLI/配置覆盖（默认 `/var/lib/dae-rs/`）。
 
 ### 4.2 下载管理
 
@@ -620,7 +620,7 @@ outbound 链把"函数内多值 OR + 函数间 AND + NOT"降级为线性 MatchSe
 |------|-----|------------------|------|
 | geosite/geoip 数据 | v2ray `.dat` | 同（原生 protobuf 解析） | 对齐 |
 | 规则集管理 | global 内 URL + 定时更新 | 独立 `rule_set` 区块，多文件、唯一 name、可独立调度 | 增强 |
-| 数据目录 | `/usr/local/share/dae`（可配） | `/var/dae-rs/`（固定默认，未来可配） | 差异（用户指定） |
+| 数据目录 | `/usr/local/share/dae`（可配） | `/var/lib/dae-rs/`（固定默认，未来可配） | 差异（用户指定） |
 | 引用语法 | `geosite:xx`/`geoip:xx` | 新增 `set:name`；保留 `geoip:`/`geosite:` | 超集 |
 | 函数命名 | `dip`/`sip`/`domain` | 新增 `source_ip`/`target_ip`/`target_domain`，保留旧别名 | 超集 |
 | 组合语义 | AND/OR/NOT/any/顺序/fallback | 完全一致 | 对齐 |
@@ -640,7 +640,7 @@ outbound 链把"函数内多值 OR + 函数间 AND + NOT"降级为线性 MatchSe
 - v2ray `.dat` protobuf 解码（geoip `GeoIPList`/`GeoIP`/`CIDR`；geosite
   `GeoSiteList`/`GeoSite`/`Domain`），内存缓存结构。
 - 文本域名/IP 列表解析（含 `full:`/`domain:`/`suffix:`/`keyword:`/`regex:` 前缀）。
-- `/var/dae-rs/` 目录布局、`.tmp/`/`.checksum/`/`.meta/` 管理。
+- `/var/lib/dae-rs/` 目录布局、`.tmp/`/`.checksum/`/`.meta/` 管理。
 - 下载器：直连 + 通过代理组（SOCKS5 隧道）下载、重试、ETag、sha256 校验、
   原子替换、损坏恢复。
 - **验证**：单元测试（解析已知 dat 样本、文本列表、校验/替换逻辑）。

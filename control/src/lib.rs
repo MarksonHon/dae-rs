@@ -359,7 +359,7 @@ pub struct ControlPlane {
     pub rule_set_notifier: Option<tokio::sync::watch::Receiver<u64>>,
     /// Ruleset in-memory cache (shared by matcher compilation / DNS routing / DNS response Routing).
     ///
-    /// Scanned and populated from `/var/dae-rs/` at startup; refreshed by background watcher after scheduler updates complete.
+    /// Scanned and populated from `/var/lib/dae-rs/` at startup; refreshed by background watcher after scheduler updates complete.
     pub rule_set_cache: ruleset::cache::RuleSetCache,
     /// Ruleset update → hot-reload signal receiver (filled by background watcher).
     ///
@@ -813,7 +813,7 @@ impl ControlPlane {
                 fallback = %dc.routing.fallback,
                 "Processing routing rules"
             );
-            // 3.5b-0. Load ruleset in-memory cache (scan from /var/dae-rs/).
+            // 3.5b-0. Load ruleset in-memory cache (scan from /var/lib/dae-rs/).
             // matcher compilation needs geoip/geosite/set data; missing data causes E2103 compilation error.
             if !dc.rule_set.is_empty() && self.rule_set_cache.is_empty() {
                 let dir = ruleset::DataDir::default_dir();

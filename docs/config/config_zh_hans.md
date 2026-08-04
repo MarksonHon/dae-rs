@@ -333,7 +333,7 @@ rule_set {
 
 - **唯一性**：`rule_set` 内所有条目的 `name`（含缺省 = 块名）全局唯一，违反报
   E2101。
-- 数据文件存放于 `/var/dae-rs/`（dat 为 `<name>.dat`，文本为 `<name>.txt`），
+- 数据文件存放于 `/var/lib/dae-rs/`（dat 为 `<name>.dat`，文本为 `<name>.txt`），
   由 dae-rs 自行下载、校验、原子替换与损坏恢复；缺失时通过第一个代理组（或
   条目显式 `proxy`）下载。
 - 路由引用语法见 §4.5「规则集引用语法」与 §4.7（DNS 侧）。
@@ -375,6 +375,6 @@ rule_set {
   出站分组会做节点选择并写入连通性 map，但节点间切换仍在开发中。
 - DNS 的 DoH / DoT 传输仅解析、未实现。
 - GeoIP / GeoSite 数据不随二进制内置，而是通过 `rule_set` 区块配置的 URL
-  下载到 `/var/dae-rs/` 并由 dae-rs 解析加载；`geoip:<code>` /
+  下载到 `/var/lib/dae-rs/` 并由 dae-rs 解析加载；`geoip:<code>` /
   `geosite:<code>` / `set:<name>` 已接入数据面与 DNS 路由求值。编译期若引用
   的数据缺失会报错（E2103）。

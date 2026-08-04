@@ -21,7 +21,7 @@ domain/IP-list rule set support to dae-rs:
 - **Data formats**: native parsing of v2ray protobuf `.dat` (aligned with
   Loyalsoldier/v2ray-rules-dat's geoip.dat / geosite.dat), plus plain-text
   one-entry-per-line domain/IP lists.
-- **Unified storage & lifecycle**: all data files live in `/var/dae-rs/`;
+- **Unified storage & lifecycle**: all data files live in `/var/lib/dae-rs/`;
   dae-rs downloads, verifies, atomically replaces and recovers them itself;
   missing local data is by default downloaded through the **first proxy group**.
 - **Configuration extension**: a new rule-set management section in both
@@ -211,10 +211,10 @@ stable), with full decoding of `GeoIPList` / `GeoSiteList`.
 
 ## 4. Storage & Lifecycle
 
-### 4.1 Directory layout: `/var/dae-rs/`
+### 4.1 Directory layout: `/var/lib/dae-rs/`
 
 ```
-/var/dae-rs/
+/var/lib/dae-rs/
 ├── geoip.dat                  # actual data file (dat type; filename = config name + .dat)
 ├── geosite.dat
 ├── chinaip.txt                # text list (domain/IP); filename = config name + .txt
@@ -233,7 +233,7 @@ stable), with full decoding of `GeoIPList` / `GeoSiteList`.
 - **Namespace isolation**: filename = `<unique name>` + type extension (`.dat`
   for dat, `.txt` for text). `name` comes from the config (§5) and is used for
   `set:<name>` references and file location.
-- `/var/dae-rs/` is created at startup if missing (needs root; dae-rs runs
+- `/var/lib/dae-rs/` is created at startup if missing (needs root; dae-rs runs
   privileged). The path may be overridable via CLI/config in the future.
 
 ### 4.2 Download management
@@ -661,7 +661,7 @@ functions.
 |-----------|-----|----------------------|-------|
 | geosite/geoip data | v2ray `.dat` | same (native protobuf parse) | aligned |
 | rule-set management | URLs + scheduled update in `global` | standalone `rule_set` section, multiple files, unique names, independent scheduling | enhanced |
-| data directory | `/usr/local/share/dae` (configurable) | `/var/dae-rs/` (fixed default, future-configurable) | difference (user-specified) |
+| data directory | `/usr/local/share/dae` (configurable) | `/var/lib/dae-rs/` (fixed default, future-configurable) | difference (user-specified) |
 | reference syntax | `geosite:xx`/`geoip:xx` | adds `set:name`; keeps `geoip:`/`geosite:` | superset |
 | function naming | `dip`/`sip`/`domain` | adds `source_ip`/`target_ip`/`target_domain`, keeps old aliases | superset |
 | combination semantics | AND/OR/NOT/any/order/fallback | fully consistent | aligned |
@@ -684,7 +684,7 @@ functions.
   `GeoSiteList`/`GeoSite`/`Domain`), in-memory cache structures.
 - Text domain/IP list parsing (`full:`/`domain:`/`suffix:`/`keyword:`/`regex:`
   prefixes).
-- `/var/dae-rs/` layout, `.tmp/`/`.checksum/`/`.meta/` management.
+- `/var/lib/dae-rs/` layout, `.tmp/`/`.checksum/`/`.meta/` management.
 - Downloader: direct + proxied (SOCKS5 tunnel), retry, ETag, sha256
   verification, atomic replacement, corruption recovery.
 - **Verify**: unit tests (parse known dat samples, text lists, verify/replace

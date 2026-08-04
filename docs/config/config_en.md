@@ -347,7 +347,7 @@ rule_set {
 
 - **Uniqueness**: every entry's `name` (including the block-name default) is
   globally unique; a duplicate raises E2101.
-- Data files live in `/var/dae-rs/` (`<name>.dat` for dat, `<name>.txt` for
+- Data files live in `/var/lib/dae-rs/` (`<name>.dat` for dat, `<name>.txt` for
   text). dae-rs downloads, verifies, atomically replaces and recovers them;
   missing data is downloaded through the first proxy group (or the entry's
   explicit `proxy`).
@@ -392,7 +392,7 @@ non-fatal issues such as missing policies or missing DNS response routing.
   connectivity map, but node-to-node switching is a work in progress.
 - DNS DoH / DoT transports are parsed but not yet implemented.
 - GeoIP/GeoSite data is not bundled with the binary; it is downloaded via the
-  URLs configured in `rule_set` into `/var/dae-rs/` and parsed by dae-rs.
+  URLs configured in `rule_set` into `/var/lib/dae-rs/` and parsed by dae-rs.
   `geoip:<code>` / `geosite:<code>` / `set:<name>` are wired into both the data
   path and DNS routing. A missing dataset referenced at compile time raises
   E2103.

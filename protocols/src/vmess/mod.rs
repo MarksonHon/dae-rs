@@ -1003,12 +1003,13 @@ impl VmessBodyStream {
     fn poll_fill_frame(&mut self, cx: &mut Context<'_>, need: usize) -> Poll<io::Result<()>> {
         while self.read_frame.len() < need {
             let mut buf = vec![0u8; need - self.read_frame.len()];
-            match Pin::new(&mut self.inner).poll_read(cx, &mut ReadBuf::new(&mut buf)) {
+            let mut read_buf = ReadBuf::new(&mut buf);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {
-                    let n = buf.len();
+                    let n = read_buf.filled().len();
                     if n == 0 {
-                        return Poll::Ready(Ok(()));
+                        return Poll::Ready(Ok(())); // EOF; caller checks len
                     }
                     self.read_frame.extend_from_slice(&buf[..n]);
                 }
@@ -1534,5 +1535,104 @@ mod tests {
         assert_eq!(d.security_type().unwrap(), SEC_NONE);
         d.set_security("chacha20-poly1305");
         assert_eq!(d.security_type().unwrap(), SEC_CHACHA20_POLY1305);
+    }
+
+    /// 测试用 AsyncDuplex：按 step 字节分块返回 data，读尽后返回 EOF（filled()==0）
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+    }
+
+    impl AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return Poll::Ready(Ok(())); // EOF
+            }
+            let n = (self.data.len() - self.pos)
+                .min(self.step)
+                .min(buf.remaining());
+            buf.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ChunkedReader {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn test_session() -> VmessSession {
+        VmessSession {
+            request_body_key: [0x11; 16],
+            request_body_iv: [0x22; 16],
+            response_header_byte: 0x00,
+            response_body_key: [0x33; 16],
+            response_body_iv: [0x44; 16],
+        }
+    }
+
+    /// 回归测试：对端在不足一个 2 字节 mask 帧时即 EOF（服务端关闭）。
+    /// 修复前 `poll_fill_frame` 会把 EOF 补零成伪帧导致解析错误；
+    /// 修复后应返回干净 EOF（Ok(0)）。
+    #[tokio::test]
+    async fn test_body_read_eof_clean() {
+        let inner = Box::new(ChunkedReader {
+            data: vec![0xAB],
+            pos: 0,
+            step: 1,
+        });
+        let mut stream = VmessBodyStream::new_with_mode(inner, test_session(), SEC_AES128_GCM, false);
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// 回归测试：完整 chunk 被分块（step=3）注入，模拟 TCP 分片/部分读，
+    /// 客户端应正确拼装并解密出明文；修复前会因补零导致 open 失败。
+    #[tokio::test]
+    async fn test_body_read_split_chunk() {
+        let session = test_session();
+        let plain = b"vmess response payload";
+
+        // 按 v2ray 响应体格式构造一个合法 chunk（response 方向密钥）
+        let mut shake = ShakeSize::new(&session.response_body_iv);
+        let mask = shake.next_mask();
+        let padding = shake.next_padding() as usize;
+        let size = (plain.len() + AEAD_TAG + padding) as u16;
+        let key = chacha_or_aes_key(&session.response_body_key, false);
+        let nonce = ChunkNonce::new(session.response_body_iv).next();
+        let ciphertext = aead_seal(&key, &nonce, plain, false).unwrap();
+
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&(size ^ mask).to_be_bytes());
+        chunk.extend_from_slice(&ciphertext);
+        chunk.resize(chunk.len() + padding, 0);
+
+        let inner = Box::new(ChunkedReader {
+            data: chunk,
+            pos: 0,
+            step: 3,
+        });
+        let mut stream = VmessBodyStream::new_with_mode(inner, session, SEC_AES128_GCM, false);
+        let mut buf = vec![0u8; plain.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], plain);
     }
 }

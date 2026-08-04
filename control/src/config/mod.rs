@@ -171,11 +171,11 @@ pub enum ConfigError {
     ApiTlsMissingCertKey,
 
     // ── DNS Errors ──
-    /// E2001: DNS group references unknown proxy group
-    #[error("[E2001] DNS group '{dns_group}' references unknown proxy group: '{proxy_group}'")]
-    DnsUnknownProxyGroup {
+    /// E2001: DNS group references unknown send_by group
+    #[error("[E2001] DNS group '{dns_group}' references unknown send_by group: '{send_by}'")]
+    DnsUnknownSendByGroup {
         dns_group: String,
-        proxy_group: String,
+        send_by: String,
     },
     /// E2002: DNS routing references unknown DNS group
     #[error("[E2002] DNS routing references unknown DNS group: '{group}'")]
@@ -204,6 +204,11 @@ pub enum ConfigError {
     #[error("[E2007] DNS routing fallback references unknown DNS group: '{group}'")]
     DnsFallbackUnknownGroup {
         group: String,
+    },
+    /// E2008: DNS group name conflicts with reserved keyword
+    #[error("[E2008] DNS group name '{name}' is reserved and cannot be used")]
+    DnsNameConflict {
+        name: String,
     },
 
     // ── Rule Set Errors ──
@@ -269,11 +274,6 @@ pub enum ConfigWarning {
     ApiTokenTooShort {
         length: usize,
     },
-    /// W2001: DNS group request_routing not configured, using fallback
-    #[allow(dead_code)]
-    DnsGroupNoRequestRouting {
-        group: String,
-    },
     /// W2002: DNS group response_routing not configured, all responses accepted
     #[allow(dead_code)]
     DnsGroupNoResponseRouting {
@@ -292,9 +292,6 @@ impl std::fmt::Display for ConfigWarning {
             }
             ConfigWarning::ApiTokenTooShort { length } => {
                 write!(f, "[W1902] API token length {} < recommended 16", length)
-            }
-            ConfigWarning::DnsGroupNoRequestRouting { group } => {
-                write!(f, "[W2001] DNS group '{}' has no request_routing configured, using first upstream as fallback", group)
             }
             ConfigWarning::DnsGroupNoResponseRouting { group } => {
                 write!(f, "[W2002] DNS group '{}' has no response_routing configured, all responses accepted", group)
@@ -323,14 +320,18 @@ pub struct DnsUpstreamEntry {
     pub address: String,
 }
 
-/// Starting DNS configuration (bootstrap resolver, used before proxy is available)
+/// Starting DNS configuration (bootstrap resolver, used before proxy is available).
+///
+/// The upstream list is a flat set of IP-address DNS servers (e.g. `udp://223.5.5.5:53`).
+/// They are queried **directly** (never through a proxy) and are used to resolve
+/// hostname-based upstreams of DNS groups at initialization time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct StartingDnsConfig {
     /// IP version preference: 4 (IPv4 only) or 6 (IPv6 only)
     pub ip_version_prefer: u8,
-    /// Bootstrap upstream server list (usually one)
-    pub upstream: Vec<DnsUpstreamEntry>,
+    /// Bootstrap upstream IP DNS server list (e.g. "udp://223.5.5.5:53")
+    pub upstream: Vec<String>,
 }
 
 /// DNS cache configuration
@@ -385,15 +386,22 @@ pub struct DnsRouteRule {
     pub action: String,
 }
 
-/// DNS request routing configuration (within a group)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsGroupRequestRouting {
-    /// Ordered list of routing rules
-    #[serde(default)]
-    pub rules: Vec<DnsRouteRule>,
-    /// Default upstream if no rule matches
-    pub fallback: String,
+/// DNS group query mode: how to select which upstream to query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsQueryMode {
+    /// Query all upstreams in the group concurrently, use the first success.
+    Concurrent,
+    /// Pick a random upstream in the group and query it.
+    Random,
+    /// Try upstreams in order (top to bottom), use the first success.
+    Sequence,
+}
+
+impl Default for DnsQueryMode {
+    fn default() -> Self {
+        DnsQueryMode::Concurrent
+    }
 }
 
 /// DNS response routing rule
@@ -423,14 +431,15 @@ pub struct DnsGroupResponseRouting {
 pub struct DnsGroupConfig {
     /// Group name (used in routing)
     pub name: String,
-    /// Proxy binding: "direct" or "proxy(group_name)" reference
-    pub proxy: String,
+    /// How to send this group's upstream queries: "direct" for direct connection,
+    /// or a proxy group name to route through that proxy group.
+    pub send_by: String,
+    /// Query mode: how to select which upstream in the group to query.
+    #[serde(default)]
+    pub query_mode: DnsQueryMode,
     /// Upstream DNS servers in this group
     #[serde(default)]
     pub upstream: Vec<DnsUpstreamEntry>,
-    /// Within-group request routing (which upstream to use)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_routing: Option<DnsGroupRequestRouting>,
     /// Response routing (pollution detection and fallback)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_routing: Option<DnsGroupResponseRouting>,
@@ -476,10 +485,7 @@ impl Default for DnsConfig {
         Self {
             starting_dns: StartingDnsConfig {
                 ip_version_prefer: 4,
-                upstream: vec![DnsUpstreamEntry {
-                    label: "bootstrap".into(),
-                    address: "udp://1.1.1.1:53".into(),
-                }],
+                upstream: vec!["udp://1.1.1.1:53".into()],
             },
             bind: "127.0.0.1:5353".into(),
             cache: DnsCacheConfig::default(),

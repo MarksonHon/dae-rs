@@ -5,6 +5,7 @@
 
 use super::*;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 use crate::ruleset::types::{parse_period, parse_time};
 // ============================================================================
@@ -414,6 +415,26 @@ fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
         return Err(ConfigError::DnsStartingDnsNoUpstream);
     }
 
+    // starting_dns upstreams must be IP addresses (hostnames can't bootstrap).
+    use crate::dns::upstream::parse_dns_url_parts;
+    for addr in &dns.starting_dns.upstream {
+        let parts = parse_dns_url_parts(addr).map_err(|e| ConfigError::InvalidValue {
+            line: 0,
+            field: "dns.starting_dns.upstream".into(),
+            message: format!("invalid starting_dns upstream '{}': {}", addr, e),
+        })?;
+        if parts.host.parse::<IpAddr>().is_err() {
+            return Err(ConfigError::InvalidValue {
+                line: 0,
+                field: "dns.starting_dns.upstream".into(),
+                message: format!(
+                    "starting_dns upstream '{}' must use an IP address (hostname '{}' cannot bootstrap)",
+                    addr, parts.host
+                ),
+            });
+        }
+    }
+
     // Collect DNS group names
     let dns_group_names: std::collections::HashSet<&str> =
         dns.groups.iter().map(|g| g.name.as_str()).collect();
@@ -430,14 +451,20 @@ fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
 
     // Validate each DNS group
     for group in &dns.groups {
-        // proxy must be "direct" or reference a valid proxy group
-        if group.proxy != "direct" {
+        // "direct" is a reserved send_by keyword and cannot be used as a group name
+        if group.name == "direct" {
+            return Err(ConfigError::DnsNameConflict {
+                name: group.name.clone(),
+            });
+        }
+        // send_by must be "direct" or reference a valid proxy group
+        if group.send_by != "direct" {
             let proxy_group_names: std::collections::HashSet<&str> =
                 config.outbounds.groups.iter().map(|g| g.name.as_str()).collect();
-            if !proxy_group_names.contains(group.proxy.as_str()) {
-                return Err(ConfigError::DnsUnknownProxyGroup {
+            if !proxy_group_names.contains(group.send_by.as_str()) {
+                return Err(ConfigError::DnsUnknownSendByGroup {
                     dns_group: group.name.clone(),
-                    proxy_group: group.proxy.clone(),
+                    send_by: group.send_by.clone(),
                 });
             }
         }
@@ -447,29 +474,6 @@ fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
             return Err(ConfigError::DnsGroupNoUpstream {
                 group: group.name.clone(),
             });
-        }
-
-        // Validate request_routing actions reference valid upstream labels
-        if let Some(ref rr) = group.request_routing {
-            let upstream_labels: std::collections::HashSet<&str> =
-                group.upstream.iter().map(|u| u.label.as_str()).collect();
-            // Also check against DNS group names for cross-group routing
-            for rule in &rr.rules {
-                if !upstream_labels.contains(rule.action.as_str())
-                    && !dns_group_names.contains(rule.action.as_str())
-                {
-                    return Err(ConfigError::DnsUnknownGroup {
-                        group: rule.action.clone(),
-                    });
-                }
-            }
-            if !upstream_labels.contains(rr.fallback.as_str())
-                && !dns_group_names.contains(rr.fallback.as_str())
-            {
-                return Err(ConfigError::DnsFallbackUnknownGroup {
-                    group: rr.fallback.clone(),
-                });
-            }
         }
 
         // Validate response_routing
@@ -625,17 +629,12 @@ fn validate_ruleset_refs(
         check_expr(&rule.r#match)?;
     }
 
-    // DNS top-level Routing + intra-group request/response Routing
+    // DNS top-level Routing + intra-group response Routing
     if let Some(dns) = &config.dns {
         for rule in &dns.routing.rules {
             check_expr(&rule.r#match)?;
         }
         for group in &dns.groups {
-            if let Some(rr) = &group.request_routing {
-                for rule in &rr.rules {
-                    check_expr(&rule.r#match)?;
-                }
-            }
             if let Some(resp) = &group.response_routing {
                 for rule in &resp.rules {
                     check_expr(&rule.r#match)?;

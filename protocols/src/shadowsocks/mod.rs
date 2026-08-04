@@ -281,6 +281,15 @@ impl OutboundDialer for ShadowsocksDialer {
         // 2. Send encrypted target address
         let target_addr = Self::encode_address(target)?;
         let framed = cipher.frame_packet(&target_addr)?;
+        // [DEBUG] 临时调试日志：定位 "length tag verification failed"，打印 target、包头 hex 与首帧前缀 hex（便于与 sslocal 抓包对比）
+        let first_frame_prefix32 = framed.iter().take(32).copied().collect::<Vec<_>>();
+        tracing::info!(
+            "shadowsocks debug dial: target={} encode_address={} salt={} first_frame_prefix32={}",
+            target,
+            hex::encode(&target_addr),
+            hex::encode(&cipher.salt),
+            hex::encode(&first_frame_prefix32),
+        );
         stream.write_all(&framed).await.map_err(ShadowsocksError::Io)?;
 
         // 3. Wrap into encrypted stream and return
@@ -495,6 +504,8 @@ pub struct SsStream {
     kind: CipherKind,
     master_key: Vec<u8>,
     tag: usize,
+    /// [DEBUG] 临时调试字段：最近一次读取到的 server salt（仅用于调试日志，不影响正常逻辑）
+    debug_server_salt: Vec<u8>,
     /// Write path output buffer (framed ciphertext)
     write_out: Vec<u8>,
     write_pos: usize,
@@ -522,6 +533,7 @@ impl SsStream {
             kind,
             master_key,
             tag,
+            debug_server_salt: Vec::new(),
             write_out: Vec::new(),
             write_pos: 0,
             read_frame: Vec::new(),
@@ -536,10 +548,11 @@ impl SsStream {
     fn poll_fill_frame(&mut self, cx: &mut Context<'_>, need: usize) -> Poll<io::Result<()>> {
         while self.read_frame.len() < need {
             let mut buf = vec![0u8; need - self.read_frame.len()];
-            match Pin::new(&mut self.inner).poll_read(cx, &mut ReadBuf::new(&mut buf)) {
+            let mut read_buf = ReadBuf::new(&mut buf);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {
-                    let n = buf.len();
+                    let n = read_buf.filled().len();
                     if n == 0 {
                         return Poll::Ready(Ok(())); // EOF; caller checks len
                     }
@@ -588,6 +601,7 @@ impl AsyncRead for SsStream {
                 return Poll::Ready(Ok(()));
             }
             let server_salt: Vec<u8> = self.read_frame.drain(..salt_len).collect();
+            self.debug_server_salt = server_salt.clone();
             self.dec = Some(match self.kind.category() {
                 CipherCategory::Aead => SsCipher::Legacy(V1Cipher::new(
                     self.kind,
@@ -601,6 +615,12 @@ impl AsyncRead for SsStream {
                 )),
                 _ => unreachable!(),
             });
+            // [DEBUG] 临时调试日志：打印 server salt hex 与 peer addr
+            tracing::info!(
+                "shadowsocks debug server_salt: salt={} peer={:?}",
+                hex::encode(&self.debug_server_salt),
+                self.inner.peer_addr(),
+            );
         }
 
         // Need to read a complete frame: length frame (2+tag) + payload frame (len+tag)
@@ -626,6 +646,16 @@ impl AsyncRead for SsStream {
                 .expect("dec initialized before frame reads")
                 .decrypt_packet(&mut len_buf)
             {
+                // [DEBUG] 临时调试日志：失败时 len_buf 已被 decrypt 原地覆盖，故用 self.read_frame 中的原始字节打印
+                let debug_len_frame_hex = hex::encode(&self.read_frame[..need_len_frame]);
+                tracing::info!(
+                    "shadowsocks debug length_tag_verify_failed: len_frame={} server_salt={} peer={:?} tag={} salt_len={}",
+                    debug_len_frame_hex,
+                    hex::encode(&self.debug_server_salt),
+                    self.inner.peer_addr(),
+                    self.tag,
+                    self.salt_len,
+                );
                 return Poll::Ready(Err(io::Error::other("shadowsocks: length tag verification failed")));
             }
             self.read_frame.drain(..need_len_frame);
@@ -852,5 +882,89 @@ mod tests {
             assert!(dec.decrypt_packet(&mut payload), "{}", cipher);
             assert_eq!(&payload[..plain.len()], plain, "{}", cipher);
         }
+    }
+
+    /// 回归测试：服务端发送 salt 后立即关闭（未送达合法长度帧）。
+    /// 修复前 `poll_fill_frame` 用 `buf.len()` 将 EOF 补成 18 字节零帧，
+    /// 从而把“服务端关闭”误报为 `length tag verification failed`；
+    /// 修复后应返回干净 EOF（Ok(0)）。
+    #[tokio::test]
+    async fn test_read_eof_after_salt_is_clean() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let kind = CipherKind::from_str("aes-128-gcm").unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut server = server;
+            let mut server_salt = vec![0u8; kind.salt_len()];
+            random_iv_or_salt(&mut server_salt);
+            server.write_all(&server_salt).await.unwrap();
+            // drop(server)：关闭连接，不发送任何长度帧
+        });
+
+        let d = ShadowsocksDialer::new(addr, "aes-128-gcm", "password", 5000);
+        let pair = d.new_cipher_pair().unwrap();
+        let mut stream = SsStream::new(client, pair);
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+        server_task.await.unwrap();
+    }
+
+    /// 回归测试：服务端响应被拆成多次 write（模拟 TCP 分片/部分读），
+    /// 客户端应正确拼装并解密出明文。
+    #[tokio::test]
+    async fn test_read_server_response_split_writes() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let kind = CipherKind::from_str("aes-128-gcm").unwrap();
+        let key = ShadowsocksDialer::master_key(kind, "password");
+        let plain = b"hello response payload from server";
+
+        let server_task = tokio::spawn(async move {
+            let mut server = server;
+            // 服务端 salt + 用 server_salt 派生的加密器
+            let mut server_salt = vec![0u8; kind.salt_len()];
+            random_iv_or_salt(&mut server_salt);
+            let mut enc = V1Cipher::new(kind, &key, &server_salt);
+            let tag = enc.tag_len();
+            // 长度帧 [2-byte len][tag]
+            let mut len_buf = vec![0u8; 2 + tag];
+            len_buf[..2].copy_from_slice(&(plain.len() as u16).to_be_bytes());
+            enc.encrypt_packet(&mut len_buf);
+            // payload 帧 [plain][tag]
+            let mut payload = vec![0u8; plain.len() + tag];
+            payload[..plain.len()].copy_from_slice(plain);
+            enc.encrypt_packet(&mut payload);
+
+            // 分多次 write，模拟 TCP 分片/部分读
+            server.write_all(&server_salt).await.unwrap();
+            server.write_all(&len_buf[..5]).await.unwrap();
+            server.write_all(&len_buf[5..]).await.unwrap();
+            server.write_all(&payload[..3]).await.unwrap();
+            server.write_all(&payload[3..]).await.unwrap();
+            server.flush().await.unwrap();
+        });
+
+        let d = ShadowsocksDialer::new(addr, "aes-128-gcm", "password", 5000);
+        let pair = d.new_cipher_pair().unwrap();
+        let mut stream = SsStream::new(client, pair);
+        let mut buf = vec![0u8; plain.len()];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], plain);
+        server_task.await.unwrap();
     }
 }

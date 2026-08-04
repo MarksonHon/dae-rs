@@ -1,11 +1,15 @@
 use anyhow::Context;
+use futures::future::select_ok;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, info, warn};
 
+use protocols::OutboundDialer;
+use crate::dns::upstream::query_dns_via_proxy;
 use crate::ruleset::cache::RuleSetCache;
 use crate::ruleset::refparse::{match_domain_patterns, match_qname_value, parse_ref, RuleSetRef};
 
@@ -60,6 +64,9 @@ pub struct DnsListener {
     on_resolve: Option<DnsResolveCallback>,
     /// Ruleset in-memory cache (for DNS response Routing `ip(geoip:/set:)` / `qname(geosite:/set:)` evaluation).
     rule_set_cache: RuleSetCache,
+    /// Outbound dialers keyed by proxy **group name**, used for proxied DNS
+    /// upstream queries (`send_by` names an outbound group).
+    dialers: HashMap<String, Arc<dyn OutboundDialer>>,
 }
 
 impl DnsListener {
@@ -71,6 +78,7 @@ impl DnsListener {
         router: DnsRouter,
         on_resolve: Option<DnsResolveCallback>,
         rule_set_cache: RuleSetCache,
+        dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     ) -> Self {
         Self {
             bind_addr,
@@ -83,6 +91,7 @@ impl DnsListener {
             shutdown_tx: None,
             on_resolve,
             rule_set_cache,
+            dialers,
         }
     }
 
@@ -111,6 +120,7 @@ impl DnsListener {
             anyhow::anyhow!("failed to bind DNS UDP listener on {}: {}", bind, e)
         })?;
         debug!("DNS UDP listener bound to {}", bind);
+        let u_dialers = self.dialers.clone();
         let u_config = config.clone();
         let u_pools = upstream_pools.clone();
         let u_cache = cache.clone();
@@ -126,6 +136,7 @@ impl DnsListener {
                 u_router,
                 u_on_resolve,
                 u_ruleset,
+                u_dialers,
             )
             .await;
         });
@@ -135,6 +146,7 @@ impl DnsListener {
         let tcp_listener = bind_tcp_with_reuseaddr(bind).await.map_err(|e| {
             anyhow::anyhow!("failed to bind DNS TCP listener on {}: {}", bind, e)
         })?;
+        let tcp_dialers = self.dialers.clone();
         let tcp_handle = tokio::spawn(async move {
             run_tcp_listener(
                 tcp_listener,
@@ -144,6 +156,7 @@ impl DnsListener {
                 router,
                 on_resolve,
                 rule_set_cache,
+                tcp_dialers,
             )
             .await;
         });
@@ -167,6 +180,7 @@ impl DnsListener {
         debug!("DNS internal listener address: {}", internal_addr);
         match bind_udp_with_reuseaddr(internal_addr).await {
             Ok(internal_socket) => {
+                let i_dialers = self.dialers.clone();
                 let i_config = Arc::new(self.config.clone());
                 let i_pools = self.upstream_pools.clone();
                 let i_cache = self.cache.clone();
@@ -182,6 +196,7 @@ impl DnsListener {
                         i_router,
                         i_on_resolve,
                         i_ruleset,
+                        i_dialers,
                     )
                     .await;
                 });
@@ -234,6 +249,7 @@ async fn run_udp_listener(
     router: Arc<DnsRouter>,
     on_resolve: Option<DnsResolveCallback>,
     rule_set_cache: RuleSetCache,
+    dialers: HashMap<String, Arc<dyn OutboundDialer>>,
 ) {
     let mut buf = vec![0u8; 4096];
     loop {
@@ -246,12 +262,30 @@ async fn run_udp_listener(
             }
         };
         let request = buf[..len].to_vec();
+        // Info-level log for DNS queries arriving from the TProxy cross-namespace
+        // path (source is NOT 127.0.0.1). This lets operators see whether hijacked
+        // DNS queries actually reach the handler, without spamming for localhost
+        // clients that talk to the bind address directly.
+        if src.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+            info!(
+                "DNS query received from {} on {}: {} bytes",
+                src,
+                socket.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".into()),
+                len
+            );
+        } else {
+            debug!(
+                "DNS query received from {}: {} bytes",
+                src, len
+            );
+        }
         let config = config.clone();
         let upstream_pools = upstream_pools.clone();
         let cache = cache.clone();
         let router = router.clone();
         let on_resolve = on_resolve.clone();
         let rule_set_cache = rule_set_cache.clone();
+        let dialers = dialers.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_dns_query(
@@ -263,10 +297,11 @@ async fn run_udp_listener(
                 &router,
                 &on_resolve,
                 &rule_set_cache,
+                dialers,
             )
             .await
             {
-                debug!("DNS query handling failed: {}", e);
+                warn!("DNS query handling failed: {}", e);
             }
         });
     }
@@ -281,6 +316,7 @@ async fn run_tcp_listener(
     router: Arc<DnsRouter>,
     on_resolve: Option<DnsResolveCallback>,
     rule_set_cache: RuleSetCache,
+    dialers: HashMap<String, Arc<dyn OutboundDialer>>,
 ) {
     loop {
         let result = listener.accept().await;
@@ -297,6 +333,7 @@ async fn run_tcp_listener(
         let router = router.clone();
         let on_resolve = on_resolve.clone();
         let rule_set_cache = rule_set_cache.clone();
+        let dialers = dialers.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -329,6 +366,7 @@ async fn run_tcp_listener(
                 &router,
                 &on_resolve,
                 &rule_set_cache,
+                &dialers,
             )
             .await
             {
@@ -364,6 +402,7 @@ async fn handle_dns_query(
     router: &Arc<DnsRouter>,
     on_resolve: &Option<DnsResolveCallback>,
     rule_set_cache: &RuleSetCache,
+    dialers: HashMap<String, Arc<dyn OutboundDialer>>,
 ) -> anyhow::Result<()> {
     let (response, upstream_addr) = handle_dns_internal(
         request,
@@ -373,6 +412,7 @@ async fn handle_dns_query(
         router,
         on_resolve,
         rule_set_cache,
+        &dialers,
     )
     .await?;
 
@@ -406,6 +446,11 @@ async fn handle_dns_query(
 /// Returns `None` for the upstream address when the response came from cache
 /// (no upstream was contacted), in which case the caller should use a fallback
 /// source address.
+///
+/// Queries all upstreams in the selected DNS group concurrently and returns
+/// the first successful response. When `send_by` is a proxy group name, the
+/// upstream queries are sent through that proxy; when `send_by` is `"direct"`,
+/// they are sent directly.
 async fn handle_dns_internal(
     request: &[u8],
     #[allow(unused)] config: &Arc<DnsConfig>,
@@ -414,16 +459,24 @@ async fn handle_dns_internal(
     router: &Arc<DnsRouter>,
     on_resolve: &Option<DnsResolveCallback>,
     rule_set_cache: &RuleSetCache,
+    dialers: &HashMap<String, Arc<dyn OutboundDialer>>,
 ) -> anyhow::Result<(Vec<u8>, Option<SocketAddr>)> {
     // Parse query name and type
     let (qname, qtype) = parse_dns_question(request);
 
-    // Check cache first
+    // Route to group (needed for the per-group cache partition)
+    let route = router.match_query(&qname, qtype);
+    if route.group.name == "null" || route.group.upstream.is_empty() {
+        return Ok((build_empty_response(request), None));
+    }
+    let group_name = route.group.name.clone();
+
+    // Check cache (per DNS group partition)
     let cache_key = DnsCache::cache_key(&qname, qtype, 1); // class IN = 1
     {
         let cache_guard = cache.read().unwrap();
-        if let Some(cached) = cache_guard.lookup(cache_key) {
-            debug!("DNS cache hit: {} type={}", qname, qtype);
+        if let Some(cached) = cache_guard.lookup(&group_name, cache_key) {
+            debug!("DNS cache hit: {} type={} group={}", qname, qtype, group_name);
             let mut response = cached.to_vec();
             // Patch transaction ID to match the current query — DNS clients
             // discard responses whose ID doesn't match the outstanding query.
@@ -434,42 +487,172 @@ async fn handle_dns_internal(
         }
     }
 
-    // Route to group and upstream
-    let route = router.match_query(&qname, qtype);
-    if route.upstream_label.is_empty() {
-        // No upstream found — return empty response
+    // Resolve the dialer for this group's `send_by` (an outbound group name).
+    // None → direct connection; Some(d) → proxied through that group.
+    let dialer: Option<&dyn OutboundDialer> = match &route.send_by {
+        Some(group) => dialers.get(group).map(|d| d.as_ref()),
+        None => None,
+    };
+
+    // Collect all upstreams in the group.
+    // Each query yields (response, upstream_addr, upstream_label) so that
+    // response routing can match `upstream(<label>)` against the actual
+    // upstream that produced the winning response.
+    let timeout = Duration::from_secs(5);
+    let is_proxied = dialer.is_some();
+
+    let mut candidates: Vec<(String, SocketAddr, Arc<DnsUpstreamPool>)> = Vec::new();
+    for upstream in &route.group.upstream {
+        let pool_key = format!("{}__{}", route.group.name, upstream.label);
+        if let Some(pool) = upstream_pools.get(&pool_key) {
+            candidates.push((upstream.label.clone(), pool.address(), pool.clone()));
+        }
+    }
+
+    if candidates.is_empty() {
+        warn!("DNS group '{}' has no available upstreams", route.group.name);
         return Ok((build_empty_response(request), None));
     }
 
-    // Look up upstream pool
-    let pool_key = format!("{}__{}", route.group.name, route.upstream_label);
-    let pool = match upstream_pools.get(&pool_key) {
-        Some(p) => p,
-        None => {
-            // Try starting DNS pools as fallback
-            let starting_key = format!("__starting__{}", route.upstream_label);
-            match upstream_pools.get(&starting_key) {
-                Some(p) => p,
-                None => {
-                    warn!("DNS upstream not found: {}", pool_key);
-                    return Ok((build_empty_response(request), None));
+    // Query one upstream candidate (direct or via proxy), returning
+    // (response, upstream_addr, upstream_label).
+    async fn query_one(
+        is_proxied: bool,
+        dialer: Option<&dyn OutboundDialer>,
+        pool: &DnsUpstreamPool,
+        upstream_addr: SocketAddr,
+        upstream_label: String,
+        request: &[u8],
+        timeout: Duration,
+    ) -> anyhow::Result<(Vec<u8>, SocketAddr, String)> {
+        if is_proxied {
+            let d = dialer.ok_or_else(|| {
+                anyhow::anyhow!("DNS group has send_by configured but no dialer available")
+            })?;
+            let transport = pool.transport();
+            let resp = query_dns_via_proxy(d, upstream_addr, transport, request, timeout).await?;
+            Ok((resp, upstream_addr, upstream_label))
+        } else {
+            let resp = pool.query(request).await?;
+            Ok((resp, upstream_addr, upstream_label))
+        }
+    }
+
+    let query_mode = route.group.query_mode;
+    let result = match query_mode {
+        crate::config::DnsQueryMode::Concurrent => {
+            let mut futures: Vec<
+                std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = anyhow::Result<(Vec<u8>, SocketAddr, String)>,
+                            > + Send,
+                    >,
+                >,
+            > = Vec::new();
+            for (label, addr, pool) in &candidates {
+                let req = request.to_vec();
+                if is_proxied {
+                    if let Some(d) = dialer {
+                        let transport = pool.transport();
+                        let label = label.clone();
+                        let addr = *addr;
+                        futures.push(Box::pin(async move {
+                            let resp =
+                                query_dns_via_proxy(d, addr, transport, &req, timeout).await?;
+                            Ok::<_, anyhow::Error>((resp, addr, label))
+                        }));
+                    } else {
+                        warn!(
+                            "DNS group '{}' has send_by configured but no dialer available",
+                            route.group.name
+                        );
+                    }
+                } else {
+                    let pool = pool.clone();
+                    let label = label.clone();
+                    let addr = *addr;
+                    futures.push(Box::pin(async move {
+                        let resp = pool.query(&req).await?;
+                        Ok::<_, anyhow::Error>((resp, addr, label))
+                    }));
                 }
+            }
+            if futures.is_empty() {
+                return Err(anyhow::anyhow!("no queryable upstreams in concurrent mode"));
+            }
+            match select_ok(futures).await {
+                Ok((result, _remaining)) => Ok(result),
+                Err(e) => Err(anyhow::anyhow!("all upstreams failed: {}", e)),
+            }
+        }
+        crate::config::DnsQueryMode::Random => {
+            // Pick one random candidate and query it.
+            let idx = fastrand::usize(..candidates.len());
+            let (label, addr, pool) = &candidates[idx];
+            query_one(
+                is_proxied,
+                dialer,
+                pool,
+                *addr,
+                label.clone(),
+                request,
+                timeout,
+            )
+            .await
+        }
+        crate::config::DnsQueryMode::Sequence => {
+            // Try upstreams in order, use the first success.
+            let mut last_err: Option<String> = None;
+            let mut result: Option<anyhow::Result<(Vec<u8>, SocketAddr, String)>> = None;
+            for (label, addr, pool) in &candidates {
+                match query_one(
+                    is_proxied,
+                    dialer,
+                    pool,
+                    *addr,
+                    label.clone(),
+                    request,
+                    timeout,
+                )
+                .await
+                {
+                    Ok(res) => {
+                        result = Some(Ok(res));
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        continue;
+                    }
+                }
+            }
+            match result {
+                Some(r) => r,
+                None => Err(anyhow::anyhow!(
+                    "all upstreams failed: {}",
+                    last_err.unwrap_or_else(|| "no candidates".into())
+                )),
             }
         }
     };
 
-    let upstream_addr = pool.address();
+    let (response, upstream_addr, upstream_label) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("DNS group '{}' {} query failed: {}", route.group.name, query_mode_label(query_mode), e);
+            return Ok((build_empty_response(request), None));
+        }
+    };
 
-    // Forward query to upstream
-    let response = pool.query(request).await?;
-
-    // Apply response routing
+    // Apply response routing against the upstream that actually produced the
+    // winning response, so `upstream(<label>)` conditions match correctly.
     let action = check_dns_response(
         &response,
         &qname,
         &route.group,
         router,
-        &route.upstream_label,
+        &upstream_label,
         rule_set_cache,
     );
 
@@ -478,7 +661,7 @@ async fn handle_dns_internal(
             // Cache the response
             let ttl = extract_min_ttl(&response);
             let mut cache_guard = cache.write().unwrap();
-            cache_guard.insert(cache_key, response.clone(), ttl);
+            cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
             // Feed accepted resolutions into the domain routing tracker so the
             // eBPF domain_routing_map is populated for domain-based routing.
             notify_resolve(on_resolve, &qname, &response);
@@ -489,21 +672,45 @@ async fn handle_dns_internal(
             let new_pool_key = format!("{}__{}", route.group.name, new_upstream);
             if let Some(new_pool) = upstream_pools.get(&new_pool_key) {
                 let new_upstream_addr = new_pool.address();
-                let response = new_pool.query(request).await?;
+                let response = if is_proxied {
+                    if let Some(d) = dialer {
+                        query_dns_via_proxy(
+                            d,
+                            new_upstream_addr,
+                            new_pool.transport(),
+                            request,
+                            timeout,
+                        )
+                        .await?
+                    } else {
+                        return Ok((build_empty_response(request), None));
+                    }
+                } else {
+                    new_pool.query(request).await?
+                };
                 let ttl = extract_min_ttl(&response);
                 let mut cache_guard = cache.write().unwrap();
-                cache_guard.insert(cache_key, response.clone(), ttl);
+                cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
                 notify_resolve(on_resolve, &qname, &response);
                 Ok((response, Some(new_upstream_addr)))
             } else {
                 // Fallback: accept original response
                 let ttl = extract_min_ttl(&response);
                 let mut cache_guard = cache.write().unwrap();
-                cache_guard.insert(cache_key, response.clone(), ttl);
+                cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
                 notify_resolve(on_resolve, &qname, &response);
                 Ok((response, Some(upstream_addr)))
             }
         }
+    }
+}
+
+/// Return a human-readable label for a DNS group query mode (used in debug logs).
+fn query_mode_label(mode: crate::config::DnsQueryMode) -> &'static str {
+    match mode {
+        crate::config::DnsQueryMode::Concurrent => "concurrent",
+        crate::config::DnsQueryMode::Random => "random",
+        crate::config::DnsQueryMode::Sequence => "sequence",
     }
 }
 

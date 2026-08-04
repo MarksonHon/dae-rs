@@ -1,7 +1,9 @@
 use anyhow::Context;
+use protocols::{OutboundDialer, UdpSession};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tracing::debug;
 
 // SO_MARK value for control plane sockets (must match dae_socket_mark in eBPF PARAM).
 // Setting this mark on all dae-rs internal sockets ensures `pid_is_control_plane()`
@@ -45,6 +47,11 @@ impl DnsUpstreamPool {
     /// Get the upstream server address.
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Get the upstream transport type (UDP / TCP / TCP+UDP / DoH / DoT).
+    pub fn transport(&self) -> DnsTransport {
+        self.transport.clone()
     }
 
     pub fn new(url: &str) -> anyhow::Result<Self> {
@@ -117,8 +124,6 @@ impl DnsUpstreamPool {
     }
 
     async fn query_tcp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         // TCP query socket: uniformly uses hostns::connect_tcp (control plane mark → direct)
         let mut stream = protocols::hostns::connect_tcp(
             self.address,
@@ -129,23 +134,131 @@ impl DnsUpstreamPool {
         .await
         .map_err(|e| anyhow::anyhow!("failed to create marked TCP socket: {}", e))?;
 
-        // TCP DNS: 2-byte length prefix
+        Self::send_tcp_dns_query(&mut stream, request, self.timeout).await
+    }
+
+    /// Send a DNS query over an existing TCP stream (2-byte length prefix framing).
+    async fn send_tcp_dns_query(
+        stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+        request: &[u8],
+        timeout: Duration,
+    ) -> anyhow::Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let len = (request.len() as u16).to_be_bytes();
         let mut framed = Vec::with_capacity(2 + request.len());
         framed.extend_from_slice(&len);
         framed.extend_from_slice(request);
 
-        tokio::time::timeout(self.timeout, stream.write_all(&framed)).await??;
+        tokio::time::timeout(timeout, stream.write_all(&framed)).await??;
 
-        // Read response: 2-byte length prefix
         let mut len_buf = [0u8; 2];
-        tokio::time::timeout(self.timeout, stream.read_exact(&mut len_buf)).await??;
+        tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await??;
         let resp_len = u16::from_be_bytes(len_buf) as usize;
 
         let mut response = vec![0u8; resp_len];
-        tokio::time::timeout(self.timeout, stream.read_exact(&mut response)).await??;
+        tokio::time::timeout(timeout, stream.read_exact(&mut response)).await??;
         Ok(response)
     }
+}
+
+/// Send a DNS query through a proxy dialer, respecting the upstream's
+/// configured transport type:
+///
+/// - `Udp` — via the proxy's UDP relay session (`dialer.udp_dial()`);
+/// - `Tcp` — via a proxied TCP connection to the upstream DNS server;
+/// - `TcpUdp` — try UDP relay first, fall back to TCP;
+/// - `Doh`/`Dot` — not supported through the proxy yet.
+///
+/// This allows DNS queries to be routed through proxy groups when
+/// `send_by` is configured.
+pub async fn query_dns_via_proxy(
+    dialer: &dyn OutboundDialer,
+    upstream_addr: SocketAddr,
+    transport: DnsTransport,
+    request: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    match transport {
+        // UDP transport through a proxy: try the proxy's UDP relay first, and
+        // fall back to TCP if UDP relay is unsupported/unreachable (e.g. some
+        // Shadowsocks servers only implement TCP). DNS servers commonly serve
+        // both UDP and TCP on port 53, so the TCP fallback keeps DNS working.
+        // The UDP attempt uses a short budget so an unresponsive relay fails
+        // over to TCP quickly instead of stalling the whole DNS query.
+        DnsTransport::Udp => {
+            let udp_budget = timeout.min(Duration::from_secs(2));
+            let session = match dialer.udp_dial().await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(
+                        "DNS proxy UDP relay unavailable ({}), falling back to TCP",
+                        e
+                    );
+                    return query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await;
+                }
+            };
+            match query_dns_udp_via_proxy(session.as_ref(), upstream_addr, request, udp_budget)
+                .await
+            {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    debug!(
+                        "DNS proxy UDP relay query failed ({}), falling back to TCP",
+                        e
+                    );
+                    query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await
+                }
+            }
+        }
+        DnsTransport::Tcp => query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await,
+        DnsTransport::TcpUdp => {
+            let udp_budget = timeout.min(Duration::from_secs(2));
+            let session = match dialer.udp_dial().await {
+                Ok(s) => s,
+                Err(_) => {
+                    return query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await
+                }
+            };
+            match query_dns_udp_via_proxy(session.as_ref(), upstream_addr, request, udp_budget)
+                .await
+            {
+                Ok(resp) => Ok(resp),
+                Err(_) => query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await,
+            }
+        }
+        DnsTransport::Doh | DnsTransport::Dot => Err(anyhow::anyhow!(
+            "DoH/DoT through proxy not implemented; use udp://, tcp://, or tcp+udp://"
+        )),
+    }
+}
+
+/// Send a DNS query over TCP through a proxy dialer.
+async fn query_dns_tcp_via_proxy(
+    dialer: &dyn OutboundDialer,
+    upstream_addr: SocketAddr,
+    request: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let target = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let mut conn = dialer.dial(&target).await.map_err(|e| {
+        anyhow::anyhow!("failed to dial upstream DNS {} via proxy: {}", target, e)
+    })?;
+
+    // Send DNS query over TCP through the proxy
+    DnsUpstreamPool::send_tcp_dns_query(&mut conn.stream, request, timeout).await
+}
+
+/// Send a DNS query as a UDP datagram through a proxy's UDP relay session.
+async fn query_dns_udp_via_proxy(
+    session: &dyn UdpSession,
+    upstream_addr: SocketAddr,
+    request: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    session.send(&upstream_addr, request).await?;
+    let (_, resp) = tokio::time::timeout(timeout, session.recv()).await??;
+    Ok(resp)
 }
 
 /// Parsed DNS upstream URL components: transport, host, and port.

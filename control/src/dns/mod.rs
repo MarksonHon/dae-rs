@@ -8,6 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use protocols::OutboundDialer;
 use crate::config::DnsConfig;
 use crate::dns::handler::{DnsListener, DnsResolveCallback};
 use crate::dns::upstream::DnsUpstreamPool;
@@ -34,16 +35,26 @@ pub struct DnsManager {
     on_resolve: Option<DnsResolveCallback>,
     /// Ruleset in-memory cache (for DNS routing / response Routing evaluation).
     rule_set_cache: RuleSetCache,
+    /// Outbound dialers keyed by proxy **group name** for proxied DNS upstream
+    /// queries (`send_by != "direct"`). The DNS group's `send_by` value names an
+    /// outbound group; the query goes through that group's dialer.
+    dialers: HashMap<String, Arc<dyn OutboundDialer>>,
 }
 
 impl DnsManager {
     /// Construct DNS manager.
     ///
     /// * `config` — DNS configuration;
-    /// * `rule_set_cache` — ruleset in-memory cache.
+    /// * `rule_set_cache` — ruleset in-memory cache;
+    /// * `dialers` — outbound dialers keyed by proxy group name, used for
+    ///   proxied DNS upstream queries (`send_by`).
     ///
     /// Returns error when DNS Routing compilation fails (unknown/invalid match expression).
-    pub fn new(config: DnsConfig, rule_set_cache: RuleSetCache) -> anyhow::Result<Self> {
+    pub fn new(
+        config: DnsConfig,
+        rule_set_cache: RuleSetCache,
+        dialers: HashMap<String, Arc<dyn OutboundDialer>>,
+    ) -> anyhow::Result<Self> {
         let router = DnsRouter::new(&config, rule_set_cache.clone())?;
         let cache = Arc::new(std::sync::RwLock::new(DnsCache::new(&config.cache)));
 
@@ -56,6 +67,7 @@ impl DnsManager {
             running: false,
             on_resolve: None,
             rule_set_cache,
+            dialers,
         })
     }
 
@@ -75,15 +87,15 @@ impl DnsManager {
         // Bootstrap pools first. They MUST be IP addresses: resolving a hostname
         // bootstrap would create a chicken-and-egg problem (nothing to resolve it with).
         let mut bootstrap_pools: HashMap<String, Arc<DnsUpstreamPool>> = HashMap::new();
-        for entry in &self.config.starting_dns.upstream {
-            match DnsUpstreamPool::new(&entry.address) {
+        for (i, addr) in self.config.starting_dns.upstream.iter().enumerate() {
+            match DnsUpstreamPool::new(addr) {
                 Ok(pool) => {
-                    bootstrap_pools.insert(format!("__starting__{}", entry.label), Arc::new(pool));
+                    bootstrap_pools.insert(format!("__starting__{}", i), Arc::new(pool));
                 }
                 Err(e) => {
                     warn!(
                         "Skipping starting_dns upstream '{}' ({}): {}",
-                        entry.label, entry.address, e
+                        i, addr, e
                     );
                 }
             }
@@ -147,6 +159,7 @@ impl DnsManager {
             router,
             self.on_resolve.clone(),
             self.rule_set_cache.clone(),
+            self.dialers.clone(),
         );
         listener.start().await?;
         self.listener = Some(listener);
@@ -209,29 +222,36 @@ async fn build_upstream_pool(
     ))
 }
 
-/// Resolve `hostname` to an IP using the first available bootstrap pool.
+/// Resolve `hostname` to an IP using the available bootstrap pools.
 ///
-/// Queries A records first, then AAAA. The bootstrap sockets carry SO_MARK=0x100,
-/// so the queries bypass the eBPF proxy pipeline (no hijack loop).
+/// Queries A records first, then AAAA, trying each bootstrap pool in turn.
+/// The bootstrap sockets carry SO_MARK=0x100, so the queries bypass the eBPF
+/// proxy pipeline (no hijack loop).
 async fn resolve_via_bootstrap(
     hostname: &str,
     bootstrap_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
 ) -> Option<IpAddr> {
     use crate::dns::upstream::{build_dns_query, parse_answers_for_addr};
 
-    let pool = bootstrap_pools.values().next()?;
-
-    let a_query = build_dns_query(hostname, 1);
-    if let Ok(resp) = pool.query(&a_query).await {
-        if let Some(ip) = parse_answers_for_addr(&resp).first() {
-            return Some(*ip);
-        }
+    let pools: Vec<Arc<DnsUpstreamPool>> = bootstrap_pools.values().cloned().collect();
+    if pools.is_empty() {
+        return None;
     }
 
+    let a_query = build_dns_query(hostname, 1);
     let aaaa_query = build_dns_query(hostname, 28);
-    if let Ok(resp) = pool.query(&aaaa_query).await {
-        if let Some(ip) = parse_answers_for_addr(&resp).first() {
-            return Some(*ip);
+    for pool in &pools {
+        if let Ok(resp) = pool.query(&a_query).await {
+            if let Some(ip) = parse_answers_for_addr(&resp).first() {
+                return Some(*ip);
+            }
+        }
+    }
+    for pool in &pools {
+        if let Ok(resp) = pool.query(&aaaa_query).await {
+            if let Some(ip) = parse_answers_for_addr(&resp).first() {
+                return Some(*ip);
+            }
         }
     }
 

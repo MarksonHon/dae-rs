@@ -267,14 +267,8 @@
     "starting_dns": {
       "ip_version_prefer": 4,
       "upstream": [
-        {
-          "label": "bootstrap",
-          "address": "udp://1.1.1.1:53"
-        },
-        {
-          "label": "bootstrap",
-          "address": "udp://1.1.1.1:53"
-        }
+        "udp://1.1.1.1:53",
+        "udp://223.5.5.5:53"
       ]
     },
     "bind": "127.0.0.1:5353",
@@ -289,7 +283,8 @@
     "groups": [
       {
         "name": "trusted_dns",
-        "proxy": "proxy_primary",
+        "send_by": "proxy_primary",
+        "query_mode": "concurrent",
         "upstream": [
           {
             "label": "googledns",
@@ -300,10 +295,6 @@
             "address": "udp://1.1.1.1:53"
           }
         ],
-        "request_routing": {
-          "rules": [],
-          "fallback": "googledns"
-        },
         "response_routing": {
           "rules": [
             {
@@ -324,7 +315,8 @@
       },
       {
         "name": "china_dns",
-        "proxy": "direct",
+        "send_by": "direct",
+        "query_mode": "sequence",
         "upstream": [
           {
             "label": "alidns",
@@ -334,11 +326,7 @@
             "label": "cnnic",
             "address": "udp://1.2.4.8:53"
           }
-        ],
-        "request_routing": {
-          "rules": [],
-          "fallback": "alidns"
-        }
+        ]
       }
     ],
     "routing": {

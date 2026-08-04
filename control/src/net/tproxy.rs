@@ -1689,7 +1689,7 @@ impl UdpTproxyListener {
                                     };
 
                                 if let Err(e) = query_socket.send_to(&pkt, handler_addr).await {
-                                    debug!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
+                                    warn!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
                                     return;
                                 }
 
@@ -1704,11 +1704,11 @@ impl UdpTproxyListener {
                                 {
                                     Ok(Ok((len, _))) => len,
                                     Ok(Err(e)) => {
-                                        debug!("DNS hijack: recv from handler error: {}", e);
+                                        warn!("DNS hijack: recv from handler error: {}", e);
                                         return;
                                     }
                                     Err(_) => {
-                                        debug!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
+                                        warn!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
                                         return;
                                     }
                                 };

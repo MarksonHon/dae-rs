@@ -1327,10 +1327,13 @@ routing {
         assert!(json.contains("shadowsocks"));
         assert!(json.contains("aes-128-gcm"));
         assert!(json.contains("192.168.12.1:9697"));
-        // starting_dns default bootstrap should not duplicate upstream in config
+        // starting_dns is a flat IP list; config-minimal uses 2 bootstrap servers
         let dns = config.dns.as_ref().expect("dns config");
-        assert_eq!(dns.starting_dns.upstream.len(), 1);
-        assert_eq!(dns.starting_dns.upstream[0].label, "bootstrap");
+        assert_eq!(dns.starting_dns.upstream.len(), 2);
+        assert!(dns.starting_dns.upstream.iter().all(|a| a.starts_with("udp://")));
+        // default query_mode is Concurrent when not specified
+        let g = dns.groups.iter().find(|g| g.name == "default_dns").unwrap();
+        assert_eq!(g.query_mode, DnsQueryMode::Concurrent);
     }
 
     // ── Rule Set parse / validation tests ──

@@ -85,7 +85,7 @@ A connection pool for a single upstream DNS server.
 
 ### 3.3 `DnsRouter` (`router.rs`)
 
-Matches a query to a group and an upstream, and checks responses.
+Matches a query to a group and checks responses.
 
 - Top-level rules support `qname(...)`, `qtype(...)` (A/AAAA/…), and `any`;
   each rule may be negated with `!`. Rule-set references such as
@@ -93,13 +93,18 @@ Matches a query to a group and an upstream, and checks responses.
   GeoSite category / `domain_list` entry (see §3.6).
 - If no rule matches, uses `config.routing.fallback`; if that is empty, the first
   configured group; if there are no groups, a "null" empty result.
-- Within a group, the upstream is chosen from `request_routing.fallback`
-  (in-group `request_routing.rules` are parsed but the current `select_upstream`
-  implementation uses the fallback directly), or the first upstream if no
-  request routing is set.
-- `proxy` field: `"direct"` → query goes out directly; `"proxy(<group>)"` → the
-  selected group name is returned in `DnsRouteResult.proxy_group` (the actual
-  proxying of DNS over the SOCKS5 path is a separate concern from this module).
+- **All routing goes through the top-level `dns.routing`**: the in-group
+  `request_routing` has been removed. `DnsRouteResult` carries only the selected
+  group and `send_by`.
+- `send_by` field: `"direct"` → this group's upstream queries go out directly;
+  otherwise a proxy group name (e.g. `send_by: proxy_primary`) → this group's
+  upstream queries are sent through that proxy group. `"direct"` is a reserved
+  keyword — no DNS server or DNS group may be named `direct`. The group name is
+  carried in `DnsRouteResult.send_by`.
+- `query_mode` field: how this group picks its upstream, one of:
+  - `concurrent` (default) — query all upstreams concurrently, use the first success;
+  - `random` — pick one random upstream and query it;
+  - `sequence` — try upstreams in config order (top to bottom), use the first success.
 
 ### 3.4 `DnsListener` / handler (`handler.rs`)
 
@@ -115,11 +120,10 @@ The actual UDP/TCP listener and per-query processing.
 - Per-query flow (`handle_dns_internal`):
   1. Parse qname + qtype.
   2. Cache lookup (key = qname + qtype + class IN).
-  3. Route via `DnsRouter` → resolve pool key (`"<group>__<label>"`, falling
-     back to `"__starting__<label>"`).
-  4. Forward to upstream.
-  5. Apply response routing (accept / reject / requery with another upstream).
-  6. On accept, insert into cache and feed accepted A/AAAA resolutions into the
+  3. Route via `DnsRouter` to a group, then pick the upstream according to the
+     group's `query_mode` and query it (direct, or through the `send_by` proxy group).
+  4. Apply response routing (accept / reject / requery with another upstream).
+  5. On accept, insert into cache and feed accepted A/AAAA resolutions into the
      domain-routing callback.
 - **IP_TRANSPARENT responses**: the reply is sent from a socket created with
   `IP_TRANSPARENT`/`IPV6_TRANSPARENT`, `SO_REUSEADDR`, `SO_REUSEPORT` and
@@ -132,12 +136,18 @@ The actual UDP/TCP listener and per-query processing.
 
 ### 3.5 `DnsCache` (`cache.rs`)
 
-A response cache keyed by `(qname, qtype, class)`.
+A response cache keyed by `(qname, qtype, class)`, **partitioned per DNS group**.
+Each group (e.g. `china_dns`, `trusted_dns`) has its own independent `HashMap`,
+so the same `(qname, qtype)` can hold different cached answers in different
+groups — a polluted domestic upstream and a trusted overseas upstream never
+contaminate each other's cache. `max_size` is the per-group capacity.
 
-- Config: `enabled`, `max_size` (4096), `max_ttl` (86400s), `min_ttl` (60s),
+- Config: `enabled`, `max_size` (4096 per group), `max_ttl` (86400s), `min_ttl` (60s),
   `optimistic_cache` (RFC 8767, default off), `optimistic_cache_ttl` (3600s).
 - Expired entries are revalidated/refreshed; with optimistic caching enabled,
   expired entries may still be served while being refreshed.
+- Cache reads/writes happen after `DnsRouter` has selected the group, and carry
+  the group name.
 
 ### 3.6 Rule-set evaluation in DNS routing
 
@@ -163,10 +173,16 @@ A response cache keyed by `(qname, qtype, class)`.
 
 - Its upstreams **must be IP literals** — resolving a hostname bootstrap would be
   a chicken-and-egg problem.
-- It is used in two places:
-  1. Resolving hostname-based upstreams (e.g. `udp://dns.google:53`) at init
-     time.
-  2. As a fallback pool if a group's own upstream lookup fails at query time.
+- It is configured as a **flat list** of IP DNS server addresses:
+  ```
+  starting_dns {
+    ip_version_prefer: 4
+    upstream: ['udp://223.5.5.5:53', 'udp://1.1.1.1:53']
+  }
+  ```
+- All of its DNS servers are queried **directly** (never through a proxy). They
+  resolve hostname-based group upstreams (e.g. `udp://dns.google:53`) at init
+  time by iterating the bootstrap servers in order (A first, then AAAA).
 
 ## 5. Integration with Domain-Based eBPF Routing
 
@@ -190,8 +206,6 @@ This mirrors the original dae `control/domain_routing_tracker.go`.
 ## 6. Current Limitations
 
 - DoH / DoT transports are parsed but not functional.
-- In-group `request_routing.rules` are parsed but the upstream choice currently
-  uses the fallback (the rule list is not yet fully evaluated).
 - `upstream(...)` response conditions currently match everything.
 - The DNS listener tasks run infinite receive loops and are stopped by
   `abort()` (safe because tokio tasks are cancel-safe at await points).

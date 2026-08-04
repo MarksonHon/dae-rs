@@ -7,15 +7,13 @@ use crate::config::{DnsConfig, DnsGroupConfig};
 use crate::ruleset::cache::RuleSetCache;
 use crate::ruleset::refparse::{match_domain_patterns, match_qname_value, parse_ref, RuleSetRef};
 
-/// Result of matching a DNS query to a group and upstream
+/// Result of matching a DNS query to a group
 #[derive(Debug, Clone)]
 pub struct DnsRouteResult {
     /// The selected DNS group
     pub group: DnsGroupConfig,
-    /// The selected upstream label within the group
-    pub upstream_label: String,
-    /// Whether this group uses a proxy (None = direct)
-    pub proxy_group: Option<String>,
+    /// How to send this query: None = direct, Some(name) = through proxy group
+    pub send_by: Option<String>,
 }
 
 /// Result of checking a DNS response
@@ -29,24 +27,11 @@ pub enum DnsResponseAction {
     Requery(String),
 }
 
-/// Compiled in-group request routing rule
-#[derive(Debug, Clone)]
-struct CompiledRequestRule {
-    match_type: DnsMatchType,
-    match_value: String,
-    negated: bool,
-    upstream_label: String,
-}
-
-/// DNS Router — matches queries to groups and upstreams, checks responses
+/// DNS Router — matches queries to groups, checks responses
 #[derive(Debug, Clone)]
 pub struct DnsRouter {
     /// DNS groups indexed by name
     groups: Arc<HashMap<String, DnsGroupConfig>>,
-    /// Compiled request routing rules per group (preprocessed at construction)
-    request_rules: HashMap<String, Vec<CompiledRequestRule>>,
-    /// Fallback upstream label per group
-    request_fallback: HashMap<String, String>,
     /// Top-level DNS routing fallback group
     fallback_group: String,
     /// Top-level DNS routing rules
@@ -116,104 +101,59 @@ impl DnsRouter {
             config.routing.fallback.clone()
         };
 
-        // Pre-compile per-group request routing rules
-        let mut request_rules = HashMap::new();
-        let mut request_fallback = HashMap::new();
-        for group in &config.groups {
-            if let Some(ref routing) = group.request_routing {
-                let compiled: Vec<CompiledRequestRule> = routing
-                    .rules
-                    .iter()
-                    .map(compile_request_rule)
-                    .collect::<Result<Vec<_>>>()?;
-                request_rules.insert(group.name.clone(), compiled);
-                request_fallback.insert(group.name.clone(), routing.fallback.clone());
-            } else {
-                // No request routing: use first upstream as fallback
-                let fallback = group.upstream.first().map(|u| u.label.clone()).unwrap_or_default();
-                request_fallback.insert(group.name.clone(), fallback);
-            }
-        }
-
         Ok(Self {
             groups: Arc::new(groups),
-            request_rules,
-            request_fallback,
             fallback_group,
             rules,
             rule_set_cache,
         })
     }
 
-    /// Match a DNS query to a group and upstream
+    /// Match a DNS query to a group
     pub fn match_query(&self, qname: &str, qtype: u16) -> DnsRouteResult {
         // Try top-level rules first
         for rule in &self.rules {
             if self.evaluate_match(rule, qname, qtype) {
                 if let Some(group) = self.groups.get(&rule.target_group) {
-                    return self.select_upstream(group, qname, qtype);
+                    return self.select_group(group);
                 }
             }
         }
 
         // Fallback
         if let Some(group) = self.groups.get(&self.fallback_group) {
-            return self.select_upstream(group, qname, qtype);
+            return self.select_group(group);
         }
 
         // Last resort: use first available group
         if let Some(group) = self.groups.values().next() {
-            return self.select_upstream(group, qname, qtype);
+            return self.select_group(group);
         }
 
         DnsRouteResult {
             group: DnsGroupConfig {
                 name: "null".into(),
-                proxy: "direct".into(),
+                send_by: "direct".into(),
+                query_mode: crate::config::DnsQueryMode::default(),
                 upstream: Vec::new(),
-                request_routing: None,
                 response_routing: None,
             },
-            upstream_label: String::new(),
-            proxy_group: None,
+            send_by: None,
         }
     }
 
-    /// Select an upstream within a group based on request routing rules
-    fn select_upstream(&self, group: &DnsGroupConfig, qname: &str, qtype: u16) -> DnsRouteResult {
-        let proxy_group = if group.proxy == "direct" {
+    /// Build the route result for a group: carries the group's send_by
+    /// ("direct" → None, otherwise the proxy group name).
+    fn select_group(&self, group: &DnsGroupConfig) -> DnsRouteResult {
+        let send_by = if group.send_by == "direct" {
             None
         } else {
-            Some(group.proxy.clone())
-        };
-
-        // Evaluate compiled request routing rules
-        let upstream_label = if let Some(rules) = self.request_rules.get(&group.name) {
-            let mut matched_label = None;
-            for rule in rules {
-                let matched =
-                    self.eval_match_type(&rule.match_type, &rule.match_value, qname, qtype);
-                let matched = if rule.negated { !matched } else { matched };
-                if matched {
-                    matched_label = Some(rule.upstream_label.clone());
-                    break;
-                }
-            }
-            matched_label.unwrap_or_else(|| {
-                self.request_fallback
-                    .get(&group.name)
-                    .cloned()
-                    .unwrap_or_default()
-            })
-        } else {
-            // No request routing configured: use first upstream
-            group.upstream.first().map(|u| u.label.clone()).unwrap_or_default()
+            Some(group.send_by.clone())
         };
 
         DnsRouteResult {
             group: group.clone(),
-            upstream_label,
-            proxy_group,
+            send_by,
         }
     }
 
@@ -345,52 +285,6 @@ fn compile_route_rule(rule: &crate::config::DnsRouteRule) -> Result<DnsRouteRule
     Err(anyhow!("unsupported DNS routing match expression: '{raw}'"))
 }
 
-/// Compile a per-group request routing rule into a CompiledRequestRule
-fn compile_request_rule(rule: &crate::config::DnsRouteRule) -> Result<CompiledRequestRule> {
-    let raw = rule.r#match.trim();
-    let upstream_label = rule.action.clone();
-
-    if raw == "any" {
-        return Ok(CompiledRequestRule {
-            match_type: DnsMatchType::Any,
-            match_value: String::new(),
-            negated: false,
-            upstream_label,
-        });
-    }
-
-    if let Some(value) = raw.strip_prefix("qname(") {
-        let value = value
-            .strip_suffix(')')
-            .ok_or_else(|| anyhow!("invalid qname rule: '{raw}'"))?;
-        let negated = value.starts_with('!');
-        let value = if negated { &value[1..] } else { value };
-        let (match_type, match_value) = compile_qname_value(value, raw)?;
-        return Ok(CompiledRequestRule {
-            match_type,
-            match_value,
-            negated,
-            upstream_label,
-        });
-    }
-
-    if let Some(value) = raw.strip_prefix("qtype(") {
-        let value = value
-            .strip_suffix(')')
-            .ok_or_else(|| anyhow!("invalid qtype rule: '{raw}'"))?;
-        let negated = value.starts_with('!');
-        let value = if negated { &value[1..] } else { value };
-        return Ok(CompiledRequestRule {
-            match_type: DnsMatchType::QType,
-            match_value: value.to_string(),
-            negated,
-            upstream_label,
-        });
-    }
-
-    Err(anyhow!("unsupported DNS request routing match expression: '{raw}'"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,10 +313,11 @@ mod tests {
         }
     }
 
-    fn make_group(name: &str, upstreams: &[(&str, &str)], request_routing: Option<config::DnsGroupRequestRouting>) -> config::DnsGroupConfig {
+    fn make_group(name: &str, upstreams: &[(&str, &str)]) -> config::DnsGroupConfig {
         config::DnsGroupConfig {
             name: name.to_string(),
-            proxy: "direct".to_string(),
+            send_by: "direct".to_string(),
+            query_mode: config::DnsQueryMode::default(),
             upstream: upstreams
                 .iter()
                 .map(|(label, addr)| config::DnsUpstreamEntry {
@@ -430,137 +325,43 @@ mod tests {
                     address: addr.to_string(),
                 })
                 .collect(),
-            request_routing,
             response_routing: None,
         }
     }
 
     #[test]
-    fn test_select_upstream_no_routing_uses_first() {
+    fn test_match_query_returns_group() {
+        // Request routing removed: match_query routes to a group, not a specific upstream.
         let config = make_config(
-            vec![make_group("g1", &[("a", "1.1.1.1"), ("b", "2.2.2.2")], None)],
+            vec![make_group("g1", &[("a", "1.1.1.1"), ("b", "2.2.2.2")])],
             vec![],
             "g1",
         );
         let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
         let result = router.match_query("example.com", 1);
-        assert_eq!(result.upstream_label, "a");
+        assert_eq!(result.group.name, "g1");
+        assert_eq!(result.send_by, None);
+        // All upstreams in the group are still present for group-level concurrent querying.
+        assert_eq!(result.group.upstream.len(), 2);
     }
 
     #[test]
-    fn test_select_upstream_with_qname_rule() {
-        let config = make_config(
-            vec![make_group(
-                "g1",
-                &[("fast", "1.1.1.1"), ("slow", "2.2.2.2")],
-                Some(config::DnsGroupRequestRouting {
-                    rules: vec![config::DnsRouteRule {
-                        r#match: "qname(google.com)".into(),
-                        action: "fast".into(),
-                    }],
-                    fallback: "slow".into(),
-                }),
-            )],
-            vec![],
-            "g1",
-        );
+    fn test_match_query_send_by_proxy() {
+        let mut group = make_group("g1", &[("a", "1.1.1.1")]);
+        group.send_by = "proxy_primary".into();
+        let config = make_config(vec![group], vec![], "g1");
         let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
-
-        // google.com matches the rule → fast
-        let result = router.match_query("google.com", 1);
-        assert_eq!(result.upstream_label, "fast");
-
-        // other.com does not match → fallback to slow
-        let result = router.match_query("other.com", 1);
-        assert_eq!(result.upstream_label, "slow");
-    }
-
-    #[test]
-    fn test_select_upstream_with_qtype_rule() {
-        let config = make_config(
-            vec![make_group(
-                "g1",
-                &[("ipv4", "1.1.1.1"), ("ipv6", "2.2.2.2")],
-                Some(config::DnsGroupRequestRouting {
-                    rules: vec![config::DnsRouteRule {
-                        r#match: "qtype(AAAA)".into(),
-                        action: "ipv6".into(),
-                    }],
-                    fallback: "ipv4".into(),
-                }),
-            )],
-            vec![],
-            "g1",
-        );
-        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
-
-        // AAAA query → ipv6
-        let result = router.match_query("example.com", 28);
-        assert_eq!(result.upstream_label, "ipv6");
-
-        // A query → ipv4 (fallback)
         let result = router.match_query("example.com", 1);
-        assert_eq!(result.upstream_label, "ipv4");
-    }
-
-    #[test]
-    fn test_select_upstream_suffix_match() {
-        let config = make_config(
-            vec![make_group(
-                "g1",
-                &[("cn", "1.1.1.1"), ("intl", "2.2.2.2")],
-                Some(config::DnsGroupRequestRouting {
-                    rules: vec![config::DnsRouteRule {
-                        r#match: "qname(suffix:cn)".into(),
-                        action: "cn".into(),
-                    }],
-                    fallback: "intl".into(),
-                }),
-            )],
-            vec![],
-            "g1",
-        );
-        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
-
-        // sub.example.cn matches suffix:cn → cn
-        let result = router.match_query("sub.example.cn", 1);
-        assert_eq!(result.upstream_label, "cn");
-
-        // example.com does not match → intl
-        let result = router.match_query("example.com", 1);
-        assert_eq!(result.upstream_label, "intl");
-    }
-
-    #[test]
-    fn test_select_upstream_any_rule() {
-        let config = make_config(
-            vec![make_group(
-                "g1",
-                &[("all", "1.1.1.1"), ("fallback", "2.2.2.2")],
-                Some(config::DnsGroupRequestRouting {
-                    rules: vec![config::DnsRouteRule {
-                        r#match: "any".into(),
-                        action: "all".into(),
-                    }],
-                    fallback: "fallback".into(),
-                }),
-            )],
-            vec![],
-            "g1",
-        );
-        let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
-
-        // any matches everything
-        let result = router.match_query("anything.xyz", 1);
-        assert_eq!(result.upstream_label, "all");
+        assert_eq!(result.group.name, "g1");
+        assert_eq!(result.send_by.as_deref(), Some("proxy_primary"));
     }
 
     #[test]
     fn test_top_level_routing_to_group() {
         let config = make_config(
             vec![
-                make_group("cn_dns", &[("alidns", "223.5.5.5")], None),
-                make_group("trusted", &[("cloudflare", "1.1.1.1")], None),
+                make_group("cn_dns", &[("alidns", "223.5.5.5")]),
+                make_group("trusted", &[("cloudflare", "1.1.1.1")]),
             ],
             vec![config::DnsRouteRule {
                 r#match: "qname(suffix:cn)".into(),
@@ -570,14 +371,12 @@ mod tests {
         );
         let router = DnsRouter::new(&config, RuleSetCache::new()).unwrap();
 
-        // .cn → cn_dns group → alidns
+        // .cn → cn_dns group
         let result = router.match_query("example.cn", 1);
-        assert_eq!(result.upstream_label, "alidns");
         assert_eq!(result.group.name, "cn_dns");
 
-        // other → trusted group → cloudflare
+        // other → trusted group
         let result = router.match_query("example.com", 1);
-        assert_eq!(result.upstream_label, "cloudflare");
         assert_eq!(result.group.name, "trusted");
     }
 
@@ -608,8 +407,8 @@ mod tests {
     fn test_top_level_qname_geosite_routing() {
         let config = make_config(
             vec![
-                make_group("cn_dns", &[("alidns", "223.5.5.5")], None),
-                make_group("trusted", &[("cloudflare", "1.1.1.1")], None),
+                make_group("cn_dns", &[("alidns", "223.5.5.5")]),
+                make_group("trusted", &[("cloudflare", "1.1.1.1")]),
             ],
             vec![config::DnsRouteRule {
                 r#match: "qname(geosite:cn)".into(),
@@ -634,8 +433,8 @@ mod tests {
     fn test_top_level_qname_set_routing() {
         let config = make_config(
             vec![
-                make_group("cn_dns", &[("alidns", "223.5.5.5")], None),
-                make_group("trusted", &[("cloudflare", "1.1.1.1")], None),
+                make_group("cn_dns", &[("alidns", "223.5.5.5")]),
+                make_group("trusted", &[("cloudflare", "1.1.1.1")]),
             ],
             vec![config::DnsRouteRule {
                 r#match: "qname(set:chinadom)".into(),
@@ -651,31 +450,6 @@ mod tests {
         // Others → trusted
         let result = router.match_query("www.google.com", 1);
         assert_eq!(result.group.name, "trusted");
-    }
-
-    #[test]
-    fn test_request_routing_qname_geosite() {
-        let config = make_config(
-            vec![make_group(
-                "g1",
-                &[("cn_up", "1.1.1.1"), ("intl", "2.2.2.2")],
-                Some(config::DnsGroupRequestRouting {
-                    rules: vec![config::DnsRouteRule {
-                        r#match: "qname(geosite:cn)".into(),
-                        action: "cn_up".into(),
-                    }],
-                    fallback: "intl".into(),
-                }),
-            )],
-            vec![],
-            "g1",
-        );
-        let router = DnsRouter::new(&config, make_geosite_cache()).unwrap();
-
-        let result = router.match_query("www.baidu.com", 1);
-        assert_eq!(result.upstream_label, "cn_up");
-        let result = router.match_query("www.google.com", 1);
-        assert_eq!(result.upstream_label, "intl");
     }
 
     #[test]

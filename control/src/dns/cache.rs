@@ -17,19 +17,23 @@ struct CachedResponse {
     stale: bool,
 }
 
-/// DNS response cache
+/// DNS response cache, partitioned per DNS group.
+///
+/// Each DNS group has its own independent `HashMap`, so the same `(qname, qtype)`
+/// may resolve to different cached answers in different groups (e.g. a polluted
+/// upstream vs. a trusted one).
 pub struct DnsCache {
     /// Cache configuration
     config: DnsCacheConfig,
-    /// Cache entries: key = hash(qname, qtype, qclass)
-    entries: HashMap<u64, CachedResponse>,
+    /// Cache entries per group: group name → (key = hash(qname, qtype, qclass) → response)
+    entries: HashMap<String, HashMap<u64, CachedResponse>>,
 }
 
 impl DnsCache {
     pub fn new(config: &DnsCacheConfig) -> Self {
         Self {
             config: config.clone(),
-            entries: HashMap::with_capacity(config.max_size as usize),
+            entries: HashMap::new(),
         }
     }
 
@@ -43,9 +47,9 @@ impl DnsCache {
         hasher.finish()
     }
 
-    /// Look up a cached response
-    pub fn lookup(&self, key: u64) -> Option<&[u8]> {
-        let entry = self.entries.get(&key)?;
+    /// Look up a cached response for a specific DNS group.
+    pub fn lookup(&self, group: &str, key: u64) -> Option<&[u8]> {
+        let entry = self.entries.get(group)?.get(&key)?;
         let now = Instant::now();
 
         if now < entry.deadline {
@@ -65,8 +69,8 @@ impl DnsCache {
         }
     }
 
-    /// Insert a response into the cache
-    pub fn insert(&mut self, key: u64, response: Vec<u8>, ttl_secs: u32) {
+    /// Insert a response into the cache for a specific DNS group.
+    pub fn insert(&mut self, group: &str, key: u64, response: Vec<u8>, ttl_secs: u32) {
         if !self.config.enabled {
             return;
         }
@@ -74,20 +78,21 @@ impl DnsCache {
         // Clamp TTL
         let ttl = ttl_secs.max(self.config.min_ttl).min(self.config.max_ttl);
 
+        let group_entries = self.entries.entry(group.to_string()).or_default();
+
         // Evict if at capacity
-        if self.entries.len() >= self.config.max_size as usize {
+        if group_entries.len() >= self.config.max_size as usize {
             // Simple: remove the oldest entry
-            if let Some(oldest_key) = self
-                .entries
+            if let Some(oldest_key) = group_entries
                 .iter()
                 .min_by_key(|(_, e)| e.created_at)
                 .map(|(k, _)| *k)
             {
-                self.entries.remove(&oldest_key);
+                group_entries.remove(&oldest_key);
             }
         }
 
-        self.entries.insert(
+        group_entries.insert(
             key,
             CachedResponse {
                 raw_response: response,
@@ -100,25 +105,33 @@ impl DnsCache {
     }
 
     /// Mark an entry as stale (for optimistic cache refresh)
-    pub fn mark_stale(&mut self, key: u64) {
-        if let Some(entry) = self.entries.get_mut(&key) {
+    pub fn mark_stale(&mut self, group: &str, key: u64) {
+        if let Some(entry) = self
+            .entries
+            .get_mut(group)
+            .and_then(|m| m.get_mut(&key))
+        {
             entry.stale = true;
         }
     }
 
-    /// Remove expired entries
+    /// Remove expired entries across all groups.
     pub fn cleanup_expired(&mut self) {
         let now = Instant::now();
-        self.entries.retain(|_, entry| {
-            if self.config.optimistic_cache {
-                // Keep stale entries within the optimistic window
-                let stale_deadline =
-                    entry.deadline + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
-                now < stale_deadline
-            } else {
-                now < entry.deadline
-            }
-        });
+        for group_entries in self.entries.values_mut() {
+            group_entries.retain(|_, entry| {
+                if self.config.optimistic_cache {
+                    // Keep stale entries within the optimistic window
+                    let stale_deadline =
+                        entry.deadline + Duration::from_secs(self.config.optimistic_cache_ttl as u64);
+                    now < stale_deadline
+                } else {
+                    now < entry.deadline
+                }
+            });
+        }
+        // Drop groups that became empty.
+        self.entries.retain(|_, group_entries| !group_entries.is_empty());
     }
 
     /// Clear all cached entries
@@ -127,11 +140,17 @@ impl DnsCache {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.values().map(|m| m.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.values().all(|m| m.is_empty())
+    }
+
+    /// Number of groups that currently have cached entries.
+    #[cfg(test)]
+    pub fn group_count(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -156,14 +175,30 @@ mod tests {
         let key = DnsCache::cache_key("example.com", 1, 1);
 
         // Miss
-        assert!(cache.lookup(key).is_none());
+        assert!(cache.lookup("g1", key).is_none());
 
         // Insert with TTL 60
-        cache.insert(key, vec![1, 2, 3, 4], 60);
+        cache.insert("g1", key, vec![1, 2, 3, 4], 60);
 
         // Hit
-        assert!(cache.lookup(key).is_some());
-        assert_eq!(cache.lookup(key).unwrap(), &[1, 2, 3, 4]);
+        assert!(cache.lookup("g1", key).is_some());
+        assert_eq!(cache.lookup("g1", key).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_cache_partitioned_by_group() {
+        let mut cache = DnsCache::new(&default_cache_config());
+        let key = DnsCache::cache_key("example.com", 1, 1);
+
+        // Same qname cached differently in two groups.
+        cache.insert("china_dns", key, vec![1], 60);
+        cache.insert("trusted_dns", key, vec![2], 60);
+
+        assert_eq!(cache.lookup("china_dns", key), Some(&[1][..]));
+        assert_eq!(cache.lookup("trusted_dns", key), Some(&[2][..]));
+        // Unknown group → miss
+        assert!(cache.lookup("other", key).is_none());
+        assert_eq!(cache.group_count(), 2);
     }
 
     #[test]
@@ -177,15 +212,15 @@ mod tests {
         let key = DnsCache::cache_key("example.com", 1, 1);
 
         // TTL 5 should be clamped to min_ttl=20
-        cache.insert(key, vec![1], 5);
-        let entry = cache.entries.get(&key).unwrap();
+        cache.insert("g1", key, vec![1], 5);
+        let entry = cache.entries.get("g1").unwrap().get(&key).unwrap();
         let ttl_secs = entry.deadline.duration_since(entry.created_at).as_secs();
         assert!(ttl_secs >= 20 && ttl_secs <= 21);
 
         // TTL 500 should be clamped to max_ttl=100
         let key2 = DnsCache::cache_key("example.com", 28, 1);
-        cache.insert(key2, vec![2], 500);
-        let entry2 = cache.entries.get(&key2).unwrap();
+        cache.insert("g1", key2, vec![2], 500);
+        let entry2 = cache.entries.get("g1").unwrap().get(&key2).unwrap();
         let ttl2 = entry2.deadline.duration_since(entry2.created_at).as_secs();
         assert!(ttl2 >= 100 && ttl2 <= 101);
     }
@@ -198,18 +233,18 @@ mod tests {
         };
         let mut cache = DnsCache::new(&config);
 
-        // Fill to capacity
+        // Fill to capacity (per-group)
         for i in 0..3 {
             let key = DnsCache::cache_key(&format!("host{}.com", i), 1, 1);
-            cache.insert(key, vec![i as u8], 60);
+            cache.insert("g1", key, vec![i as u8], 60);
         }
         assert_eq!(cache.len(), 3);
 
         // Insert one more — should evict oldest
         let key_new = DnsCache::cache_key("new.com", 1, 1);
-        cache.insert(key_new, vec![99], 60);
+        cache.insert("g1", key_new, vec![99], 60);
         assert_eq!(cache.len(), 3);
-        assert!(cache.lookup(key_new).is_some());
+        assert!(cache.lookup("g1", key_new).is_some());
     }
 
     #[test]
@@ -218,16 +253,18 @@ mod tests {
         let key = DnsCache::cache_key("example.com", 1, 1);
 
         // Insert with min TTL (10s) — it will expire quickly in cleanup
-        cache.insert(key, vec![1], 10);
+        cache.insert("g1", key, vec![1], 10);
 
         // Force expiry by backdating created_at
-        if let Some(entry) = cache.entries.get_mut(&key) {
+        if let Some(entry) = cache.entries.get_mut("g1").unwrap().get_mut(&key) {
             entry.created_at = Instant::now() - Duration::from_secs(60);
             entry.deadline = Instant::now() - Duration::from_secs(1);
         }
 
         cache.cleanup_expired();
-        assert!(cache.lookup(key).is_none());
+        assert!(cache.lookup("g1", key).is_none());
+        // Empty group should be dropped
+        assert_eq!(cache.group_count(), 0);
     }
 
     #[test]
@@ -239,7 +276,7 @@ mod tests {
         let mut cache = DnsCache::new(&config);
         let key = DnsCache::cache_key("example.com", 1, 1);
 
-        cache.insert(key, vec![1, 2, 3], 60);
-        assert!(cache.lookup(key).is_none());
+        cache.insert("g1", key, vec![1, 2, 3], 60);
+        assert!(cache.lookup("g1", key).is_none());
     }
 }

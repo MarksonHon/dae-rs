@@ -23,6 +23,8 @@ base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
+futures = "0.3"
+fastrand = "2"
 socket2 = { version = "0.5", features = ["all"] }
 ipnet = "2"
 libc = "0.2"

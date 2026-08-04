@@ -33,19 +33,16 @@ routing {
 
 dns {
   starting_dns {
-    upstream {
-      bootstrap: 'udp://1.1.1.1:53'
-    }
+    ip_version_prefer: 4
+    upstream: ['udp://223.5.5.5:53', 'udp://1.1.1.1:53']
   }
   bind: '127.0.0.1:5353'
   groups {
     default_dns {
-      proxy: proxy
+      send_by: proxy
+      query_mode: concurrent
       upstream {
         cloudflare: 'udp://1.1.1.1:53'
-      }
-      request_routing {
-        fallback: cloudflare
       }
     }
   }

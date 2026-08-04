@@ -62,6 +62,7 @@ pub mod ruleset;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -335,6 +336,16 @@ pub struct ControlPlane {
     udp_tracker: Option<Arc<Mutex<crate::net::udp_tracker::UdpConnStateTracker>>>,
     /// Userspace routing matcher (used by routing handoff consumer)
     routing_matcher: Option<Arc<crate::routing::matcher::RoutingMatcher>>,
+    /// Outbound dialer built from the configured proxy node/group.
+    ///
+    /// Built once before the DNS manager and TProxy start, then shared between
+    /// the TProxy listeners and the DNS manager (for `send_by` proxied DNS
+    /// upstream queries).
+    outbound_dialer: Option<Arc<dyn OutboundDialer>>,
+    /// Outbound dialers keyed by outbound **group name**, used by the DNS
+    /// manager for `send_by` proxied DNS upstream queries. TProxy keeps using
+    /// [`Self::outbound_dialer`] (first node / default).
+    outbound_group_dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     /// Current routing epoch slot (0 or 1) for double-buffering.
     /// On each reload, we write to the non-active slot, then flip.
     current_epoch_slot: u32,
@@ -407,6 +418,8 @@ impl ControlPlane {
             embedded_ebpf: None,
             ebpf_param: None,
             routing_matcher: None,
+            outbound_dialer: None,
+            outbound_group_dialers: HashMap::new(),
             current_epoch_slot: 0,
             datapath_generation: 0,
             rule_set_scheduler: None,
@@ -1008,7 +1021,11 @@ impl ControlPlane {
         if let Some(ref dns_cfg) = self.config.dns_config {
             info!("Step 4.5/5: Starting DNS manager");
             debug!(dns_bind = %dns_cfg.bind, dns_cache_max_size = dns_cfg.cache.max_size, "DNS config details");
-            let mut dns_mgr = crate::dns::DnsManager::new(dns_cfg.clone(), self.rule_set_cache.clone())?;
+            let mut dns_mgr = crate::dns::DnsManager::new(
+                dns_cfg.clone(),
+                self.rule_set_cache.clone(),
+                self.outbound_group_dialers.clone(),
+            )?;
             // Wire DNS resolutions into the domain routing tracker so the eBPF
             // domain_routing_map is populated for domain-based routing rules.
             let domain_routing = self.domain_routing.clone();
@@ -1223,6 +1240,106 @@ impl ControlPlane {
     /// * Returns a parse error if the proxy address format is invalid
     /// * Returns an error if the proxy namespace has not been created
     /// * Returns a bind error if the port is already in use
+    /// Build the outbound dialer from the configured proxy node, or the legacy
+    /// flat config fields (single SOCKS5 node) when no daefile nodes exist.
+    ///
+    /// The result is cached in `self.outbound_dialer` so the DNS manager and
+    /// TProxy listeners share one dialer.
+    fn build_outbound_dialer(
+        &self,
+        host_ns_fd: Option<i32>,
+        socket_mark: u32,
+    ) -> anyhow::Result<Arc<dyn OutboundDialer>> {
+        match self
+            .config
+            .daefile_config
+            .as_ref()
+            .and_then(|c| c.outbounds.nodes.first())
+        {
+            Some(node) => {
+                let d = dialer::build_dialer(node, host_ns_fd, socket_mark)?;
+                info!(
+                    node = %node.name,
+                    protocol = %node.protocol,
+                    address = %node.address,
+                    "Outbound dialer built from node config"
+                );
+                Ok(d)
+            }
+            None => {
+                // Fallback: legacy flat config fields (single SOCKS5 node).
+                let proxy_addr: SocketAddr = self.config.proxy_addr.parse().map_err(|e| {
+                    anyhow::anyhow!("Invalid proxy address '{}': {}", self.config.proxy_addr, e)
+                })?;
+                debug!(
+                    proxy_addr = %proxy_addr,
+                    proxy_has_username = !self.config.proxy_username.is_empty(),
+                    proxy_dial_timeout_ms = self.config.proxy_dial_timeout_ms,
+                    "Legacy SOCKS5 dialer configuration (no daefile nodes)"
+                );
+                let mut d = Socks5Dialer::new_with_mark(
+                    proxy_addr,
+                    &self.config.proxy_username,
+                    &self.config.proxy_password,
+                    self.config.proxy_dial_timeout_ms,
+                    socket_mark,
+                );
+                d.set_host_ns_fd(host_ns_fd);
+                Ok(Arc::new(d))
+            }
+        }
+    }
+
+    /// Build outbound dialers for every outbound **group**, keyed by group name.
+    ///
+    /// Used by the DNS manager: a DNS group's `send_by` names an outbound group,
+    /// and the DNS upstream query goes through that group's dialer. Each group's
+    /// node selection is resolved to its first concrete node (the current
+    /// architecture has no per-node liveness selection — the TProxy path already
+    /// uses only the first node). Groups that fail to resolve a node are skipped.
+    fn build_outbound_group_dialers(
+        &self,
+        host_ns_fd: Option<i32>,
+        socket_mark: u32,
+    ) -> HashMap<String, Arc<dyn OutboundDialer>> {
+        let mut map: HashMap<String, Arc<dyn OutboundDialer>> = HashMap::new();
+        let Some(cfg) = self.config.daefile_config.as_ref() else {
+            return map;
+        };
+
+        for group in &cfg.outbounds.groups {
+            // Resolve the first concrete node referenced by the group's selectors.
+            let node = resolve_group_first_node(group, &cfg.outbounds.nodes);
+            match node {
+                Some(node) => match dialer::build_dialer(node, host_ns_fd, socket_mark) {
+                    Ok(d) => {
+                        debug!(
+                            group = %group.name,
+                            node = %node.name,
+                            "Outbound group dialer built for DNS send_by"
+                        );
+                        map.insert(group.name.clone(), d);
+                    }
+                    Err(e) => {
+                        warn!(
+                            group = %group.name,
+                            "Failed to build outbound group dialer (skipped): {}",
+                            e
+                        );
+                    }
+                },
+                None => {
+                    warn!(
+                        group = %group.name,
+                        "Outbound group has no resolvable node (skipped for DNS send_by)"
+                    );
+                }
+            }
+        }
+        map
+    }
+
+    /// Creates a SOCKS5 dialer and TProxy listener in the HOST namespace.
     async fn start_tproxy(&mut self) -> Result<()> {
         let start_time = std::time::Instant::now();
         debug!("start_tproxy: beginning TProxy setup");
@@ -1246,45 +1363,29 @@ impl ControlPlane {
         );
 
         // ---- Construct outbound Dialer according to configured protocol ----
-        let dialer: Arc<dyn OutboundDialer> = match self
-            .config
-            .daefile_config
-            .as_ref()
-            .and_then(|c| c.outbounds.nodes.first())
-        {
-            Some(node) => {
-                let d = dialer::build_dialer(node, host_ns_fd, socket_mark)?;
-                info!(
-                    node = %node.name,
-                    protocol = %node.protocol,
-                    address = %node.address,
-                    "Outbound dialer built from node config"
-                );
-                d
-            }
-            None => {
-                // Fallback: legacy flat config fields (single SOCKS5 node).
-                let proxy_addr: SocketAddr = self.config.proxy_addr.parse().map_err(|e| {
-                    anyhow::anyhow!("Invalid proxy address '{}': {}", self.config.proxy_addr, e)
-                })?;
-                debug!(
-                    proxy_addr = %proxy_addr,
-                    proxy_has_username = !self.config.proxy_username.is_empty(),
-                    proxy_dial_timeout_ms = self.config.proxy_dial_timeout_ms,
-                    "Legacy SOCKS5 dialer configuration (no daefile nodes)"
-                );
-                let mut d = Socks5Dialer::new_with_mark(
-                    proxy_addr,
-                    &self.config.proxy_username,
-                    &self.config.proxy_password,
-                    self.config.proxy_dial_timeout_ms,
-                    socket_mark,
-                );
-                d.set_host_ns_fd(host_ns_fd);
-                Arc::new(d)
-            }
+        // If the DNS manager already triggered dialer construction (it needs it
+        // for `send_by` proxied DNS upstreams), reuse it; otherwise build it now.
+        let dialer: Arc<dyn OutboundDialer> = if let Some(d) = self.outbound_dialer.clone() {
+            d
+        } else {
+            let d = self.build_outbound_dialer(host_ns_fd, socket_mark)?;
+            self.outbound_dialer = Some(d.clone());
+            d
         };
         debug!("Outbound dialer created: {}", dialer.protocol_name());
+
+        // ---- Build per-group outbound dialers (for DNS `send_by`) ----
+        // DNS groups may reference any outbound group via `send_by`. Build a
+        // dialer for every group once, keyed by group name, and pass it to the
+        // DNS manager so proxied DNS upstream queries use the correct group.
+        if self.outbound_group_dialers.is_empty() {
+            let group_dialers = self.build_outbound_group_dialers(host_ns_fd, socket_mark);
+            self.outbound_group_dialers = group_dialers;
+            debug!(
+                groups = self.outbound_group_dialers.len(),
+                "Per-group outbound dialers built for DNS send_by"
+            );
+        }
 
         // ---- TProxy listener (in DAENS) ----
         // eBPF data flow:
@@ -2631,6 +2732,53 @@ fn configure_kernel_if(iface: &str) {
 // ============================================================================
 // Unit Tests
 // ============================================================================
+
+/// Resolve an outbound group to its first concrete node.
+///
+/// Evaluates the group's selectors in order:
+/// - `List` → look up each named node, return the first that exists;
+/// - `Regex` → return the first node whose name matches the pattern.
+///
+/// The current architecture has no per-node liveness selection (TProxy also
+/// only uses the first node), so the first matching node is used.
+fn resolve_group_first_node<'a>(
+    group: &config::OutboundGroupConfig,
+    nodes: &'a [config::OutboundNodeConfig],
+) -> Option<&'a config::OutboundNodeConfig> {
+    let find_by_name = |name: &str| nodes.iter().find(|n| n.name == name);
+
+    for selector in &group.selectors {
+        match selector {
+            config::NodeSelector::List { nodes: names } => {
+                for name in names {
+                    if let Some(node) = find_by_name(name) {
+                        return Some(node);
+                    }
+                }
+            }
+            config::NodeSelector::Regex { pattern } => {
+                match regex::Regex::new(pattern) {
+                    Ok(re) => {
+                        for node in nodes {
+                            if re.is_match(&node.name) {
+                                return Some(node);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            group = %group.name,
+                            pattern = %pattern,
+                            "Invalid node selector regex (ignored): {}",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Collect all proxy server IP addresses from the configuration.
 ///

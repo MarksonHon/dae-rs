@@ -50,8 +50,6 @@ enum ParseState {
     DnsGroupUpstream(String), // group_name
     /// Inside dns > routing block (DNS routing)
     DnsRouting,
-    /// Inside dns group > request_routing block
-    DnsGroupRequestRouting(String), // group_name
     /// Inside dns group > response_routing block
     DnsGroupResponseRouting(String), // group_name
     // ── Rule set states ──
@@ -123,9 +121,9 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
     let mut current_dns_config: Option<DnsConfig> = None;
     let mut current_dns_group = DnsGroupConfig {
         name: String::new(),
-        proxy: String::new(),
+        send_by: String::new(),
+        query_mode: DnsQueryMode::default(),
         upstream: Vec::new(),
-        request_routing: None,
         response_routing: None,
     };
     let mut current_dns_route_rules: Vec<DnsRouteRule> = Vec::new();
@@ -780,35 +778,9 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
             // ── dns > starting_dns ──
             ParseState::DnsStartingDns => {
                 if line == "}" {
-                    // Pop from stack first; if stack has DnsStartingDns,
-                    // we were in the upstream sub-block — return to parent level
-                    if let Some(parent) = state_stack.pop() {
-                        state = parent;
-                    } else {
-                        state = ParseState::Dns;
-                    }
+                    state = ParseState::Dns;
                     continue;
                 }
-                if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
-                    match section_name {
-                        "upstream" => {
-                            // Enter upstream sub-block: push current state and stay.
-                            // Clear default-preset bootstrap to avoid duplication with parsed entries.
-                            if let Some(ref mut dns) = current_dns_config {
-                                dns.starting_dns.upstream.clear();
-                            }
-                            state_stack.push(ParseState::DnsStartingDns);
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown starting_dns sub-section: '{}'", section_name),
-                            });
-                        }
-                    }
-                    continue;
-                }
-                // Inside upstream sub-block or at starting_dns level — parse label: 'url' pairs
                 parse_kv_pair(line, line_number, |key, value| {
                     match key {
                         "ip_version_prefer" => {
@@ -821,14 +793,33 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                                 dns.starting_dns.ip_version_prefer = v;
                             }
                         }
-                        // Allow inline upstream entries: label: 'url'
-                        _ => {
+                        // upstream is a flat list of IP DNS addresses:
+                        //   upstream: ['udp://223.5.5.5:53', 'udp://1.1.1.1:53']
+                        // or a single quoted address:
+                        //   upstream: 'udp://223.5.5.5:53'
+                        "upstream" => {
+                            let addrs = parse_string_list(value, line_number, "starting_dns upstream")
+                                .or_else(|_| {
+                                    // Fall back to a single unquoted/optionally-quoted address.
+                                    let a = unquote(value);
+                                    if a.trim().is_empty() {
+                                        Err(ConfigError::Syntax {
+                                            line: line_number,
+                                            message: format!("starting_dns upstream cannot be empty"),
+                                        })
+                                    } else {
+                                        Ok(vec![a.to_string()])
+                                    }
+                                })?;
                             if let Some(ref mut dns) = current_dns_config {
-                                dns.starting_dns.upstream.push(DnsUpstreamEntry {
-                                    label: key.to_string(),
-                                    address: unquote(value).to_string(),
-                                });
+                                dns.starting_dns.upstream = addrs;
                             }
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown starting_dns field: '{}'", key),
+                            });
                         }
                     }
                     Ok(())
@@ -910,9 +901,9 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     if !name.is_empty() && !name.contains(' ') {
                         current_dns_group = DnsGroupConfig {
                             name: name.clone(),
-                            proxy: String::new(),
+                            send_by: String::new(),
+                            query_mode: DnsQueryMode::default(),
                             upstream: Vec::new(),
-                            request_routing: None,
                             response_routing: None,
                         };
                         state = ParseState::DnsGroup(name.clone());
@@ -931,9 +922,9 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     // Finalize group and add to config
                     let group = std::mem::replace(&mut current_dns_group, DnsGroupConfig {
                         name: String::new(),
-                        proxy: String::new(),
+                        send_by: String::new(),
+                        query_mode: DnsQueryMode::default(),
                         upstream: Vec::new(),
-                        request_routing: None,
                         response_routing: None,
                     });
                     if let Some(ref mut dns) = current_dns_config {
@@ -947,11 +938,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     match section_name {
                         "upstream" => {
                             state = ParseState::DnsGroupUpstream(group_name.clone());
-                        }
-                        "request_routing" => {
-                            current_dns_route_rules.clear();
-                            current_dns_route_fallback.clear();
-                            state = ParseState::DnsGroupRequestRouting(group_name.clone());
                         }
                         "response_routing" => {
                             current_dns_resp_rules.clear();
@@ -967,11 +953,15 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     }
                     continue;
                 }
-                // Handle proxy binding
+                // Handle send_by / query_mode bindings
                 parse_kv_pair(line, line_number, |key, value| {
                     match key {
-                        "proxy" => {
-                            current_dns_group.proxy = unquote(value).to_string();
+                        "send_by" => {
+                            current_dns_group.send_by = unquote(value).to_string();
+                        }
+                        "query_mode" => {
+                            let mode = parse_query_mode(unquote(value), line_number)?;
+                            current_dns_group.query_mode = mode;
                         }
                         _ => {
                             return Err(ConfigError::Syntax {
@@ -1032,39 +1022,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 return Err(ConfigError::Syntax {
                     line: line_number,
                     message: format!("expected DNS routing rule or fallback, got: '{}'", line),
-                });
-            }
-
-            // ── dns group > request_routing ──
-            ParseState::DnsGroupRequestRouting(group_name) => {
-                if line == "}" {
-                    current_dns_group.request_routing = Some(DnsGroupRequestRouting {
-                        rules: std::mem::take(&mut current_dns_route_rules),
-                        fallback: std::mem::take(&mut current_dns_route_fallback),
-                    });
-                    state = ParseState::DnsGroup(group_name.clone());
-                    continue;
-                }
-                // Handle fallback: action
-                if let Some(action) = line.strip_prefix("fallback:").map(|s| s.trim()) {
-                    current_dns_route_fallback = action.to_string();
-                    continue;
-                }
-                // Handle rule line: expr -> action
-                if let Some(arrow_pos) = line.find("->") {
-                    let expr = line[..arrow_pos].trim();
-                    let action = line[arrow_pos + 2..].trim();
-                    if !expr.is_empty() && !action.is_empty() {
-                        current_dns_route_rules.push(DnsRouteRule {
-                            r#match: expr.to_string(),
-                            action: action.to_string(),
-                        });
-                        continue;
-                    }
-                }
-                return Err(ConfigError::Syntax {
-                    line: line_number,
-                    message: format!("expected request routing rule or fallback, got: '{}'", line),
                 });
             }
 
@@ -1309,6 +1266,49 @@ fn parse_map_value(
         map.insert(key.to_string(), val.to_string());
     }
     Ok(map)
+}
+
+/// Parse a string list value of the form `['a', 'b', 'c']` into a `Vec<String>`.
+///
+/// Items may be single or double quoted, or bare (no quotes). Empty items are skipped.
+fn parse_string_list(
+    value: &str,
+    line_number: usize,
+    field: &str,
+) -> Result<Vec<String>> {
+    let value = value.trim();
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| ConfigError::Syntax {
+            line: line_number,
+            message: format!("field '{}' expected list syntax `[ ... ]`, got: '{}'", field, value),
+        })?;
+    let mut out = Vec::new();
+    for entry in inner.split(',') {
+        let entry = unquote(entry.trim());
+        if !entry.is_empty() {
+            out.push(entry.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a DNS group `query_mode` value: `concurrent` | `random` | `sequence`.
+fn parse_query_mode(value: &str, line_number: usize) -> Result<DnsQueryMode> {
+    match value.trim().to_lowercase().as_str() {
+        "concurrent" => Ok(DnsQueryMode::Concurrent),
+        "random" => Ok(DnsQueryMode::Random),
+        "sequence" => Ok(DnsQueryMode::Sequence),
+        other => Err(ConfigError::FieldType {
+            line: line_number,
+            field: "query_mode".into(),
+            message: format!(
+                "invalid query_mode '{}'; expected concurrent, random, or sequence",
+                other
+            ),
+        }),
+    }
 }
 
 /// Parse an import line: `import: 'url'` or `import: "url"`

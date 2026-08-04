@@ -1,4 +1,4 @@
-//! VMess 协议Dialer
+//! VMess protocol dialer
 //!
 //! Implements VMess AEAD outbound protocol (compatible with v2ray-core 4.0+):
 //! - AEAD authentication (MD5 derived CmdKey + HMAC-SHA256 KDF)
@@ -59,7 +59,7 @@ const BODY_CHUNK_SIZE: usize = 16384;
 /// AEAD tag length
 const AEAD_TAG: usize = 16;
 
-/// VMess Dialer错误
+/// VMess Dialer error
 #[derive(Debug, thiserror::Error)]
 pub enum VMessError {
     #[error("VMess dial timeout: {0}")]
@@ -159,7 +159,7 @@ pub struct VMessDialer {
 }
 
 impl VMessDialer {
-    /// 从 v2rayN base64 JSON 格式创建Dialer
+    /// Create a dialer from the v2rayN base64 JSON format
     pub fn new_from_base64_json(base64_str: &str, dial_timeout_ms: u64) -> Result<Self, VMessError> {
         use base64::Engine as _;
         let decoded = base64::engine::general_purpose::STANDARD
@@ -216,7 +216,7 @@ impl VMessDialer {
         })
     }
 
-    /// 创建新的 VMess Dialer
+    /// Create a new VMess Dialer
     pub fn new(proxy_addr: SocketAddr, uuid: impl Into<String>, dial_timeout_ms: u64) -> Self {
         Self {
             proxy_addr,
@@ -249,13 +249,13 @@ impl VMessDialer {
         self
     }
 
-    /// 设置Transport method
+    /// Set the transport method
     pub fn set_network(&mut self, network: VMessNetwork) -> &mut Self {
         self.network = network;
         self
     }
 
-    /// 设置 WebSocket path
+    /// Set the WebSocket path
     pub fn set_ws_path(&mut self, path: impl Into<String>) -> &mut Self {
         self.ws_path = Some(path.into());
         self
@@ -267,19 +267,19 @@ impl VMessDialer {
         self
     }
 
-    /// 设置 HTTP/2 path
+    /// Set the HTTP/2 path
     pub fn set_h2_path(&mut self, path: impl Into<String>) -> &mut Self {
         self.h2_path = Some(path.into());
         self
     }
 
-    /// 设置 HTTP/2 host
+    /// Set the HTTP/2 host
     pub fn set_h2_host(&mut self, host: impl Into<String>) -> &mut Self {
         self.h2_host = Some(host.into());
         self
     }
 
-    /// 设置 gRPC service name
+    /// Set the gRPC service name
     pub fn set_grpc_service_name(&mut self, name: impl Into<String>) -> &mut Self {
         self.grpc_service_name = Some(name.into());
         self
@@ -602,7 +602,7 @@ fn seal_header(cmd_key: &[u8; 16], header: &[u8], auth_id: &[u8; 16]) -> Result<
     Ok(out)
 }
 
-/// 编码目标地址（VMess ATYP：1=IPv4, 2=Domain name, 3=IPv6；端口在前）
+/// Encode the target address (VMess ATYP: 1=IPv4, 2=Domain name, 3=IPv6; port first)
 fn encode_address_port(target: &str) -> Result<(Vec<u8>, u16), VMessError> {
     let (mut host, port) = target
         .rsplit_once(':')
@@ -629,7 +629,7 @@ fn encode_address_port(target: &str) -> Result<(Vec<u8>, u16), VMessError> {
     Ok((addr, port))
 }
 
-/// 编码 VMess UDP 数据报地址：ATYP + ADDR + PORT（1=IPv4, 2=Domain name, 3=IPv6）
+/// Encode the VMess UDP datagram address: ATYP + ADDR + PORT (1=IPv4, 2=Domain name, 3=IPv6)
 fn encode_packet_addr(host: &str, port: u16) -> Vec<u8> {
     let mut addr = Vec::with_capacity(1 + 16 + 2);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
@@ -799,7 +799,7 @@ where
     use aes_gcm::{Aes128Gcm, KeyInit as _, Nonce};
     use aes_gcm::aead::Aead;
 
-    // 1. Length seal（18 字节）
+    // 1. Length seal (18 bytes)
     let mut len_cipher = [0u8; 18];
     stream.read_exact(&mut len_cipher).await.map_err(VMessError::Io)?;
     let len_key = kdf16(resp_key, &[KDF_RESP_LEN_KEY]);
@@ -1303,8 +1303,9 @@ impl crate::UdpSession for VMessUdpSession {
 // WebSocket byte stream adapter (message-based -> byte stream)
 // ============================================================================
 
-/// 将 WebSocket 消息流适配为字节流：Read direction拼接 Binary/Text 消息，
-/// Write direction按 Binary 消息发送；自动应答 Ping，Close/None 表示 EOF。
+/// Adapts a WebSocket message stream into a byte stream: the read direction
+/// concatenates Binary/Text messages, the write direction sends Binary
+/// messages; Ping is answered automatically, and Close/None indicate EOF.
 pub struct WsByteStream<S> {
     ws: tokio_tungstenite::WebSocketStream<S>,
     rx: Vec<u8>,
@@ -1406,7 +1407,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for WsByteStream<S> {
                     self.eof = true;
                     return Poll::Ready(Ok(()));
                 }
-                _ => {} // Ping 已处理；Pong/Frame 忽略
+                _ => {} // Ping handled; Pong/Frame ignored
             }
         }
     }
@@ -1537,7 +1538,7 @@ mod tests {
         assert_eq!(d.security_type().unwrap(), SEC_CHACHA20_POLY1305);
     }
 
-    /// 测试用 AsyncDuplex：按 step 字节分块返回 data，读尽后返回 EOF（filled()==0）
+    /// Test AsyncDuplex: returns data in chunks of `step` bytes, then returns EOF (filled()==0) once the data is exhausted
     struct ChunkedReader {
         data: Vec<u8>,
         pos: usize,
@@ -1588,9 +1589,9 @@ mod tests {
         }
     }
 
-    /// 回归测试：对端在不足一个 2 字节 mask 帧时即 EOF（服务端关闭）。
-    /// 修复前 `poll_fill_frame` 会把 EOF 补零成伪帧导致解析错误；
-    /// 修复后应返回干净 EOF（Ok(0)）。
+    /// Regression test: the peer EOFs before a full 2-byte mask frame is received (server closed).
+    /// Before the fix, `poll_fill_frame` zero-padded the EOF into a bogus frame, causing parse errors;
+    /// after the fix it should return a clean EOF (Ok(0)).
     #[tokio::test]
     async fn test_body_read_eof_clean() {
         let inner = Box::new(ChunkedReader {
@@ -1604,14 +1605,15 @@ mod tests {
         assert_eq!(n, 0);
     }
 
-    /// 回归测试：完整 chunk 被分块（step=3）注入，模拟 TCP 分片/部分读，
-    /// 客户端应正确拼装并解密出明文；修复前会因补零导致 open 失败。
+    /// Regression test: a complete chunk is injected in chunks (step=3), simulating TCP
+    /// fragmentation/partial reads; the client should correctly reassemble and decrypt the
+    /// plaintext. Before the fix, zero-padding caused open to fail.
     #[tokio::test]
     async fn test_body_read_split_chunk() {
         let session = test_session();
         let plain = b"vmess response payload";
 
-        // 按 v2ray 响应体格式构造一个合法 chunk（response 方向密钥）
+        // Build a valid chunk in the v2ray response body format (response direction key)
         let mut shake = ShakeSize::new(&session.response_body_iv);
         let mask = shake.next_mask();
         let padding = shake.next_padding() as usize;

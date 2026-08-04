@@ -1,4 +1,4 @@
-//! TUIC v5 协议Dialer（基于 QUIC）
+//! TUIC v5 protocol dialer (based on QUIC)
 //!
 //! Implements TUIC v5 outbound proxy protocol:
 //! - QUIC transport (quinn + rustls, ALPN `tuic-v5`, 0-RTT early data)
@@ -34,7 +34,7 @@ const CMD_PACKET: u8 = 0x02;
 /// ALPN
 const TUIC_ALPN: &[u8] = b"tuic-v5";
 
-/// TUIC Dialer错误
+/// TUIC Dialer error
 #[derive(Debug, thiserror::Error)]
 pub enum TuicError {
     #[error("TUIC dial timeout: {0}")]
@@ -88,7 +88,7 @@ struct QuinnConnection {
 }
 
 impl TuicDialer {
-    /// 创建新的 TUIC Dialer
+    /// Create a new TUIC Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         uuid: impl Into<String>,
@@ -241,7 +241,7 @@ impl TuicDialer {
     async fn authenticate(&self, conn: &quinn::Connection) -> Result<(), TuicError> {
         let uuid = parse_uuid(&self.uuid)?;
 
-        // RFC 5705 Keying Material Exporter：label = UUID，context = Password
+        // RFC 5705 Keying Material Exporter: label = UUID, context = Password
         let mut token = [0u8; 32];
         conn.export_keying_material(&mut token, &uuid, self.password.as_bytes())
             .map_err(|e| TuicError::Quic(format!("key exporter failed: {:?}", e)))?;

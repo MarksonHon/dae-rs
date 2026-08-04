@@ -4,15 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# libbpf-rs: 用户空间 eBPF 管理（替代 aya）
+# libbpf-rs: userspace eBPF management (replaces aya)
 libbpf-rs = "0.24"
-# libbpf-sys: libbpf C 库的 Rust FFI 绑定
-# 统一启用 vendored（libbpf + elfutils libelf + zlib 全部由 zig cc 从源码构建、静态链接）：
-# - 交叉编译（musl / aarch64-gnu）时宿主机的 libelf/libz 是 glibc/x86_64 的，无法使用
-# - x86_64-gnu 时系统头文件与 zig 内置 glibc 版本不一致会引发 __isoc23_* 符号缺失，
-#   因此 gnu 目标也不依赖系统 libelf，保证所有 Linux 目标构建行为一致
+# libbpf-sys: Rust FFI bindings for the libbpf C library
+# Vendored is enabled uniformly (libbpf + elfutils libelf + zlib are all built from source
+# and statically linked by zig cc):
+# - When cross-compiling (musl / aarch64-gnu), the host's libelf/libz are glibc/x86_64 and cannot be used
+# - On x86_64-gnu, mismatched system headers vs the glibc version built into zig cause missing
+#   __isoc23_* symbols, so even the gnu target does not depend on the system libelf, keeping build
+#   behavior consistent across all Linux targets
 libbpf-sys = { version = "1.4", features = ["vendored"] }
-# 安全地进行结构体↔字节转换
+# Safely convert between structs and bytes
 bytemuck = { version = "1", features = ["derive"] }
 
 tokio = { version = "1", features = ["full"] }
@@ -26,12 +28,14 @@ tracing = "0.1"
 futures = "0.3"
 fastrand = "2"
 socket2 = { version = "0.5", features = ["all"] }
-ipnet = "2"
+ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
 regex = "1"
-# 规则集下载：HTTP 客户端（SOCKS5 代理 + rustls TLS，与现有 rustls 栈一致；关闭默认 TLS 避免 openssl）
+bincode = "1"
+# Rule-set download: HTTP client (SOCKS5 proxy + rustls TLS, consistent with the existing rustls
+# stack; default TLS disabled to avoid openssl)
 reqwest = { version = "0.12", default-features = false, features = ["socks", "rustls-tls-native-roots"] }
-# 规则集文件 sha256 校验
+# Rule-set file sha256 verification
 sha2 = "0.10"
 rtnetlink = "0.21"
 netlink-packet-route = "0.21"
@@ -42,15 +46,16 @@ chrono = "0.4"
 shared = { path = "../shared" }
 protocols = { path = "../protocols" }
 
-# 交叉编译需要宿主安装 autotools：autoreconf/autopoint/flex/bison/gawk（musl 构建额外需要
-# musl 版 argp/fts/obstack，见 .github/workflows/build.yml 中的 musl-deps 步骤）
+# Cross-compilation requires autotools on the host: autoreconf/autopoint/flex/bison/gawk
+# (musl builds additionally need musl versions of argp/fts/obstack, see the musl-deps step in
+# .github/workflows/build.yml)
 
 [build-dependencies]
 libbpf-cargo = "0.24"
 
 [dev-dependencies]
 tower = "0.5"
-# 规则集存储/下载单元测试使用临时目录
+# Rule-set storage/download unit tests use a temporary directory
 tempfile = "3"
-# 规则集调度器测试：paused 时间（start_paused / tokio::time::advance）
+# Rule-set scheduler tests: paused time (start_paused / tokio::time::advance)
 tokio = { version = "1", features = ["test-util"] }

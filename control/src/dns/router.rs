@@ -1,11 +1,9 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::warn;
-
 use crate::config::{DnsConfig, DnsGroupConfig};
 use crate::ruleset::cache::RuleSetCache;
-use crate::ruleset::refparse::{match_domain_patterns, match_qname_value, parse_ref, RuleSetRef};
+use crate::ruleset::refparse::{match_qname_value, parse_ref, RuleSetRef};
 
 /// Result of matching a DNS query to a group
 #[derive(Debug, Clone)]
@@ -136,7 +134,6 @@ impl DnsRouter {
                 send_by: "direct".into(),
                 query_mode: crate::config::DnsQueryMode::default(),
                 upstream: Vec::new(),
-                response_routing: None,
             },
             send_by: None,
         }
@@ -167,26 +164,9 @@ impl DnsRouter {
     fn eval_match_type(&self, mt: &DnsMatchType, value: &str, qname: &str, qtype: u16) -> bool {
         match mt {
             DnsMatchType::QName => match_qname_value(qname, value),
-            DnsMatchType::GeoSite => match self.rule_set_cache.find_geosite_code(value) {
-                Some(patterns) => match_domain_patterns(qname, &patterns),
-                None => {
-                    warn!(
-                        code = %value,
-                        "DNS qname(geosite:...) code not found in rule set cache; no match"
-                    );
-                    false
-                }
-            },
-            DnsMatchType::Set => match self.rule_set_cache.get_set_domains(value) {
-                Some(patterns) => match_domain_patterns(qname, &patterns),
-                None => {
-                    warn!(
-                        name = %value,
-                        "DNS qname(set:...) not found or not a domain_list; no match"
-                    );
-                    false
-                }
-            },
+            // Compiled matching: O(qname labels) via suffix trie instead of a linear scan.
+            DnsMatchType::GeoSite => self.rule_set_cache.geosite_matches(value, qname),
+            DnsMatchType::Set => self.rule_set_cache.domain_set_matches(value, qname),
             DnsMatchType::QType => {
                 let type_str = value.to_uppercase();
                 match type_str.as_str() {
@@ -303,6 +283,7 @@ mod tests {
                 fallback: fallback.to_string(),
             },
             cache: config::DnsCacheConfig::default(),
+            response_action: None,
         }
     }
 
@@ -318,7 +299,6 @@ mod tests {
                     address: addr.to_string(),
                 })
                 .collect(),
-            response_routing: None,
         }
     }
 

@@ -274,11 +274,6 @@ pub enum ConfigWarning {
     ApiTokenTooShort {
         length: usize,
     },
-    /// W2002: DNS group response_routing not configured, all responses accepted
-    #[allow(dead_code)]
-    DnsGroupNoResponseRouting {
-        group: String,
-    },
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -292,9 +287,6 @@ impl std::fmt::Display for ConfigWarning {
             }
             ConfigWarning::ApiTokenTooShort { length } => {
                 write!(f, "[W1902] API token length {} < recommended 16", length)
-            }
-            ConfigWarning::DnsGroupNoResponseRouting { group } => {
-                write!(f, "[W2002] DNS group '{}' has no response_routing configured, all responses accepted", group)
             }
         }
     }
@@ -429,11 +421,16 @@ pub struct DnsResponseRule {
     pub action: String,
 }
 
-/// DNS response routing configuration
+/// DNS response action configuration (module-level).
+///
+/// Applied to the DNS response after an upstream query, regardless of which
+/// group produced it. Rules match against the response and the answering
+/// upstream's label; actions are `accept`, `reject`, or an upstream label to
+/// requery within the group that answered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct DnsGroupResponseRouting {
-    /// Ordered list of response routing rules
+pub struct DnsResponseActionConfig {
+    /// Ordered list of response rules
     #[serde(default)]
     pub rules: Vec<DnsResponseRule>,
     /// Default action if no rule matches
@@ -455,9 +452,6 @@ pub struct DnsGroupConfig {
     /// Upstream DNS servers in this group
     #[serde(default)]
     pub upstream: Vec<DnsUpstreamEntry>,
-    /// Response routing (pollution detection and fallback)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_routing: Option<DnsGroupResponseRouting>,
 }
 
 /// Top-level DNS routing: which group handles which query
@@ -491,6 +485,10 @@ pub struct DnsConfig {
     /// DNS routing: which group handles which query
     #[serde(default)]
     pub routing: DnsRoutingConfig,
+    /// Module-level response action: filters / processes DNS responses after
+    /// the upstream query, regardless of which group produced them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_action: Option<DnsResponseActionConfig>,
 }
 
 fn default_dns_bind() -> String { "127.0.0.1:5353".into() }
@@ -509,6 +507,7 @@ impl Default for DnsConfig {
                 rules: Vec::new(),
                 fallback: String::new(),
             },
+            response_action: None,
         }
     }
 }

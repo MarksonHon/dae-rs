@@ -276,7 +276,8 @@ routing {
 | `starting_dns` | 代理可用前的引导解析器。包含 `ip_version_prefer`（`4` 或 `6`）与 `upstream` 列表（必须是 IP 字面量，避免先有鸡还是先有蛋的问题）。 |
 | `bind` | 本地 DNS 监听地址（默认 `127.0.0.1:5353`）。 |
 | `cache` | 缓存设置：`enabled`、`max_size`、`max_ttl`、`min_ttl`、`optimistic_cache`、`optimistic_cache_ttl`。 |
-| `groups` | DNS 分组。每组含 `proxy`（`direct` 或 `proxy(<group>)`）、`upstream` 条目（label + URL，如 `udp://1.1.1.1:53`、`tcp+udp://dns.google:53`）、`request_routing` 与 `response_routing`。响应路由支持 `ip(geoip:<code>)` / `ip(set:<name>)` / `qname(geosite:<code>)` / `qname(set:<name>)` 条件，可用 `&&` 与 `!` 组合。 |
+| `groups` | DNS 分组。每组含 `send_by`（`direct` 或代理组名）、`query_mode`（`concurrent` / `random` / `sequence`）与 `upstream` 条目（label + URL，如 `udp://1.1.1.1:53`、`tcp+udp://dns.google:53`）。 |
+| `response_action` | DNS 模块级响应动作：对查询得到的结果做进一步筛选（无论来自哪个分组）。规则支持 `upstream(<label>)` / `ip(geoip:<code>)` / `ip(set:<name>)` / `qname(geosite:<code>)` / `qname(set:<name>)` 条件，可用 `&&` 与 `!` 组合；动作可取 `accept`、`reject` 或某个上游 label（改用该上游重查）。 |
 | `routing` | 顶层 DNS 查询路由：`qname(geosite:cn) -> china_dns`、`qname(set:chinadomain) -> china_dns` 等，外加 `fallback`。 |
 
 可解析的 URL scheme：`udp://`、`tcp://`、`tcp+udp://`、`https://` / `doh://`、
@@ -307,14 +308,14 @@ rule_set {
 
   chinadomain {
     type: domain_list
-    url: 'https://example.com/rules/chinadomain.txt'   # 占位 URL，可替换
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt'   # 占位 URL，可替换
     name: chinadomain
     update: time: 04:30
   }
 
   chinaip {
     type: ip_list
-    url: 'https://example.com/rules/chinaip.txt'       # 占位 URL，可替换
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt'       # 占位 URL，可替换
     name: chinaip
     update: period: 1d
     proxy: proxy_primary
@@ -356,8 +357,8 @@ rule_set {
 | `E2001` – `E2007` | DNS 分组 / 路由 / starting_dns 问题。 |
 | `E2101` – `E2106` | 规则集：name 重复 / 引用未知规则集 / 数据缺失 / 调度表达式非法（含秒级）/ URL 非法 / 容量超限。 |
 
-警告（`W1801`、`W1901`、`W1902`、`W2001`、`W2002`）用于提示非致命问题，
-如缺少 policy、缺少 DNS response_routing 等。
+警告（`W1801`、`W1901`、`W1902`）用于提示非致命问题，
+如缺少 policy 等。
 
 ## 6. 默认值一览
 

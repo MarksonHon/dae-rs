@@ -41,7 +41,7 @@
 | 2 | [`matcher.rs`](control/src/routing/matcher.rs:1626) `build_match_set_for_function()` | `geoip:cn` 等解析失败被**静默丢弃**（`if let Ok(cidrs)` 分支不命中则无任何 MatchSet 生成） |
 | 3 | [`matcher.rs`](control/src/routing/matcher.rs:1242) 域名收集 | `domain(geosite:cn)` 被当作普通后缀域名模式 `cn` 处理 → 退化为"以 .cn 结尾"匹配 |
 | 4 | [`router.rs`](control/src/dns/router.rs:270) `compile_route_rule()` | DNS 查询路由 `qname(geosite:cn)` 被编译为普通后缀字符串 `geosite:cn`，恒不匹配 |
-| 5 | [`handler.rs`](control/src/dns/handler.rs:585) `evaluate_response_condition()` | DNS 响应路由 `ip(geoip:...)` 未实现，条件恒为 `true` |
+| 5 | [`handler.rs`](control/src/dns/handler.rs:585) `evaluate_response_condition()` | DNS 响应动作 `ip(geoip:...)` 未实现，条件恒为 `true` |
 | 6 | 全局 | 无数据文件加载/解析/更新机制，无数据源配置项 |
 
 ### 1.2 现有架构要点（设计约束）
@@ -59,7 +59,7 @@
     （双缓冲 2×1024+8 = 2056）；单个 LPM trie 内部 `MAX_LPM_SIZE = 2_048_000` 条；
     `domain_routing_map` 位图固定 `MAX_MATCH_SET_LEN / 32 = 32` 个 u32（即域名集
     规则索引上限 1024）。
-- **DNS 路由**（[`router.rs`](control/src/dns/router.rs)）与 **DNS 响应路由**
+- **DNS 路由**（[`router.rs`](control/src/dns/router.rs)）与 **DNS 响应动作**
   （[`handler.rs`](control/src/dns/handler.rs:564)）有各自独立的规则编译/求值路径，
   目前均为简单后缀/类型匹配，需接入规则集数据。
 - **配置解析**在 [`parser.rs`](control/src/config/parser.rs)（行缩进状态机）、
@@ -308,7 +308,7 @@ rule_set {
   # ── 文本域名列表 ──
   chinadomain {
     type: domain_list
-    url: 'https://example.com/rules/chinadomain.txt'
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt'
     name: chinadomain
     update: time: 04:30
     update_on_start: false
@@ -317,7 +317,7 @@ rule_set {
   # ── 文本 IP 列表 ──
   chinaip {
     type: ip_list
-    url: 'https://example.com/rules/chinaip.txt'
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt'
     name: chinaip
     update: period: 1d
     proxy: proxy_primary         # 显式指定下载用代理组（可选，默认第一个代理组）
@@ -345,14 +345,14 @@ rule_set {
     },
     "chinadomain": {
       "type": "domain_list",
-      "url": "https://example.com/rules/chinadomain.txt",
+      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt",
       "name": "chinadomain",
       "update": { "time": "04:30" },
       "update_on_start": false
     },
     "chinaip": {
       "type": "ip_list",
-      "url": "https://example.com/rules/chinaip.txt",
+      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt",
       "name": "chinaip",
       "update": { "period": "1d" },
       "proxy": "proxy_primary"
@@ -464,7 +464,7 @@ rule_set {
   （用户空间直接匹配内存缓存，不依赖 eBPF）。
 - `qname(suffix:...)` 等普通模式继续走现有后缀逻辑。
 
-### 6.5 DNS 响应路由（`handler.rs`）求值语义（修复"恒 true"缺陷）
+### 6.5 DNS 响应动作（`handler.rs`）求值语义（修复"恒 true"缺陷）
 
 - 将 [`evaluate_response_condition()`](control/src/dns/handler.rs:564) 扩展：
   - `ip(geoip:cn)` / `ip(set:chinaip)`：解析响应中所有 A/AAAA 地址
@@ -524,7 +524,7 @@ rule_set {
   3. `update` 二选一互斥 + 时间/周期格式（拒绝秒级）；
   4. 路由规则中 `set:<name>` / `geoip:<code>` / `geosite:<code>` 引用完整性
      （E2102）；
-  5. DNS 路由 / DNS 响应路由中同类引用校验（E2102）。
+  5. DNS 路由 / DNS 响应动作中同类引用校验（E2102）。
 
 ### 8.3 新错误码
 
@@ -611,7 +611,7 @@ outbound 链把"函数内多值 OR + 函数间 AND + NOT"降级为线性 MatchSe
 
 - **DNS 查询路由**（[`router.rs`](control/src/dns/router.rs)）：当前每条规则单条件；
   阶段 3 升级为支持 `&&`/`!` 组合（复用 §6.5 的条件求值器），语义对齐数据面。
-- **DNS 响应路由**（[`handler.rs`](control/src/dns/handler.rs)）：条件求值器支持
+- **DNS 响应动作**（[`handler.rs`](control/src/dns/handler.rs)）：条件求值器支持
   `&&`/`!` 与规则集条件（§6.5）。
 
 ## 11. 与 dae 的对齐与差异总结
@@ -657,7 +657,7 @@ outbound 链把"函数内多值 OR + 函数间 AND + NOT"降级为线性 MatchSe
 - matcher：`compile_rules()` 接入规则集 → LPM trie / domain_sets；缺失处理
   （E2103）；容量检查（E2106）。
 - DNS 查询路由：`qname(geosite:cn)` / `qname(set:...)` 求值。
-- DNS 响应路由：`ip(geoip:cn)` / `ip(set:...)` 求值，修复"恒 true"；条件求值器
+- DNS 响应动作：`ip(geoip:cn)` / `ip(set:...)` 求值，修复"恒 true"；条件求值器
   （`&&`/`!`）。
 - **验证**：路由编译单测（规则集 → MatchSet/LPM/domain_sets）、DNS 路由单测。
 

@@ -1,8 +1,8 @@
-//! Juicity 协议Dialer（基于 QUIC）
+//! Juicity protocol dialer (based on QUIC)
 //!
 //! Implements Juicity outbound proxy protocol:
 //! - QUIC transport (quinn + rustls, ALPN `h3`, TLS 1.3)
-//! - `Authenticate`：UUID + RFC 5705 Keying Material Exporter token
+//! - `Authenticate`: UUID + RFC 5705 Keying Material Exporter token
 //! - TCP carried on QUIC stream, proxy header = [network][addr_type][address][port]
 //! - Each QUIC connection carries at most 30 streams, then new connection
 //!
@@ -29,7 +29,7 @@ use crate::{OutboundDialer, ProxyConn};
 
 /// Juicity protocol version
 const JUICITY_VERSION: u8 = 0x00;
-/// Command type（认证）
+/// Command type (authentication)
 const CMD_AUTHENTICATE: u8 = 0x00;
 /// ALPN
 const JUICITY_ALPN: &[u8] = b"h3";
@@ -43,7 +43,7 @@ const ADDR_IPV4: u8 = 1;
 const ADDR_DOMAIN: u8 = 3;
 const ADDR_IPV6: u8 = 4;
 
-/// Juicity Dialer错误
+/// Juicity Dialer error
 #[derive(Debug, thiserror::Error)]
 pub enum JuicityError {
     #[error("Juicity dial timeout: {0}")]
@@ -96,7 +96,7 @@ struct JuicityConnState {
 }
 
 impl JuicityDialer {
-    /// 创建新的 Juicity Dialer
+    /// Create a new Juicity Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         uuid: impl Into<String>,

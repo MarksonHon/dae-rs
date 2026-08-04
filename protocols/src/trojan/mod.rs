@@ -1,4 +1,4 @@
-//! Trojan 协议Dialer
+//! Trojan protocol dialer
 //!
 //! Implements Trojan outbound proxy protocol, based on TLS transport, disguising as HTTPS traffic.
 //! Reference: https://github.com/trojan-gfw/trojan/blob/master/docs/protocol.md
@@ -17,7 +17,7 @@ use rustls::{ClientConfig, RootCertStore};
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// Trojan Dialer错误
+/// Trojan Dialer error
 #[derive(Debug, thiserror::Error)]
 pub enum TrojanError {
     #[error("Trojan dial timeout: {0}")]
@@ -53,7 +53,7 @@ pub struct TrojanDialer {
 }
 
 impl TrojanDialer {
-    /// 创建新的 Trojan Dialer
+    /// Create a new Trojan Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         password: impl Into<String>,
@@ -210,7 +210,7 @@ fn split_target(target: &str) -> Result<(&str, u16), TrojanError> {
     Ok((host, port))
 }
 
-/// 编码 Trojan 地址：ATYP + ADDR + PORT（1=IPv4, 3=Domain name, 4=IPv6）
+/// Encode the Trojan address: ATYP + ADDR + PORT (1=IPv4, 3=Domain name, 4=IPv6)
 fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, TrojanError> {
     let mut addr = Vec::with_capacity(1 + 16 + 2);
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {

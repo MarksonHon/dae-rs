@@ -490,21 +490,21 @@ impl ControlPlane {
             param.dae0_ifindex = self
                 .netns_mgr
                 .get_host_ifindex()
-                .map_err(|e| anyhow::anyhow!("获取 dae0 ifindex 失败: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("failed to get dae0 ifindex: {}", e))?;
             info!("Set PARAM.dae0_ifindex = {}", param.dae0_ifindex);
 
             // Get proxy netns inode (dae_netns_id)
             param.dae_netns_id = self
                 .netns_mgr
                 .get_proxy_netns_inode()
-                .map_err(|e| anyhow::anyhow!("获取代理命名空间 inode 失败: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("failed to get proxy namespace inode: {}", e))?;
             info!("Set PARAM.dae_netns_id = {}", param.dae_netns_id);
 
             // Get dae0peer MAC address
             param.dae0peer_mac = self
                 .netns_mgr
                 .get_peer_mac()
-                .map_err(|e| anyhow::anyhow!("获取 dae0peer MAC 地址失败: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("failed to get dae0peer MAC address: {}", e))?;
             info!(
                 "Set PARAM.dae0peer_mac = {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                 param.dae0peer_mac[0],
@@ -1412,8 +1412,9 @@ impl ControlPlane {
                 dialer.clone(),
                 tproxy_listener_mark,
             );
-            // TCP DNS 劫持：原始目标为 53 端口的连接转发到内部 DNS handler
-            // （与 UDP 劫持一致），上游连接在宿主 NS 创建。
+            // TCP DNS hijack: connections whose original destination is port 53 are forwarded
+            // to the internal DNS handler (consistent with UDP hijack); the upstream connection
+            // is created in the host NS.
             tcp.set_host_ns_fd(host_ns_fd);
             if let Some(ref dns_cfg) = self.config.dns_config {
                 if let Ok(dns_bind) = dns_cfg.bind.parse::<std::net::SocketAddr>() {
@@ -1646,9 +1647,9 @@ impl ControlPlane {
 
             loop {
                 let interval = if in_pressure {
-                    std::time::Duration::from_secs(1) // 压力模式 1s
+                    std::time::Duration::from_secs(1) // pressure mode: 1s
                 } else {
-                    std::time::Duration::from_secs(5) // 稳态模式 5s
+                    std::time::Duration::from_secs(5) // steady-state mode: 5s
                 };
                 tokio::time::sleep(interval).await;
 
@@ -1739,7 +1740,7 @@ impl ControlPlane {
                                         );
                                     }
                                 } else {
-                                    pressure_rounds = 0; // 高于阈值，重置计数
+                                    pressure_rounds = 0; // above threshold, reset the counter
                                 }
                             } else {
                                 // Check if we should enter pressure mode
@@ -2469,7 +2470,7 @@ impl ControlPlane {
     // hot-reload (reuses [`ControlPlane::reload_config`]).
     ///
     /// Returns whether hot-reload was performed. Should be called periodically (e.g., main event loop); returns
-    /// `false`。
+    /// `false`.
     ///
     /// # Legacy
     ///

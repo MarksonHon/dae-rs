@@ -1,4 +1,4 @@
-//! Shadowsocks 协议Dialer
+//! Shadowsocks protocol dialer
 //!
 //! Implements Shadowsocks outbound proxy protocol (TCP), supporting:
 //! - AEAD (Legacy) - EVP_BytesToKey master key + HKDF-SHA1 session sub-key
@@ -29,7 +29,7 @@ use shadowsocks_crypto::CipherKind;
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// Shadowsocks Dialer错误
+/// Shadowsocks Dialer error
 #[derive(Debug, thiserror::Error)]
 pub enum ShadowsocksError {
     #[error("Shadowsocks dial timeout: {0}")]
@@ -77,7 +77,7 @@ pub struct ShadowsocksDialer {
 }
 
 impl ShadowsocksDialer {
-    /// 创建新的 Shadowsocks Dialer
+    /// Create a new Shadowsocks Dialer
     pub fn new(
         proxy_addr: SocketAddr,
         cipher: impl Into<String>,
@@ -188,7 +188,7 @@ impl ShadowsocksDialer {
         })
     }
 
-    /// 编码目标地址：ATYP + ADDR + PORT（1=IPv4, 3=Domain name, 4=IPv6）
+    /// Encode the target address: ATYP + ADDR + PORT (1=IPv4, 3=Domain name, 4=IPv6)
     fn encode_address(target: &str) -> Result<Vec<u8>, ShadowsocksError> {
         let (host, port) = split_target(target)?;
         encode_addr(host, port)
@@ -235,7 +235,8 @@ fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, ShadowsocksError> {
 }
 
 /// Decode Shadowsocks address, return `(SocketAddr, bytes consumed)`.
-/// Domain name为 0.0.0.0:port（无法在无 DNS 场景解析时保留端口）。
+/// Domain names resolve to 0.0.0.0:port (the port is preserved when the address
+/// cannot be resolved in a DNS-free scenario).
 fn decode_addr(data: &[u8]) -> Result<(SocketAddr, usize), ShadowsocksError> {
     if data.is_empty() {
         return Err(ShadowsocksError::ProtocolError("empty address".into()));
@@ -289,7 +290,9 @@ impl OutboundDialer for ShadowsocksDialer {
         // 2. Send encrypted target address
         let target_addr = Self::encode_address(target)?;
         let framed = cipher.frame_packet(&target_addr)?;
-        // [DEBUG] 临时调试日志：定位 "length tag verification failed"，打印 target、包头 hex 与首帧前缀 hex（便于与 sslocal 抓包对比）
+        // [DEBUG] Temporary debug log: to locate "length tag verification failed", prints the
+        // target, the address header hex and the first-frame prefix hex (for comparison against
+        // sslocal packet captures)
         let first_frame_prefix32 = framed.iter().take(32).copied().collect::<Vec<_>>();
         tracing::info!(
             "shadowsocks debug dial: target={} encode_address={} salt={} first_frame_prefix32={}",
@@ -720,7 +723,7 @@ impl SsCipherPair {
     }
 }
 
-/// 带 AEAD framing的 Shadowsocks TCP 流。
+/// Shadowsocks TCP stream with AEAD framing.
 ///
 /// Write path: chunk by 0x3FFF + 2-byte length prefix encryption.
 /// Read path: decrypt length frame (2+tag bytes) first, then read decrypted payload (len+tag bytes);
@@ -735,7 +738,8 @@ pub struct SsStream {
     kind: CipherKind,
     master_key: Vec<u8>,
     tag: usize,
-    /// [DEBUG] 临时调试字段：最近一次读取到的 server salt（仅用于调试日志，不影响正常逻辑）
+    /// [DEBUG] Temporary debug field: the most recently read server salt (used only for debug
+    /// logging, does not affect normal logic)
     debug_server_salt: Vec<u8>,
     /// Write path output buffer (framed ciphertext)
     write_out: Vec<u8>,
@@ -846,7 +850,7 @@ impl AsyncRead for SsStream {
                 )),
                 _ => unreachable!(),
             });
-            // [DEBUG] 临时调试日志：打印 server salt hex 与 peer addr
+            // [DEBUG] Temporary debug log: prints the server salt hex and peer addr
             tracing::info!(
                 "shadowsocks debug server_salt: salt={} peer={:?}",
                 hex::encode(&self.debug_server_salt),
@@ -924,7 +928,8 @@ impl AsyncRead for SsStream {
                 .expect("dec initialized before frame reads")
                 .decrypt_packet(&mut len_buf)
             {
-                // [DEBUG] 临时调试日志：失败时 len_buf 已被 decrypt 原地覆盖，故用 self.read_frame 中的原始字节打印
+                // [DEBUG] Temporary debug log: on failure `len_buf` has already been overwritten
+                // in place by decrypt, so print the original bytes from self.read_frame
                 let debug_len_frame_hex = hex::encode(&self.read_frame[..need_len_frame]);
                 tracing::info!(
                     "shadowsocks debug length_tag_verify_failed: len_frame={} server_salt={} peer={:?} tag={} salt_len={}",
@@ -1133,7 +1138,7 @@ mod tests {
                 _ => unreachable!(),
             };
 
-            // 验证：用“服务端自己的 salt”派生解密器无法解开客户端帧
+            // Verify: a decryptor derived from the server's own salt cannot decrypt the client frame
             // (proves lazy initialization must use server salt, not client salt --- regression test for the fix)
             let mut server_salt = vec![0u8; kind.salt_len()];
             random_iv_or_salt(&mut server_salt);
@@ -1162,10 +1167,10 @@ mod tests {
         }
     }
 
-    /// 回归测试：服务端发送 salt 后立即关闭（未送达合法长度帧）。
-    /// 修复前 `poll_fill_frame` 用 `buf.len()` 将 EOF 补成 18 字节零帧，
-    /// 从而把“服务端关闭”误报为 `length tag verification failed`；
-    /// 修复后应返回干净 EOF（Ok(0)）。
+    /// Regression test: the server closes immediately after sending the salt (no valid length
+    /// frame is delivered). Before the fix, `poll_fill_frame` padded the EOF with `buf.len()`
+    /// zeros into an 18-byte zero frame, misreporting the server close as `length tag verification
+    /// failed`; after the fix it should return a clean EOF (Ok(0)).
     #[tokio::test]
     async fn test_read_eof_after_salt_is_clean() {
         use tokio::io::AsyncReadExt;
@@ -1183,7 +1188,7 @@ mod tests {
             let mut server_salt = vec![0u8; kind.salt_len()];
             random_iv_or_salt(&mut server_salt);
             server.write_all(&server_salt).await.unwrap();
-            // drop(server)：关闭连接，不发送任何长度帧
+            // drop(server): close the connection without sending any length frame
         });
 
         let d = ShadowsocksDialer::new(addr, "aes-128-gcm", "password", 5000);
@@ -1195,8 +1200,9 @@ mod tests {
         server_task.await.unwrap();
     }
 
-    /// 回归测试：服务端响应被拆成多次 write（模拟 TCP 分片/部分读），
-    /// 客户端应正确拼装并解密出明文。
+    /// Regression test: the server response is split across multiple writes (simulating TCP
+    /// fragmentation/partial reads); the client should correctly reassemble and decrypt the
+    /// plaintext.
     #[tokio::test]
     async fn test_read_server_response_split_writes() {
         use tokio::io::AsyncReadExt;
@@ -1214,21 +1220,21 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let mut server = server;
-            // 服务端 salt + 用 server_salt 派生的加密器
+            // Server salt + encryptor derived from server_salt
             let mut server_salt = vec![0u8; kind.salt_len()];
             random_iv_or_salt(&mut server_salt);
             let mut enc = V1Cipher::new(kind, &key, &server_salt);
             let tag = enc.tag_len();
-            // 长度帧 [2-byte len][tag]
+            // Length frame [2-byte len][tag]
             let mut len_buf = vec![0u8; 2 + tag];
             len_buf[..2].copy_from_slice(&(plain.len() as u16).to_be_bytes());
             enc.encrypt_packet(&mut len_buf);
-            // payload 帧 [plain][tag]
+            // Payload frame [plain][tag]
             let mut payload = vec![0u8; plain.len() + tag];
             payload[..plain.len()].copy_from_slice(plain);
             enc.encrypt_packet(&mut payload);
 
-            // 分多次 write，模拟 TCP 分片/部分读
+            // Split across multiple writes to simulate TCP fragmentation/partial reads
             server.write_all(&server_salt).await.unwrap();
             server.write_all(&len_buf[..5]).await.unwrap();
             server.write_all(&len_buf[5..]).await.unwrap();

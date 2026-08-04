@@ -28,26 +28,27 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-// ── dae-rs 自身流量专用 socket（“必须直连”约定）──
+// ── dae-rs self-traffic dedicated socket (the "must direct connect" convention) ──
 
 /// dae-rs self-traffic dedicated socket configuration.
 ///
-/// Design convention: **all traffic emitted from dae-rs process must direct connect** -- cannot be intercepted by eBPF
-/// 透明代理管道劫持，否则会形成“代理连接 → 又被劫持 → 再代理”的循环。
+/// Design convention: **all traffic emitted from the dae-rs process must direct connect** -- it
+/// cannot be intercepted by the eBPF transparent-proxy hijacking pipeline, otherwise a
+/// "proxy connection → hijacked again → re-proxied" loop would form.
 ///
 /// Implementation relies on two layers of mechanisms:
-/// 1. `self_mark = shared::DAE_SOCKET_MARK`（0x100）：eBPF
+/// 1. `self_mark = shared::DAE_SOCKET_MARK` (0x100): eBPF
 ///    `pid_is_control_plane()` SO_MARK fallback check hit → direct pass;
-/// 2. `host_ns_fd`：在宿主Network namespace creation socket（kdae-aligned）。
+/// 2. `host_ns_fd`: create the socket in the host network namespace (kdae-aligned).
 ///
-/// 所有 dae-rs 出站 socket（Dialer、DNS upstream、透明回包等）都应通过
+/// All dae-rs outbound sockets (Dialer, DNS upstream, transparent replies, etc.) should be created via
 /// [`connect_tcp`] / [`create_udp`] / [`create_transparent_udp`] created,
 /// passing this structure, not manually assembling SO_MARK.
 #[derive(Debug, Clone, Copy)]
 pub struct DirectSocket {
     /// SO_MARK for eBPF self-exclusion (0 = not set)
     pub self_mark: u32,
-    /// Host network namespace fd（None = 当前命名空间）
+    /// Host network namespace fd (None = current namespace)
     pub host_ns_fd: Option<RawFd>,
 }
 

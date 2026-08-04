@@ -129,7 +129,7 @@ fn check_privileges() -> anyhow::Result<()> {
     let required_caps = [
         Capability::CAP_NET_ADMIN,
         Capability::CAP_SYS_ADMIN,
-        Capability::CAP_BPF, // Linux 5.8+ 需要
+        Capability::CAP_BPF, // requires Linux 5.8+
     ];
 
     let missing: Vec<String> = required_caps

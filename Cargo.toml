@@ -36,16 +36,16 @@ uuid = { version = "1", features = ["v4"] }
 tower-http = { version = "0.7", features = ["cors", "auth"] }
 socks5-proto = "0.4"
 
-# 安全地将 #[repr(C)] 结构体转换到/从字节切片
+# Safely convert #[repr(C)] structs to/from byte slices
 bytemuck = { version = "1", features = ["derive"] }
 
 control = { path = "control" }
 protocols = { path = "protocols" }
 shared = { path = "shared" }
 
-# 全局内存分配器（dae-rs 仅支持 Linux）
-# gnu 目标使用 jemalloc（多线程下性能好、碎片少）
-# musl 目标使用 mimalloc（轻量且与 musl 兼容）
+# Global memory allocator (dae-rs only supports Linux)
+# The gnu target uses jemalloc (better performance under multithreading, less fragmentation)
+# The musl target uses mimalloc (lightweight and compatible with musl)
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
 

@@ -1,21 +1,23 @@
-//! Ruleset scheduler（设计文档 §7）。
+//! Ruleset scheduler (design document §7).
 //!
-//! 单 tokio 任务聚合所有规则集的定时更新：
+//! A single tokio task aggregates the scheduled updates of all rule sets:
 //!
-//! - `update_on_start: true`：启动后**立即异步**触发一次无条件更新（不阻塞启动）；
-//! - `time: HH:MM`：每天本地时区该时刻触发；启动时若已过则顺延次日；
-//! - `period: 3h2m`：以上次**成功更新**为基准（失败不消耗周期），支持 `d`/`h`/`m`
-//!   组合、最小单位分钟、禁止秒。
+//! - `update_on_start: true`: triggers one unconditional update **asynchronously and immediately** after startup (does not block startup);
+//! - `time: HH:MM`: triggers daily at that time in the local timezone; if already passed at startup, postponed to the next day;
+//! - `period: 3h2m`: based on the last **successful update** (failures do not consume the period), supports `d`/`h`/`m`
+//!   combinations, minimum unit is minutes, seconds forbidden.
 //!
-//! 更新完成后通过 `watch` 通道（[`UpdateSignal`]，成功计数递增）通知外部——
-//! 本层只发通知信号，具体热重载接线（Routing重编译 / eBPF 双缓冲切换）由集成处 / 阶段 3 负责。
+//! After an update completes, external parties are notified through a `watch` channel
+//! ([`UpdateSignal`], with a monotonically increasing success counter) —
+//! this layer only emits notification signals; the actual hot-reload wiring
+//! (Routing recompilation / eBPF double-buffer switching) is handled by the integration layer / phase 3.
 //!
-//! **时钟基准**：调度时刻与"上次成功更新"统一用单调时钟 [`tokio::time::Instant`]
-//! 记录（`Local` 时间仅用于 `HH:MM` 到时刻的换算），保证与 `tokio::time::sleep_until`
-//! 一致、可在 `start_paused` 测试下推进虚拟时钟。
+//! **Clock basis**: both the scheduled time and the "last successful update" are recorded using the
+//! monotonic clock [`tokio::time::Instant`] (`Local` time is only used to convert `HH:MM` into an instant),
+//! keeping consistency with `tokio::time::sleep_until` and allowing the virtual clock to advance under `start_paused` tests.
 //!
-//! 时间计算辅助函数（[`next_time_trigger`] / [`next_period_trigger`] /
-//! [`parse_period`]）均为**纯函数、不依赖当前时刻**（`now` 作为参数注入），可独立单测。
+//! The time-computation helpers ([`next_time_trigger`] / [`next_period_trigger`] /
+//! [`parse_period`]) are all **pure functions that do not depend on the current time** (`now` is injected as a parameter), so they can be unit-tested independently.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -36,42 +38,43 @@ use crate::ruleset::types::{parse_time, RuleSetConfig, RuleSetUpdate};
 use crate::ruleset::RuleSetError;
 
 // ============================================================================
-// 公共接口
+// Public interface
 // ============================================================================
 
-/// 代理解析接口：`proxy` 代理组名 → SOCKS5 地址。
+/// Proxy resolution interface: `proxy` proxy group name → SOCKS5 address.
 ///
-/// 本层**不实现**代理组解析（如"第一个代理组"的确定、组内节点选择等），仅定义
-/// 接口并接收调用方注入。`None` 表示该代理组未知/不可用（回退直连下载并告警）。
-/// 阶段 3 / 集成处负责提供真实实现。
+/// This layer does **not** implement proxy group resolution (e.g. determining the "first proxy
+/// group" or selecting nodes within a group); it only defines the interface and accepts an
+/// injected implementation. `None` means the proxy group is unknown/unavailable (fall back to
+/// direct download with a warning). Phase 3 / the integration layer provides the real implementation.
 pub trait ProxyResolver: Send + Sync {
-    /// Parse proxy group名 → SOCKS5 地址；`None` 表示不可用（直连）。
+    /// Parse proxy group name → SOCKS5 address; `None` means unavailable (direct).
     fn resolve(&self, proxy: &str) -> Option<SocketAddr>;
 }
 
-/// 更新完成通知信号。
+/// Update-complete notification signal.
 ///
-/// 每次成功更新发送一次，值单调递增；接收方用 [`watch::Receiver::changed`]
-/// 感知"有规则集已更新，可触发热重载"。
+/// Sent once on every successful update with a monotonically increasing value; receivers use
+/// [`watch::Receiver::changed`] to detect that a rule set has been updated and hot reload can be triggered.
 pub type UpdateSignal = watch::Sender<u64>;
 
-/// 调度器句柄（[`RuleSetScheduler::spawn`] 的返回值）。
+/// Scheduler handle (the return value of [`RuleSetScheduler::spawn`]).
 pub struct SchedulerHandle {
-    /// Scheduled task句柄（调用 [`SchedulerHandle::shutdown`] 后结束）。
+    /// Scheduled task handle (ends after calling [`SchedulerHandle::shutdown`]).
     pub handle: JoinHandle<()>,
-    /// 优雅关停信号发送端。
+    /// Graceful shutdown signal sender.
     pub shutdown: watch::Sender<bool>,
-    /// 更新完成通知接收端（成功更新时值递增）。
+    /// Update-complete notification receiver (value increments on successful update).
     pub notifier: watch::Receiver<u64>,
 }
 
 impl SchedulerHandle {
-    /// 触发优雅关停（发送信号，Scheduled task在下次唤醒时退出）。
+    /// Trigger a graceful shutdown (sends the signal; the Scheduled task exits at its next wake-up).
     pub fn shutdown(&self) {
         let _ = self.shutdown.send(true);
     }
 
-    /// 优雅关停并等待Scheduled task结束。
+    /// Gracefully shut down and wait for the Scheduled task to finish.
     pub async fn stop(self) {
         let _ = self.shutdown.send(true);
         let _ = self.handle.await;
@@ -79,61 +82,61 @@ impl SchedulerHandle {
 }
 
 // ============================================================================
-// 调度器
+// Scheduler
 // ============================================================================
 
-/// 更新执行函数类型（可注入以便测试；生产使用 [`default_updater`]）。
+/// Update execution function type (injectable for testing; production uses [`default_updater`]).
 type UpdateFuture =
     Pin<Box<dyn Future<Output = Result<UpdateOutcome, RuleSetError>> + Send>>;
 type UpdateFn =
     Arc<dyn Fn(&RuleSetConfig, &DataDir, Option<SocketAddr>) -> UpdateFuture + Send + Sync>;
 
-/// 解析后的调度触发类型。
+/// Parsed scheduling trigger kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TriggerKind {
-    /// 每天本地时区 `HH:MM` 触发一次。
+    /// Trigger once daily at `HH:MM` in the local timezone.
     Time { hh: u8, mm: u8 },
-    /// 周期触发（基准 = 上次成功更新）。
+    /// Periodic trigger (base = last successful update).
     Period { period: Duration },
 }
 
-/// 单条目的调度状态。
+/// Scheduling state for a single entry.
 #[derive(Debug, Clone)]
 struct Entry {
     config: RuleSetConfig,
     kind: TriggerKind,
-    /// 下次触发时刻（单调时钟）。
+    /// Next trigger instant (monotonic clock).
     next: TokioInstant,
 }
 
-/// Ruleset scheduler。
+/// Ruleset scheduler.
 ///
-/// 通过 [`RuleSetScheduler::spawn`] 创建后台任务；持有：
-/// - 配置条目（含调度表达式）；
-/// - [`DataDir`]（下载/存储）；
-/// - 代理解析函数（注入）；
-/// - 通知通道（成功更新时递增）。
+/// Creates a background task via [`RuleSetScheduler::spawn`]; it holds:
+/// - configuration entries (including scheduling expressions);
+/// - a [`DataDir`] (download/storage);
+/// - a proxy resolution function (injected);
+/// - a notification channel (incremented on successful update).
 pub struct RuleSetScheduler {
     dir: Arc<DataDir>,
     proxy_resolver: Arc<dyn ProxyResolver>,
-    /// 缺省代理组名（"第一个代理组"，由调用方解析后注入；`proxy: None` 的条目使用）。
+    /// Default proxy group name ("first proxy group", resolved and injected by the caller; used by entries with `proxy: None`).
     default_proxy: Option<String>,
     entries: Vec<Entry>,
-    /// name → 上次成功更新时刻（单调时钟；失败不消耗周期的基础）。
+    /// name → last successful update instant (monotonic clock; the basis for failures not consuming the period).
     last_success: Arc<tokio::sync::Mutex<HashMap<String, TokioInstant>>>,
     notifier: watch::Sender<u64>,
     shutdown: watch::Receiver<bool>,
 }
 
 impl RuleSetScheduler {
-    /// 创建并 `tokio::spawn` Scheduled task。
+    /// Create and `tokio::spawn` the Scheduled task.
     ///
-    /// * `entries` — 规则集配置条目（已通过 validator 校验）。
+    /// * `entries` — rule set configuration entries (already validated by the validator).
     /// * `dir` — data directory.
-    /// * `proxy_resolver` — 代理解析接口（本层不实现代理组解析）。
-    /// * `default_proxy` — "第一个代理组"名（缺省代理；由调用方/阶段 3 确定）。
+    /// * `proxy_resolver` — proxy resolution interface (this layer does not implement proxy group resolution).
+    /// * `default_proxy` — the "first proxy group" name (default proxy; determined by the caller / phase 3).
     ///
-    /// 返回 [`SchedulerHandle`]（含 `JoinHandle`、关停发送端、通知接收端）。
+    /// Returns a [`SchedulerHandle`] (containing a `JoinHandle`, a shutdown sender, and a notification receiver).
     pub fn spawn(
         entries: Vec<RuleSetConfig>,
         dir: Arc<DataDir>,
@@ -155,9 +158,9 @@ impl RuleSetScheduler {
         SchedulerHandle { handle, shutdown: shutdown_tx, notifier: notifier_rx }
     }
 
-    /// 调度主循环。
+    /// Scheduler main loop.
     async fn run(mut self, configs: Vec<RuleSetConfig>, updater: UpdateFn) {
-        // Parse configuration → 调度条目（非法 update 已被 validator 拦截，这里防御性跳过）
+        // Parse configuration → schedule entries (invalid updates are already caught by the validator; skip defensively here)
         for cfg in configs {
             let kind = match &cfg.update {
                 Some(RuleSetUpdate::Time(t)) => match parse_time(t) {
@@ -182,7 +185,7 @@ impl RuleSetScheduler {
             self.entries.push(Entry { config: cfg, kind, next: TokioInstant::now() });
         }
 
-        // 初始化各条目首次触发时刻
+        // Initialize the first trigger instant of each entry
         let now_local = Local::now();
         let now_inst = TokioInstant::now();
         for i in 0..self.entries.len() {
@@ -193,7 +196,7 @@ impl RuleSetScheduler {
             self.entries[i].next = next;
         }
 
-        // update_on_start：立即异步触发（独立任务，不阻塞调度循环 / 启动）
+        // update_on_start: fire immediately and asynchronously (independent task; does not block the scheduler loop / startup)
         let on_start: Vec<Entry> = self
             .entries
             .iter()
@@ -207,7 +210,7 @@ impl RuleSetScheduler {
         info!("Rule set scheduler started with {} entries", self.entries.len());
 
         loop {
-            // 先计算最近触发时刻（不可变借用），再进入 select（`changed()` 需可变借用）。
+            // Compute the nearest trigger instant first (immutable borrow), then enter select (`changed()` needs a mutable borrow).
             let next = self.next_instant();
             tokio::select! {
                 _ = self.shutdown.changed() => {
@@ -228,9 +231,9 @@ impl RuleSetScheduler {
                         updated |= self.process_entry(i, now, &updater).await;
                     }
                     if updated {
-                        // 递增通知计数（接收方用 changed() 感知）。
-                        // 先取局部值再 send：避免 `borrow()` 返回的 `watch::Ref` 读锁
-                        // 临时值存活到 `send()`（写锁）调用期间，同一线程重入 RwLock 死锁。
+                        // Increment the notification counter (receivers detect it via changed()).
+                        // Take a local value before send: avoids the `watch::Ref` read lock returned by `borrow()`
+                        // staying alive across the `send()` (write lock) call, which would re-enter the RwLock and deadlock on the same thread.
                         let next = self.notifier.borrow().wrapping_add(1);
                         let _ = self.notifier.send(next);
                     }
@@ -239,7 +242,7 @@ impl RuleSetScheduler {
         }
     }
 
-    /// 计算条目首次触发时刻（period 基准：进程内上次成功更新 → 磁盘 meta → 启动时刻）。
+    /// Compute the entry's first trigger instant (period base: in-process last successful update → disk meta → startup time).
     async fn initial_next(
         &self,
         entry: &Entry,
@@ -258,7 +261,7 @@ impl RuleSetScheduler {
                 match base {
                     Some(t) => next_period_point(t, *period, now_inst),
                     None => {
-                        // 跨重启延续：从 meta 恢复上次成功更新时刻
+                        // Persist across restarts: recover the last successful update instant from meta
                         let base_dt = self
                             .dir
                             .read_meta(&entry.config.name)
@@ -280,13 +283,13 @@ impl RuleSetScheduler {
         }
     }
 
-    /// 最近触发时刻（无条目时睡较长间隔防御）。
+    /// Nearest trigger instant (sleep a long interval defensively when there are no entries).
     fn next_instant(&self) -> TokioInstant {
         let now = TokioInstant::now();
         let mut nearest: Option<TokioInstant> = None;
         for e in &self.entries {
             if e.next <= now {
-                // 已到点，立即返回（下一轮处理）
+                // Already due, return immediately (processed in the next round)
                 return now;
             }
             nearest = Some(nearest.map_or(e.next, |n: TokioInstant| n.min(e.next)));
@@ -294,8 +297,8 @@ impl RuleSetScheduler {
         nearest.unwrap_or_else(|| now + Duration::from_secs(3600))
     }
 
-    /// 处理一个到点条目：执行更新、更新上次成功时刻并排下次。
-    /// 返回是否成功更新（用于决定是否发通知）。
+    /// Process a due entry: run the update, advance the last-success instant, and schedule the next one.
+    /// Returns whether the update succeeded (used to decide whether to notify).
     async fn process_entry(&mut self, idx: usize, now: TokioInstant, updater: &UpdateFn) -> bool {
         let (config, kind) = {
             let e = &self.entries[idx];
@@ -310,7 +313,7 @@ impl RuleSetScheduler {
         match updater(&config, &self.dir, proxy).await {
             Ok(_outcome) => {
                 info!(name = %config.name, "rule set update succeeded");
-                // 成功：基准前移为当前时刻
+                // Success: advance the base to the current instant
                 self.last_success.lock().await.insert(config.name.clone(), now);
                 let next = match &kind {
                     TriggerKind::Time { hh, mm } => {
@@ -328,8 +331,8 @@ impl RuleSetScheduler {
             }
             Err(err) => {
                 warn!(name = %config.name, error = %err, "rule set update failed; period base not consumed");
-                // 失败不消耗周期：period 基准仍为上次成功更新（若无则为当前），
-                // 取下一个未来周期点（避免空转重试）；time 顺延次日。
+                // Failure does not consume the period: the period base stays at the last successful update (or now if none),
+                // and the next future period point is taken (avoiding spin retries); time rolls over to the next day.
                 let next = match &kind {
                     TriggerKind::Time { hh, mm } => {
                         let nl = Local::now();
@@ -356,7 +359,7 @@ impl RuleSetScheduler {
         }
     }
 
-    /// 立即触发一次更新（update_on_start 条目，独立任务）。
+    /// Trigger an update immediately (for update_on_start entries, as an independent task).
     fn spawn_immediate(&self, entry: Entry, updater: UpdateFn) {
         let dir = self.dir.clone();
         let resolver = self.proxy_resolver.clone();
@@ -371,7 +374,7 @@ impl RuleSetScheduler {
                 Ok(_) => {
                     info!(name = %name, "rule set update_on_start succeeded");
                     last_success.lock().await.insert(name, TokioInstant::now());
-                    // 先取局部值再 send，避免 Ref 读锁临时值与 send 写锁重入死锁。
+                    // Take a local value before send to avoid the Ref read lock deadlocking with the send write lock.
                     let next = notifier.borrow().wrapping_add(1);
                     let _ = notifier.send(next);
                 }
@@ -383,7 +386,7 @@ impl RuleSetScheduler {
     }
 }
 
-/// 生产更新执行器：调用 [`update_rule_set`]。
+/// Production update executor: calls [`update_rule_set`].
 fn default_updater() -> UpdateFn {
     Arc::new(|config, dir, proxy| {
         let config = config.clone();
@@ -392,7 +395,7 @@ fn default_updater() -> UpdateFn {
     })
 }
 
-/// 确定条目下载用的代理地址：显式 `proxy` > 缺省代理组；不可用 → 直连（告警）。
+/// Determine the proxy address used to download an entry: explicit `proxy` > default proxy group; unavailable → direct (with a warning).
 fn resolve_proxy_addr(
     config: &RuleSetConfig,
     resolver: &dyn ProxyResolver,
@@ -412,13 +415,13 @@ fn resolve_proxy_addr(
 }
 
 // ============================================================================
-// 时间计算辅助函数（纯函数，可单测）
+// Time-computation helper functions (pure, unit-testable)
 // ============================================================================
 
-/// 计算从 `now`（本地时间）起的下一个 `HH:MM` 触发时刻。
+/// Compute the next `HH:MM` trigger instant after `now` (local time).
 ///
-/// 若 `now` 当日该时刻已过（**含恰好相等**），则顺延次日（设计 §5.5）。
-/// 纯函数：`now` 由调用方注入，不依赖系统当前时刻。
+/// If that time on `now`'s day has already passed (**including exactly equal**), defer to the next day (design §5.5).
+/// Pure function: `now` is injected by the caller and does not depend on the system's current time.
 pub fn next_time_trigger(now: DateTime<Local>, hh: u8, mm: u8) -> DateTime<Local> {
     let naive = now
         .date_naive()
@@ -435,17 +438,17 @@ pub fn next_time_trigger(now: DateTime<Local>, hh: u8, mm: u8) -> DateTime<Local
     }
 }
 
-/// 从上一次成功更新时刻起计算下一次 `period` 触发时刻（失败不消耗周期）。
-/// 纯函数：`last_success` 由调用方注入。
+/// Compute the next `period` trigger instant after the last successful update (failures do not consume the period).
+/// Pure function: `last_success` is injected by the caller.
 pub fn next_period_trigger(last_success: DateTime<Local>, period: Duration) -> DateTime<Local> {
     last_success + ChronoDuration::from_std(period).expect("period fits chrono duration")
 }
 
-/// 计算下一个**未来**的周期触发点：`last_success + k * period`（`k` 为使结果
-/// 严格大于 `now` 的最小正整数）。
+/// Compute the next **future** period trigger point: `last_success + k * period` (where `k` is the smallest
+/// positive integer making the result strictly greater than `now`).
 ///
-/// 基准 `last_success` 不因失败改变（失败不消耗周期）；若基准时刻 + 周期的点
-/// 已经过去，则顺延到下一个周期点——避免失败后空转重试。
+/// The base `last_success` is not changed by failures (failures do not consume the period); if the point at
+/// base instant + period has already passed, defer to the next period point — avoiding spin retries after failures.
 fn next_period_point(
     last_success: TokioInstant,
     period: Duration,
@@ -460,7 +463,7 @@ fn next_period_point(
     last_success + period.saturating_mul(step.min(u32::MAX as u128) as u32)
 }
 
-/// 将本地时刻换算为单调时钟 `Instant`（相对 `now_local` / `now_inst`）。
+/// Convert a local time to a monotonic-clock `Instant` (relative to `now_local` / `now_inst`).
 fn local_to_instant(
     now_local: DateTime<Local>,
     now_inst: TokioInstant,
@@ -470,10 +473,10 @@ fn local_to_instant(
     now_inst + dur
 }
 
-/// 解析周期字符串（`3h2m` / `1d12h30m`）为 [`std::time::Duration`]。
+/// Parse a period string (`3h2m` / `1d12h30m`) into a [`std::time::Duration`].
 ///
-/// 与 [`crate::ruleset::types::parse_period`] 相同，此处 re-export 以便调度器
-/// 与外部经调度器命名空间访问。
+/// Same as [`crate::ruleset::types::parse_period`]; re-exported here so the scheduler
+/// and external callers can access it through the scheduler namespace.
 pub use crate::ruleset::types::parse_period;
 
 // ============================================================================
@@ -514,7 +517,7 @@ mod tests {
             .expect("valid local datetime")
     }
 
-    // ── 时间计算纯函数 ──
+    // ── Time-computation pure functions ──
 
     #[test]
     fn test_next_time_trigger_same_day() {
@@ -553,12 +556,12 @@ mod tests {
 
     #[test]
     fn test_parse_period_invalid() {
-        // 禁止秒
+        // seconds forbidden
         assert!(parse_period("1s").is_err());
         assert!(parse_period("3h2m5s").is_err());
         // Invalid unit
         assert!(parse_period("3x").is_err());
-        // 缺单位 / 缺数字 / 空 / 零
+        // missing unit / missing number / empty / zero
         assert!(parse_period("3").is_err());
         assert!(parse_period("h").is_err());
         assert!(parse_period("").is_err());
@@ -583,24 +586,24 @@ mod tests {
         let base = local(2026, 8, 3, 10, 0, 0);
         let next = next_period_trigger(base, Duration::from_secs(3 * 3600 + 2 * 60));
         assert_eq!(next, local(2026, 8, 3, 13, 2, 0));
-        // 跨天
+        // crosses a day
         let next2 = next_period_trigger(base, Duration::from_secs(86400));
         assert_eq!(next2, local(2026, 8, 4, 10, 0, 0));
     }
 
     #[tokio::test(start_paused = true)]
     async fn test_next_period_point_skips_past() {
-        // 基准 T，周期 1m；now = T + 61s（T+P 已过）→ 下一个周期点 T + 2m
+        // Base T, period 1m; now = T + 61s (T+P already passed) → next period point T + 2m
         let t = TokioInstant::now();
         let now = t + Duration::from_secs(61);
         let next = next_period_point(t, Duration::from_secs(60), now);
         assert_eq!(next, t + Duration::from_secs(120));
-        // 未到周期：now = T + 10s → 下一个周期点 T + 1m
+        // Before the period: now = T + 10s → next period point T + 1m
         let now2 = t + Duration::from_secs(10);
         assert_eq!(next_period_point(t, Duration::from_secs(60), now2), t + Duration::from_secs(60));
     }
 
-    // ── 调度器集成（paused 时间）──
+    // ── Scheduler integration (paused time) ──
 
     fn build_scheduler(
         dir: Arc<DataDir>,
@@ -622,11 +625,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_scheduler_update_on_start_fires_immediately() {
-        // update_on_start 条目在启动后立即异步触发（不等待调度周期）。
-        // 使用 paused 时间 + current_thread runtime：不依赖真实时钟 / OS 线程调度，
-        // 避免默认并行测试（--test-threads）下偶发卡死——原 multi_thread + yield_now
-        // 轮询 + 真实时钟 3s deadline 在高负载并行下无法保证后台任务及时被调度，
-        // 曾被观察到卡死超过 60s（阶段 5 修复）。
+        // update_on_start entries fire immediately and asynchronously after startup (without waiting for the schedule).
+        // Use paused time + a current_thread runtime: it does not depend on the real clock / OS thread scheduling,
+        // avoiding flaky hangs under the default parallel test runner (--test-threads) — the previous multi_thread + yield_now
+        // polling + a real-clock 3s deadline could not guarantee timely scheduling of the background task under
+        // high parallel load and was once observed to hang for over 60s (fixed in phase 5).
         let dir = Arc::new(DataDir::new(tempfile::tempdir().unwrap().path()));
         let calls = Arc::new(AtomicUsize::new(0));
         let updater: UpdateFn = {
@@ -643,8 +646,8 @@ mod tests {
         let (scheduler, _shutdown_tx, _notifier_rx) = build_scheduler(dir, None);
         let _handle = tokio::spawn(scheduler.run(vec![cfg], updater));
 
-        // Deterministic让出控制权：scheduler.run 完成初始化并触发 update_on_start 独立任务。
-        // 虚拟时钟推进（不依赖真实时间）；轮询设上限避免意外死循环。
+        // Deterministic yield of control: scheduler.run completes initialization and fires the update_on_start independent task.
+        // Advance the virtual clock (independent of real time); cap the polling to avoid accidental infinite loops.
         for _ in 0..100 {
             if calls.load(Ordering::SeqCst) >= 1 {
                 break;
@@ -654,8 +657,8 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "update_on_start should fire immediately");
 
-        // 不等待 handle：测试结束 runtime drop 自动清理后台Scheduled task；
-        // 优雅关停由 shutdown 测试覆盖。
+        // Do not await the handle: when the test ends, the runtime drop cleans up the background Scheduled task automatically;
+        // graceful shutdown is covered by the shutdown tests.
     }
 
     #[tokio::test(start_paused = true)]
@@ -669,23 +672,23 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         tokio::time::advance(Duration::from_millis(10)).await;
-        // Scheduled task应优雅退出
+        // The Scheduled task should exit gracefully
         handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn test_scheduler_shutdown_with_entry_real_time() {
-        // 非 paused（真实时间）：验证优雅关停能立即中断长 sleep（存在活跃条目时），
-        // 覆盖 ControlPlane.stop() 实际调用的场景。
+        // Not paused (real time): verify that graceful shutdown can promptly interrupt a long sleep (when there are active entries),
+        // covering the scenario ControlPlane.stop() actually calls.
         let dir = Arc::new(DataDir::new(tempfile::tempdir().unwrap().path()));
         let updater: UpdateFn = Arc::new(|_c, _d, _p| {
             Box::pin(async { Ok(UpdateOutcome::NotModified) })
         });
         let mut cfg = base_config("shutdown-entry");
-        cfg.update = Some(RuleSetUpdate::Period("1d".into())); // 长周期 → sleep 很久
+        cfg.update = Some(RuleSetUpdate::Period("1d".into())); // long period → sleeps for a long time
 
         let (scheduler, shutdown_tx, _notifier_rx) = build_scheduler(dir, None);
-        // 预置 last_success，避免 initial_next 读取磁盘 meta
+        // Pre-seed last_success to avoid initial_next reading disk meta
         scheduler
             .last_success
             .lock()
@@ -693,10 +696,10 @@ mod tests {
             .insert("shutdown-entry".into(), TokioInstant::now());
         let handle = tokio::spawn(scheduler.run(vec![cfg], updater));
 
-        // 让 run 完成初始化并进入 sleep
+        // Let run finish initialization and enter sleep
         tokio::task::yield_now().await;
         shutdown_tx.send(true).unwrap();
-        // 优雅关停应在超时内完成（中断 1d 的 sleep）
+        // Graceful shutdown should complete within the timeout (interrupting the 1d sleep)
         let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "scheduler should shut down promptly with an active entry");
     }

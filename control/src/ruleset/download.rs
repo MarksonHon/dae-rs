@@ -1,11 +1,11 @@
-//! Ruleset download器（设计 §4.2 / §4.3）。
+//! Ruleset downloader (design §4.2 / §4.3).
 //!
-//! - 直连 + 可选 SOCKS5 代理（reqwest `socks` feature；`socks5h://` 远程解析）。
-//! - 单次超时 30s，指数退避重试（默认 3 次，2s/4s/8s）。
-//! - ETag / Last-Modified 条件请求：返回 304 → 视为无需更新。
-//! - 下载后计算 sha256；提供期望 sha256 时强制校验；校验失败删除临时文件并报错。
+//! - Direct connection + optional SOCKS5 proxy (reqwest `socks` feature; `socks5h://` resolves remotely).
+//! - Single-request timeout of 30s, exponential backoff retries (3 by default, 2s/4s/8s).
+//! - ETag / Last-Modified conditional requests: a 304 response means no update is needed.
+//! - Computes sha256 after download; when an expected sha256 is provided, verification is enforced; on mismatch, deletes the temp file and returns an error.
 //!
-//! "经第一个代理组下载"的接入由后续子任务负责：本层只接收 `proxy_socks5` 地址。
+//! "Download via the first proxy group" is wired in by a later sub-task: this layer only receives a `proxy_socks5` address.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,14 +18,14 @@ use crate::ruleset::store::{DataDir, RuleSetMeta, RuleSetState, StoreError};
 use crate::ruleset::types::{RuleSetConfig, RuleSetData};
 use crate::ruleset::{parse_rule_set_data, RuleSetError};
 
-/// 下载选项。
+/// Download options.
 #[derive(Debug, Clone)]
 pub struct DownloadOptions {
-    /// 单次请求超时。
+    /// Per-request timeout.
     pub timeout: Duration,
-    /// 指数退避Retry count（默认 3 次，间隔 2s/4s/8s）。
+    /// Exponential-backoff retry count (3 by default, intervals 2s/4s/8s).
     pub max_retries: u32,
-    /// 重试基础延迟（默认 2s）。
+    /// Base retry delay (2s by default).
     pub retry_base_delay: Duration,
 }
 
@@ -39,22 +39,22 @@ impl Default for DownloadOptions {
     }
 }
 
-/// 下载结果信息。
+/// Download result information.
 #[derive(Debug, Clone)]
 pub struct DownloadedInfo {
     /// File size (bytes).
     pub size: u64,
-    /// 内容 sha256（十六进制小写）。
+    /// Content sha256 (lowercase hex).
     pub sha256: String,
-    /// 服务端 ETag（若有）。
+    /// Server ETag (if any).
     pub etag: Option<String>,
-    /// 服务端 Last-Modified（若有）。
+    /// Server Last-Modified (if any).
     pub last_modified: Option<String>,
-    /// 条件请求命中（304），内容未变更。
+    /// Conditional request hit (304); content unchanged.
     pub not_modified: bool,
 }
 
-/// 下载错误。
+/// Download error.
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("invalid proxy url '{url}': {detail}")]
@@ -71,24 +71,24 @@ pub enum DownloadError {
     Io { path: String, source: std::io::Error },
 }
 
-/// 更新结果。
+/// Update outcome.
 #[derive(Debug)]
 pub enum UpdateOutcome {
-    /// 已更新：携带新解析数据，供调用方重建内存缓存。
+    /// Updated: carries new parsed data for the caller to rebuild its in-memory cache.
     Updated(RuleSetData),
-    /// 未变更（304 或 sha256 与上次记录相同）。
+    /// Not changed (304 or sha256 identical to the last recorded value).
     NotModified,
 }
 
-/// 下载一个规则集文件到 `dest_tmp`（临时路径）。
+/// Download a rule set file to `dest_tmp` (a temporary path).
 ///
-/// * `url` — 数据源地址（http/https）。
-/// * `proxy_socks5` — 可选 SOCKS5 代理地址；`None` 为直连。
-/// * `dest_tmp` — 临时目标文件路径（校验通过前不落正式目录）。
-/// * `expected_sha256` — 若提供则强制校验，失败会删除临时文件并返回错误。
+/// * `url` — data source address (http/https).
+/// * `proxy_socks5` — optional SOCKS5 proxy address; `None` means direct connection.
+/// * `dest_tmp` — temporary destination file path (not written to the official directory until verification passes).
+/// * `expected_sha256` — if provided, verification is enforced; on failure, the temp file is deleted and an error is returned.
 ///
-/// 注意：调用方需保证 `dest_tmp` 的父目录存在（如 [`DataDir::tmp_file_path`]
-/// 与 [`DataDir::ensure_dirs`] 配合使用）。
+/// Note: the caller must ensure `dest_tmp`'s parent directory exists (e.g. by pairing
+/// [`DataDir::tmp_file_path`] with [`DataDir::ensure_dirs`]).
 pub async fn download(
     url: &str,
     proxy_socks5: Option<SocketAddr>,
@@ -107,7 +107,7 @@ pub async fn download(
     .await
 }
 
-/// 带条件请求与自定义选项的下载（供 [`update_rule_set`] 使用）。
+/// Download with conditional requests and custom options (used by [`update_rule_set`]).
 pub(crate) async fn download_with_meta(
     url: &str,
     proxy_socks5: Option<SocketAddr>,
@@ -176,7 +176,7 @@ async fn attempt_once(
         .map_err(|source| DownloadError::Request { url: req.url.clone(), source })?;
     let status = resp.status();
 
-    // 条件请求命中 → 内容未变更
+    // Conditional request hit → content unchanged
     if status == reqwest::StatusCode::NOT_MODIFIED {
         let etag = header_str(resp.headers(), reqwest::header::ETAG);
         let last_modified = header_str(resp.headers(), reqwest::header::LAST_MODIFIED);
@@ -227,9 +227,9 @@ fn header_str(headers: &reqwest::header::HeaderMap, name: reqwest::header::Heade
 
 fn is_retryable(e: &DownloadError) -> bool {
     match e {
-        // 网络/超时类错误可重试
+        // Network/timeout errors are retryable
         DownloadError::Request { .. } => true,
-        // 仅 5xx 服务端错误可重试；4xx / 校验失败等不重试
+        // Only 5xx server errors are retryable; 4xx / verification failures etc. are not
         DownloadError::HttpStatus { status, .. } => *status >= 500,
         _ => false,
     }
@@ -244,7 +244,7 @@ fn build_client(
         .connect_timeout(Duration::from_secs(10))
         .user_agent(format!("dae-rs/{}", env!("CARGO_PKG_VERSION")));
     if let Some(addr) = proxy_socks5 {
-        // socks5h：经代理解析目标Domain name（目标 URL 的 host 由代理侧解析）
+        // socks5h: resolve the target domain name via the proxy (the proxy side resolves the target URL's host)
         let proxy_url = format!("socks5h://{addr}");
         let proxy = reqwest::Proxy::all(&proxy_url)
             .map_err(|e| DownloadError::InvalidProxy { url: proxy_url, detail: e.to_string() })?;
@@ -255,12 +255,12 @@ fn build_client(
         .map_err(|e| DownloadError::ClientBuild(e.to_string()))
 }
 
-/// 更新一个规则集：下载 → 校验 → 解析校验（失败判损坏）→ 原子替换 →
-/// 更新 `.meta`/`.checksum` → 返回新数据（供调用方重建内存缓存）。
+/// Update a rule set: download → checksum → parse (failure marks it corrupt) → atomic replace →
+/// update `.meta`/`.checksum` → return the new data (for the caller to rebuild its in-memory cache).
 ///
-/// * `config` — 规则集配置条目（阶段 2 Configuration subsystem填充）。
-/// * `dir` — 数据目录。
-/// * `proxy_socks5` — 可选 SOCKS5 代理地址（后续子任务从"第一个代理组"解析后传入）。
+/// * `config` — the rule set configuration entry (filled in by the phase 2 Configuration subsystem).
+/// * `dir` — the data directory.
+/// * `proxy_socks5` — optional SOCKS5 proxy address (a later sub-task resolves it from the "first proxy group" and passes it in).
 pub async fn update_rule_set(
     config: &RuleSetConfig,
     dir: &DataDir,
@@ -290,7 +290,7 @@ pub async fn update_rule_set(
         return Ok(UpdateOutcome::NotModified);
     }
 
-    // 与上次记录校验和对比：相同则内容未变，无需替换
+    // Compare with the previously recorded checksum: if identical, the content is unchanged and no replace is needed
     if let Some(prev) = &prev_sha {
         if prev.eq_ignore_ascii_case(&info.sha256) {
             let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -299,7 +299,7 @@ pub async fn update_rule_set(
         }
     }
 
-    // 解析校验（dat 解码 / 文本解析失败判损坏，删除临时文件）
+    // Parse verification (dat decode / text parse failure marks the file corrupt; delete the temp file)
     let bytes = tokio::fs::read(&tmp_path).await.map_err(|source| {
         RuleSetError::Store(StoreError::Io { path: tmp_path.display().to_string(), source })
     })?;
@@ -321,11 +321,11 @@ pub async fn update_rule_set(
         }
     };
 
-    // 原子替换：.tmp → 正式文件
+    // Atomic replace: .tmp → official file
     let dest = dir.data_file_path(&config.name, config.r#type);
     dir.atomic_replace(&tmp_path, &dest).await?;
 
-    // 更新 checksum 与 meta
+    // Update checksum and meta
     dir.write_checksum(&config.name, &info.sha256).await?;
     let meta = RuleSetMeta {
         name: config.name.clone(),
@@ -356,7 +356,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    // ── 极简 HTTP 测试服务器（本地 TcpListener，Deterministic测试，无外部依赖）──
+    // ── Minimal HTTP test server (local TcpListener, deterministic tests, no external dependencies) ──
 
     struct MockResponse {
         status: u16,
@@ -380,7 +380,7 @@ mod tests {
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_flag = shutdown.clone();
             let handle = thread::spawn(move || {
-                // 轮询 accept：收到 shutdown 标志后退出，避免 Drop 时 join 挂起
+                // Poll accept: exit after receiving the shutdown flag, avoiding a hung join at Drop
                 while !shutdown_flag.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => handle_conn(stream, &responses),
@@ -401,7 +401,7 @@ mod tests {
 
     impl Drop for MockServer {
         fn drop(&mut self) {
-            // 设置关闭标志 → accept 循环退出 → join 可返回
+            // Set the shutdown flag → accept loop exits → join can return
             self.shutdown.store(true, Ordering::Release);
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
@@ -477,7 +477,7 @@ mod tests {
         let _ = stream.write_all(&resp.body);
     }
 
-    // ── 下载测试 ──
+    // ── Download tests ──
 
     #[test]
     fn test_mock_server_raw() {
@@ -541,7 +541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("file.tmp");
 
-        // 带上次 etag 的条件请求 → 304
+        // Conditional request with the previous etag → 304
         let info = download_with_meta(
             &server.url("/file"),
             None,
@@ -576,7 +576,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DownloadError::ChecksumMismatch { .. }));
-        // 校验失败 → 临时文件被删除
+        // Verification failure → temp file deleted
         assert!(!dest.exists());
     }
 
@@ -637,7 +637,7 @@ mod tests {
         assert!(matches!(err, DownloadError::Request { .. }));
     }
 
-    // ── 更新一个规则集（端到端）──
+    // ── Updating a rule set (end-to-end) ──
 
     #[tokio::test]
     async fn test_update_rule_set() {
@@ -665,7 +665,7 @@ mod tests {
             proxy: None,
         };
 
-        // 首次：下载 → 解析 → 原子替换 → 写 checksum/meta
+        // First: download → parse → atomic replace → write checksum/meta
         let outcome = update_rule_set(&cfg, &data_dir, None).await.unwrap();
         match outcome {
             UpdateOutcome::Updated(RuleSetData::IpList(nets)) => {
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(meta.url, cfg.url);
         assert!(meta.last_updated.is_some());
 
-        // 二次：条件请求（带 etag）→ 304 → NotModified
+        // Second: conditional request (with etag) → 304 → NotModified
         let outcome2 = update_rule_set(&cfg, &data_dir, None).await.unwrap();
         assert!(matches!(outcome2, UpdateOutcome::NotModified));
     }
@@ -698,7 +698,7 @@ mod tests {
     async fn test_update_rule_set_unchanged_skips_replace() {
         let body = b"1.1.1.0/24\n";
         let sha = crate::ruleset::sha256_hex(body);
-        // 无 etag：每次返回 200
+        // No etag: always returns 200
         let server = MockServer::start(HashMap::from([(
             "/a.txt".to_string(),
             MockResponse {
@@ -727,7 +727,7 @@ mod tests {
         let data_path = data_dir.data_file_path("a", RuleSetType::IpList);
         let mtime1 = std::fs::metadata(&data_path).unwrap().modified().unwrap();
 
-        // 内容相同（sha 与上次一致）→ NotModified，且不替换文件
+        // Content identical (sha matches the previous one) → NotModified, and the file is not replaced
         std::thread::sleep(Duration::from_millis(1100));
         let out2 = update_rule_set(&cfg, &data_dir, None).await.unwrap();
         assert!(matches!(out2, UpdateOutcome::NotModified));
@@ -737,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_rule_set_corrupt_rejected() {
-        // 服务器返回垃圾字节，无法解析为 IP 列表 → 判损坏，临时文件删除
+        // Server returns garbage bytes that cannot be parsed as an IP list → marked corrupt, temp file deleted
         let server = MockServer::start(HashMap::from([(
             "/bad.txt".to_string(),
             MockResponse {
@@ -762,7 +762,7 @@ mod tests {
 
         let err = update_rule_set(&cfg, &data_dir, None).await.unwrap_err();
         assert!(matches!(err, RuleSetError::List(_)));
-        // 正式文件未被创建，临时文件被清理
+        // The official file was not created, and the temp file was cleaned up
         assert!(!data_dir.data_file_path("bad", RuleSetType::IpList).exists());
         assert!(dir.path().join(".tmp").read_dir().unwrap().next().is_none());
     }

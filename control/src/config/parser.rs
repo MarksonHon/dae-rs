@@ -50,8 +50,8 @@ enum ParseState {
     DnsGroupUpstream(String), // group_name
     /// Inside dns > routing block (DNS routing)
     DnsRouting,
-    /// Inside dns group > response_routing block
-    DnsGroupResponseRouting(String), // group_name
+    /// Inside dns > response_action block (module-level response filtering)
+    DnsResponseAction,
     // ── Rule set states ──
     /// Inside rule_set section
     RuleSet,
@@ -124,7 +124,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
         send_by: String::new(),
         query_mode: DnsQueryMode::default(),
         upstream: Vec::new(),
-        response_routing: None,
     };
     let mut current_dns_route_rules: Vec<DnsRouteRule> = Vec::new();
     let mut current_dns_route_fallback = String::new();
@@ -198,7 +197,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                             let port: u16 = value.parse().map_err(|_| ConfigError::FieldType {
                                 line: line_number,
                                 field: key.into(),
-                                message: format!("无法解析为整数: '{}'", value),
+                                message: format!("cannot parse as integer: '{}'", value),
                             })?;
                             config.runtime.tproxy_port = port;
                         }
@@ -208,7 +207,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         _ => {
                             return Err(ConfigError::Syntax {
                                 line: line_number,
-                                message: format!("未知 global 字段: '{}'", key),
+                                message: format!("unknown global field: '{}'", key),
                             });
                         }
                     }
@@ -497,7 +496,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                                 ConfigError::FieldType {
                                     line: line_number,
                                     field: key.into(),
-                                    message: format!("无法解析为整数: '{}'", value),
+                                    message: format!("cannot parse as integer: '{}'", value),
                                 }
                             })?);
                         }
@@ -524,14 +523,14 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                                 ConfigError::FieldType {
                                     line: line_number,
                                     field: key.into(),
-                                    message: format!("无法解析为整数: '{}'", value),
+                                    message: format!("cannot parse as integer: '{}'", value),
                                 }
                             })?;
                         }
                         _ => {
                             return Err(ConfigError::Syntax {
                                 line: line_number,
-                                message: format!("未知节点字段: '{}'", key),
+                                message: format!("unknown node field: '{}'", key),
                             });
                         }
                     }
@@ -747,6 +746,11 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                             current_dns_route_fallback.clear();
                             state = ParseState::DnsRouting;
                         }
+                        "response_action" => {
+                            current_dns_resp_rules.clear();
+                            current_dns_resp_fallback = "accept".into();
+                            state = ParseState::DnsResponseAction;
+                        }
                         _ => {
                             return Err(ConfigError::Syntax {
                                 line: line_number,
@@ -925,7 +929,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                             send_by: String::new(),
                             query_mode: DnsQueryMode::default(),
                             upstream: Vec::new(),
-                            response_routing: None,
                         };
                         state = ParseState::DnsGroup(name.clone());
                         continue;
@@ -946,7 +949,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         send_by: String::new(),
                         query_mode: DnsQueryMode::default(),
                         upstream: Vec::new(),
-                        response_routing: None,
                     });
                     if let Some(ref mut dns) = current_dns_config {
                         dns.groups.push(group);
@@ -959,11 +961,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     match section_name {
                         "upstream" => {
                             state = ParseState::DnsGroupUpstream(group_name.clone());
-                        }
-                        "response_routing" => {
-                            current_dns_resp_rules.clear();
-                            current_dns_resp_fallback = "accept".into();
-                            state = ParseState::DnsGroupResponseRouting(group_name.clone());
                         }
                         _ => {
                             return Err(ConfigError::Syntax {
@@ -1046,14 +1043,16 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 });
             }
 
-            // ── dns group > response_routing ──
-            ParseState::DnsGroupResponseRouting(group_name) => {
+            // ── dns > response_action (module-level response filtering) ──
+            ParseState::DnsResponseAction => {
                 if line == "}" {
-                    current_dns_group.response_routing = Some(DnsGroupResponseRouting {
-                        rules: std::mem::take(&mut current_dns_resp_rules),
-                        fallback: std::mem::take(&mut current_dns_resp_fallback),
-                    });
-                    state = ParseState::DnsGroup(group_name.clone());
+                    if let Some(ref mut dns) = current_dns_config {
+                        dns.response_action = Some(DnsResponseActionConfig {
+                            rules: std::mem::take(&mut current_dns_resp_rules),
+                            fallback: std::mem::take(&mut current_dns_resp_fallback),
+                        });
+                    }
+                    state = ParseState::Dns;
                     continue;
                 }
                 // Handle fallback: action
@@ -1075,7 +1074,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 }
                 return Err(ConfigError::Syntax {
                     line: line_number,
-                    message: format!("expected response routing rule or fallback, got: '{}'", line),
+                    message: format!("expected response action rule or fallback, got: '{}'", line),
                 });
             }
 

@@ -213,7 +213,7 @@ routing {
   fallback: proxy(g)
 }
 "#;
-        let config = parse_daefile(input).expect("解析失败");
+        let config = parse_daefile(input).expect("parse failed");
         let err = validate_config(&config).unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateNode { .. }));
     }
@@ -249,7 +249,7 @@ routing {
   fallback: proxy(g)
 }
 "#;
-        let config = parse_daefile(input).expect("解析失败");
+        let config = parse_daefile(input).expect("parse failed");
         let err = validate_config(&config).unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateGroup { .. }));
     }
@@ -281,7 +281,7 @@ routing {
   fallback: proxy(g)
 }
 "#;
-        let config = parse_daefile(input).expect("解析失败");
+        let config = parse_daefile(input).expect("parse failed");
         let err = validate_config(&config).unwrap_err();
         assert!(matches!(err, ConfigError::UnknownNode { .. }));
     }
@@ -314,7 +314,7 @@ routing {
   fallback: proxy(g)
 }
 "#;
-        let config = parse_daefile(input).expect("解析失败");
+        let config = parse_daefile(input).expect("parse failed");
         let err = validate_config(&config).unwrap_err();
         assert!(matches!(err, ConfigError::UnknownGroup { .. }));
     }
@@ -346,7 +346,7 @@ routing {
   fallback: invalid_action
 }
 "#;
-        let config = parse_daefile(input).expect("解析失败");
+        let config = parse_daefile(input).expect("parse failed");
         let err = validate_config(&config).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
@@ -378,7 +378,7 @@ routing {
   fallback: proxy(g)
 }
 "#;
-        let config = parse_daefile(input).expect("解析失败");
+        let config = parse_daefile(input).expect("parse failed");
         let err = validate_config(&config).unwrap_err();
         assert!(matches!(err, ConfigError::SelectMissingSelected { .. }));
     }
@@ -477,7 +477,7 @@ routing {
   fallback: proxy(g)
 }
 "#;
-        let config = parse_daefile(input).expect("解析失败");
+        let config = parse_daefile(input).expect("parse failed");
         let err = validate_config(&config).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
@@ -1277,14 +1277,13 @@ routing {
         assert!(matches.contains(&"target_domain(geosite:cn)"));
         assert!(matches.contains(&"target_domain(set:chinadomain)"));
 
-        // DNS query Routing / response Routing references
+        // DNS query Routing / module-level response action references
         let dns = config.dns.as_ref().expect("dns config");
         assert!(
             dns.routing.rules.iter().any(|r| r.r#match == "qname(set:chinadomain)"),
             "DNS query routing should reference set:chinadomain"
         );
-        let trusted = dns.groups.iter().find(|g| g.name == "trusted_dns").unwrap();
-        let resp = trusted.response_routing.as_ref().expect("response_routing");
+        let resp = dns.response_action.as_ref().expect("response_action");
         assert!(resp.rules.iter().any(|r| r.r#match == "ip(set:chinaip)"));
     }
 

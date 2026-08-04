@@ -1305,8 +1305,8 @@ impl EbpfManager {
             776 |    // ARPHRD_SIT
             778 |    // ARPHRD_IPIP
             65534    // ARPHRD_NONE
-            => Ok(0),   // L3: 无链路头
-            _ => Ok(14), // L2: 默认以太网头 (与 dae 一致)
+            => Ok(0),   // L3: no link header
+            _ => Ok(14), // L2: default ethernet header (consistent with dae)
         }
     }
 

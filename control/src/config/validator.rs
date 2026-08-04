@@ -68,7 +68,7 @@ pub fn validate_config(config: &DaefileConfig) -> std::result::Result<(), Config
 fn validate_structure(config: &DaefileConfig) -> std::result::Result<(), ConfigError> {
     if config.outbounds.nodes.is_empty() && config.outbounds.groups.is_empty() {
         return Err(ConfigError::MissingSection {
-            section: "outbounds (至少一个节点和一个组)".into(),
+            section: "outbounds (at least one node and one group)".into(),
         });
     }
     if config.routing.fallback.is_empty() {
@@ -238,7 +238,7 @@ fn validate_node_fields(config: &DaefileConfig) -> std::result::Result<(), Confi
         if !SUPPORTED_PROTOCOLS.contains(&node.protocol.as_str()) {
             return Err(ConfigError::InvalidValue {
                 line: 0,
-                field: format!("节点 '{}'.protocol", node.name),
+                field: format!("node '{}'.protocol", node.name),
                 message: format!(
                     "unsupported protocol '{}', supported protocols: {}",
                     node.protocol,
@@ -250,14 +250,14 @@ fn validate_node_fields(config: &DaefileConfig) -> std::result::Result<(), Confi
         if node.address.is_empty() {
             return Err(ConfigError::FieldType {
                 line: 0,
-                field: format!("节点 '{}'.address", node.name),
+                field: format!("node '{}'.address", node.name),
                 message: "address must not be empty".into(),
             });
         }
         // Protocol-specific required fields
         let missing = |field: &str| ConfigError::InvalidValue {
             line: 0,
-            field: format!("节点 '{}'.{}", node.name, field),
+            field: format!("node '{}'.{}", node.name, field),
             message: format!(
                 "missing required field '{}' for protocol '{}'",
                 field, node.protocol
@@ -475,18 +475,22 @@ fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
                 group: group.name.clone(),
             });
         }
+    }
 
-        // Validate response_routing
-        if let Some(ref resp) = group.response_routing {
-            if resp.fallback != "accept" && resp.fallback != "reject" {
-                // Could also be an upstream label for requery
-                let upstream_labels: std::collections::HashSet<&str> =
-                    group.upstream.iter().map(|u| u.label.as_str()).collect();
-                if !upstream_labels.contains(resp.fallback.as_str()) {
-                    return Err(ConfigError::DnsUnknownGroup {
-                        group: resp.fallback.clone(),
-                    });
-                }
+    // Validate module-level response_action: fallback must be `accept`, `reject`,
+    // or an upstream label that exists in at least one group (requery targets an
+    // upstream within the group that answered).
+    if let Some(ref resp) = dns.response_action {
+        if resp.fallback != "accept" && resp.fallback != "reject" {
+            let all_upstream_labels: std::collections::HashSet<&str> = dns
+                .groups
+                .iter()
+                .flat_map(|g| g.upstream.iter().map(|u| u.label.as_str()))
+                .collect();
+            if !all_upstream_labels.contains(resp.fallback.as_str()) {
+                return Err(ConfigError::DnsUnknownGroup {
+                    group: resp.fallback.clone(),
+                });
             }
         }
     }
@@ -516,7 +520,7 @@ fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
 /// 2. URL protocol / `#sha256=` validation → E2105;
 /// 3. `update` missing / invalid time format (includes seconds) / `period` invalid unit → E2104;
 /// 4. reference integrity (`set:`/`geoip:`/`geosite:` in data plane / DNS routing / DNS response Routing)
-///    → E2102（§8.2）。
+///    → E2102 (§8.2).
 ///
 /// E2103 (compile-time data missing) triggered by matcher / DNS routing at compile phase.
 fn validate_rule_set(config: &DaefileConfig) -> std::result::Result<(), ConfigError> {
@@ -629,16 +633,14 @@ fn validate_ruleset_refs(
         check_expr(&rule.r#match)?;
     }
 
-    // DNS top-level Routing + intra-group response Routing
+    // DNS top-level Routing + module-level response_action expressions
     if let Some(dns) = &config.dns {
         for rule in &dns.routing.rules {
             check_expr(&rule.r#match)?;
         }
-        for group in &dns.groups {
-            if let Some(resp) = &group.response_routing {
-                for rule in &resp.rules {
-                    check_expr(&rule.r#match)?;
-                }
+        if let Some(resp) = &dns.response_action {
+            for rule in &resp.rules {
+                check_expr(&rule.r#match)?;
             }
         }
     }

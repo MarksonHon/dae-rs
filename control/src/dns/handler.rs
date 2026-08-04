@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use protocols::OutboundDialer;
 use crate::dns::upstream::query_dns_via_proxy;
 use crate::ruleset::cache::RuleSetCache;
-use crate::ruleset::refparse::{match_domain_patterns, match_qname_value, parse_ref, RuleSetRef};
+use crate::ruleset::refparse::{match_qname_value, parse_ref, RuleSetRef};
 
 // ============================================================================
 // Linux socket option constants for IP_TRANSPARENT
@@ -942,13 +942,13 @@ async fn handle_dns_internal(
         }
     };
 
-    // Apply response routing against the upstream that actually produced the
-    // winning response, so `upstream(<label>)` conditions match correctly.
+    // Apply the module-level response action against the upstream that actually
+    // produced the winning response, so `upstream(<label>)` conditions match
+    // correctly.
     let action = check_dns_response(
         &response,
         &qname,
-        &route.group,
-        router,
+        &config.response_action,
         &upstream_label,
         rule_set_cache,
     );
@@ -1153,22 +1153,25 @@ fn extract_answer_addrs(response: &[u8]) -> Vec<(IpAddr, u32)> {
     out
 }
 
-/// Check DNS response routing
+/// Apply the module-level DNS response action to a response.
+///
+/// The action is configured at the `dns` level (not per-group) and applies to
+/// the response of whichever group answered. Rules match against the response
+/// and the answering upstream's label; actions are `accept`, `reject`, or an
+/// upstream label to requery within the answering group.
 fn check_dns_response(
     response: &[u8],
     qname: &str,
-    group: &crate::config::DnsGroupConfig,
-    #[allow(unused)] router: &Arc<DnsRouter>,
+    response_action: &Option<crate::config::DnsResponseActionConfig>,
     upstream_label: &str,
     rule_set_cache: &RuleSetCache,
 ) -> DnsResponseAction {
-    let routing = match &group.response_routing {
-        Some(r) => r,
-        None => return DnsResponseAction::Accept,
+    let Some(action_cfg) = response_action else {
+        return DnsResponseAction::Accept;
     };
 
     // Check response rules
-    for rule in &routing.rules {
+    for rule in &action_cfg.rules {
         let raw = rule.r#match.trim();
         let action = rule.action.trim();
 
@@ -1195,7 +1198,7 @@ fn check_dns_response(
     }
 
     // Fallback
-    match routing.fallback.as_str() {
+    match action_cfg.fallback.as_str() {
         "accept" => DnsResponseAction::Accept,
         "reject" => DnsResponseAction::Reject,
         upstream => DnsResponseAction::Requery(upstream.to_string()),
@@ -1273,7 +1276,7 @@ fn eval_atomic_condition(
         }
     }
 
-    // nocontent（NODATA）
+    // nocontent (NODATA)
     if cond == "nocontent" {
         if response.len() < 12 {
             return true;
@@ -1309,23 +1312,27 @@ fn eval_atomic_condition(
 fn eval_ip_condition(inner: &str, addrs: &[(IpAddr, u32)], rule_set_cache: &RuleSetCache) -> bool {
     for val in split_condition_params(inner) {
         let hit = match parse_ref(val) {
-            RuleSetRef::GeoIp(code) => match rule_set_cache.find_geoip_code(&code) {
-                Some(nets) => addrs.iter().any(|(ip, _)| nets.iter().any(|n| n.contains(ip))),
-                None => {
-                    warn!(code = %code, "DNS response ip(geoip:...) code not found; no match");
-                    false
+            // Compiled matching: O(log N) via merged range binary search.
+            RuleSetRef::GeoIp(code) => {
+                let hit = addrs.iter().any(|(ip, _)| rule_set_cache.geoip_contains(&code, *ip));
+                if !hit {
+                    // Keep the not-found warning for diagnostics (the set may genuinely be empty).
+                    if !rule_set_cache.find_geoip_code(&code).is_some_and(|n| !n.is_empty()) {
+                        warn!(code = %code, "DNS response ip(geoip:...) code not found; no match");
+                    }
                 }
-            },
-            RuleSetRef::Set(name) => match rule_set_cache.get_set_ips(&name) {
-                Some(nets) => addrs.iter().any(|(ip, _)| nets.iter().any(|n| n.contains(ip))),
-                None => {
+                hit
+            }
+            RuleSetRef::Set(name) => {
+                let hit = addrs.iter().any(|(ip, _)| rule_set_cache.ip_set_contains(&name, *ip));
+                if !hit && rule_set_cache.get_set_ips(&name).is_none() {
                     warn!(
                         name = %name,
                         "DNS response ip(set:...) not found or not an ip_list; no match"
                     );
-                    false
                 }
-            },
+                hit
+            }
             RuleSetRef::GeoSite(code) => {
                 warn!(code = %code, "DNS response ip(geosite:...) is invalid; no match");
                 false
@@ -1356,23 +1363,24 @@ fn eval_ip_condition(inner: &str, addrs: &[(IpAddr, u32)], rule_set_cache: &Rule
 fn eval_qname_condition(inner: &str, qname: &str, rule_set_cache: &RuleSetCache) -> bool {
     for val in split_condition_params(inner) {
         let hit = match parse_ref(val) {
-            RuleSetRef::GeoSite(code) => match rule_set_cache.find_geosite_code(&code) {
-                Some(patterns) => match_domain_patterns(qname, &patterns),
-                None => {
+            // Compiled matching: O(qname labels) via suffix trie.
+            RuleSetRef::GeoSite(code) => {
+                let hit = rule_set_cache.geosite_matches(&code, qname);
+                if !hit && rule_set_cache.find_geosite_code(&code).is_none() {
                     warn!(code = %code, "DNS response qname(geosite:...) code not found; no match");
-                    false
                 }
-            },
-            RuleSetRef::Set(name) => match rule_set_cache.get_set_domains(&name) {
-                Some(patterns) => match_domain_patterns(qname, &patterns),
-                None => {
+                hit
+            }
+            RuleSetRef::Set(name) => {
+                let hit = rule_set_cache.domain_set_matches(&name, qname);
+                if !hit && rule_set_cache.get_set_domains(&name).is_none() {
                     warn!(
                         name = %name,
                         "DNS response qname(set:...) not found or not a domain_list; no match"
                     );
-                    false
                 }
-            },
+                hit
+            }
             RuleSetRef::GeoIp(code) => {
                 warn!(code = %code, "DNS response qname(geoip:...) is invalid; no match");
                 false
@@ -1622,8 +1630,8 @@ async fn bind_tcp_with_reuseaddr(addr: SocketAddr) -> anyhow::Result<tokio::net:
 ///
 /// Create IP_TRANSPARENT UDP socket for DNS response (bound to orig_dst).
 ///
-/// 统一委托 [`protocols::hostns::create_transparent_udp`] 实现“dae-rs 自身
-/// 流量必须直连”的约定（SO_MARK=0x100 自排除 + 宿主 NS）。
+/// Uniformly delegates to [`protocols::hostns::create_transparent_udp`] to implement the
+/// "dae-rs's own traffic must go direct" convention (SO_MARK=0x100 self-exclusion + host NS).
 async fn create_marked_udp_socket_for_dns(
     orig_dst: SocketAddr,
     _mark: u32,
@@ -1728,37 +1736,37 @@ mod tests {
     #[test]
     fn test_response_ip_geoip() {
         let resp = make_a_response("www.test.com", &["1.0.1.5".parse().unwrap()]);
-        assert!(eval("ip(geoip:cn)", "www.test.com", &resp, "u1"), "geoip:cn 命中");
-        assert!(eval("ip(geoip:CN)", "www.test.com", &resp, "u1"), "大小写不敏感");
-        assert!(eval("ip(geoip:cn)", "www.test.com", &[], "u1") == false, "空响应不命中");
+        assert!(eval("ip(geoip:cn)", "www.test.com", &resp, "u1"), "geoip:cn matched");
+        assert!(eval("ip(geoip:CN)", "www.test.com", &resp, "u1"), "case insensitive");
+        assert!(eval("ip(geoip:cn)", "www.test.com", &[], "u1") == false, "empty response does not match");
     }
 
     #[test]
     fn test_response_ip_set() {
         let resp = make_a_response("www.test.com", &["10.1.1.1".parse().unwrap()]);
-        assert!(eval("ip(set:chinaip)", "www.test.com", &resp, "u1"), "set:chinaip 命中");
+        assert!(eval("ip(set:chinaip)", "www.test.com", &resp, "u1"), "set:chinaip matched");
     }
 
     #[test]
     fn test_response_ip_plain_cidr_and_miss() {
         let resp = make_a_response("www.test.com", &["8.8.8.8".parse().unwrap()]);
-        assert!(eval("ip(8.8.8.0/24)", "www.test.com", &resp, "u1"), "普通 CIDR 命中");
-        assert!(!eval("ip(geoip:cn)", "www.test.com", &resp, "u1"), "geoip 未命中");
+        assert!(eval("ip(8.8.8.0/24)", "www.test.com", &resp, "u1"), "plain CIDR matched");
+        assert!(!eval("ip(geoip:cn)", "www.test.com", &resp, "u1"), "geoip not matched");
     }
 
     #[test]
     fn test_response_qname_geosite() {
         let resp = make_a_response("www.baidu.com", &["1.2.3.4".parse().unwrap()]);
         assert!(eval("qname(geosite:cn)", "www.baidu.com", &resp, "u1"));
-        assert!(eval("qname(geosite:cn)", "WWW.BAIDU.COM", &resp, "u1"), "大小写不敏感");
+        assert!(eval("qname(geosite:cn)", "WWW.BAIDU.COM", &resp, "u1"), "case insensitive");
         assert!(!eval("qname(geosite:cn)", "www.google.com", &resp, "u1"));
     }
 
     #[test]
     fn test_response_qname_set() {
         let resp = make_a_response("example.cn", &["1.2.3.4".parse().unwrap()]);
-        assert!(eval("qname(set:chinadom)", "example.cn", &resp, "u1"), "set full 命中");
-        assert!(!eval("qname(set:chinadom)", "sub.example.cn", &resp, "u1"), "full 不含子域");
+        assert!(eval("qname(set:chinadom)", "example.cn", &resp, "u1"), "set full matched");
+        assert!(!eval("qname(set:chinadom)", "sub.example.cn", &resp, "u1"), "full does not include subdomain");
     }
 
     #[test]
@@ -1777,7 +1785,7 @@ mod tests {
     fn test_response_unknown_condition_false() {
         // Fix defect 5: unknown condition defaults to false (no longer always true)
         let resp = make_a_response("www.test.com", &["1.2.3.4".parse().unwrap()]);
-        assert!(!eval("bogus(x)", "www.test.com", &resp, "u1"), "未知条件应 false");
+        assert!(!eval("bogus(x)", "www.test.com", &resp, "u1"), "unknown condition should be false");
         assert!(!eval("ip(geoip:unknown-code)", "www.test.com", &resp, "u1"));
     }
 

@@ -1,19 +1,19 @@
-//! 规则集内存数据结构与配置条目类型。
+//! Rule set in-memory data structures and configuration entry types.
 //!
-//! 本模块只定义数据与配置类型，不参与任何 matcher / DNS / parser 接线
-//! （由后续子任务接入）。
+//! This module only defines data and configuration types; it does not take part in any
+//! matcher / DNS / parser wiring (handled by later sub-tasks).
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// 规则集数据类型（对应配置条目 `type` 字段）。
+/// Rule set data type (corresponds to the `type` field of a configuration entry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleSetType {
-    /// dat 数据：geoip（`GeoIPList`）。
+    /// dat data: geoip (`GeoIPList`).
     #[serde(rename = "geoip")]
     GeoIp,
-    /// dat 数据：geosite（`GeoSiteList`）。
+    /// dat data: geosite (`GeoSiteList`).
     #[serde(rename = "geosite")]
     GeoSite,
     /// Text domain list.
@@ -25,7 +25,7 @@ pub enum RuleSetType {
 }
 
 impl RuleSetType {
-    /// 文件类型后缀：dat → `.dat`，文本 → `.txt`。
+    /// File type extension: dat → `.dat`, text → `.txt`.
     pub fn file_extension(&self) -> &'static str {
         match self {
             RuleSetType::GeoIp | RuleSetType::GeoSite => ".dat",
@@ -33,7 +33,7 @@ impl RuleSetType {
         }
     }
 
-    /// 与配置 `type` 字符串一致的名字（日志/诊断用）。
+    /// Name matching the configuration `type` string (for logs / diagnostics).
     pub fn as_str(&self) -> &'static str {
         match self {
             RuleSetType::GeoIp => "geoip",
@@ -44,59 +44,59 @@ impl RuleSetType {
     }
 }
 
-/// Domain name模式类型。
+/// Domain name pattern type.
 ///
-/// 对齐 v2ray `DomainType`（Plain/Regex/Domain/Full）与文本列表前缀
-/// （`suffix:`/`keyword:`/`full:`/`domain:`/`regex:`）。
+/// Aligned with the v2ray `DomainType` (Plain/Regex/Domain/Full) and text-list prefixes
+/// (`suffix:`/`keyword:`/`full:`/`domain:`/`regex:`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DomainPatternType {
-    /// 后缀匹配，含自身（v2ray Plain；文本无前缀或 `suffix:`）。
+    /// Suffix match, including itself (v2ray Plain; text with no prefix or `suffix:`).
     Suffix,
-    /// 子串匹配（文本 `keyword:`）。
+    /// Substring match (text `keyword:`).
     Keyword,
-    /// 精确匹配（v2ray Full；文本 `full:`）。
+    /// Exact match (v2ray Full; text `full:`).
     Full,
-    /// 正则匹配（v2ray Regex；文本 `regex:`）。
+    /// Regex match (v2ray Regex; text `regex:`).
     Regex,
-    /// 子域匹配，不含自身（v2ray Domain；文本 `domain:`）。
+    /// Subdomain match, excluding itself (v2ray Domain; text `domain:`).
     Domain,
 }
 
-/// 单条Domain name模式。
+/// A single domain name pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainPattern {
-    /// 模式类型。
+    /// Pattern type.
     pub pattern_type: DomainPatternType,
-    /// 模式值（Domain name / 关键字 / 正则表达式）。
+    /// Pattern value (domain name / keyword / regular expression).
     pub value: String,
 }
 
-/// Ruleset scheduler表达式（设计 §5.4）。
+/// Rule set scheduler expression (design §5.4).
 ///
-/// `update` 字段为**互斥二选一**：
-/// - `time: HH:MM` — 每天本地时区该时刻触发一次；
-/// - `period: 3h2m` — 周期触发（`d`/`h`/`m` 组合，最小单位分钟，**禁止秒**）。
+/// The `update` field is **mutually exclusive between two options**:
+/// - `time: HH:MM` — triggers once daily at that time in the local timezone;
+/// - `period: 3h2m` — periodic trigger (`d`/`h`/`m` combinations, minimum unit minutes, **seconds forbidden**).
 ///
-/// 枚举保存**原始文本**（而非解析后的值），这样配置校验器（E2104）能在
-/// `update` 层面报告格式错误（时间/周期非法、含秒等），而调度器经
-/// [`parse_time`] / [`parse_period`] 纯函数解析为结构化数据。
+/// The enum stores the **raw text** (rather than parsed values), so the configuration validator (E2104) can
+/// report format errors at the `update` level (invalid time/period, contains seconds, etc.), while the
+/// scheduler parses it into structured data via the [`parse_time`] / [`parse_period`] pure functions.
 ///
-/// JSON 表示为 `{ "time": "21:47" }` / `{ "period": "3h2m" }`
-/// （serde 枚举带 payload + `rename` 天然匹配该布局）。
+/// JSON representation: `{ "time": "21:47" }` / `{ "period": "3h2m" }`
+/// (a serde enum with payload + `rename` naturally matches this layout).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleSetUpdate {
-    /// 每天本地时区 `HH:MM`（00-23:00-59，无秒）触发一次。
+    /// Trigger once daily at `HH:MM` (00-23:00-59, no seconds) in the local timezone.
     #[serde(rename = "time")]
     Time(String),
-    /// 周期触发：`d`/`h`/`m` 组合（如 `3h2m`、`1d12h30m`），最小单位分钟，禁止秒。
+    /// Periodic trigger: `d`/`h`/`m` combinations (e.g. `3h2m`, `1d12h30m`), minimum unit minutes, seconds forbidden.
     #[serde(rename = "period")]
     Period(String),
 }
 
-/// 解析 `HH:MM` 时间字符串为 `(时, 分)`。
+/// Parse an `HH:MM` time string into `(hour, minute)`.
 ///
-/// 校验：严格 `HH:MM`，小时 00-23，分钟 00-59；**不允许秒**。
-/// 纯函数，供 validator（E2104）与调度器使用，可独立单测。
+/// Validation: strict `HH:MM`, hours 00-23, minutes 00-59; **seconds are not allowed**.
+/// Pure function, used by the validator (E2104) and the scheduler; unit-testable independently.
 pub fn parse_time(hhmm: &str) -> Result<(u8, u8), String> {
     let s = hhmm.trim();
     let (hh, mm) = s
@@ -125,10 +125,10 @@ pub fn parse_time(hhmm: &str) -> Result<(u8, u8), String> {
     Ok((hh, mm))
 }
 
-/// 解析周期字符串（`3h2m`、`1d12h30m`）为 [`std::time::Duration`]。
+/// Parse a period string (`3h2m`, `1d12h30m`) into a [`std::time::Duration`].
 ///
-/// 支持单位 `d`（天）/ `h`（小时）/ `m`（分钟），可任意组合；**最小单位为分钟，
-/// 禁止秒**。纯函数，供 validator（E2104）与调度器使用，可独立单测。
+/// Supports the units `d` (days) / `h` (hours) / `m` (minutes) in any combination; **the minimum unit
+/// is minutes, seconds are forbidden**. Pure function, used by the validator (E2104) and the scheduler; unit-testable independently.
 pub fn parse_period(spec: &str) -> Result<std::time::Duration, String> {
     let s = spec.trim();
     if s.is_empty() {
@@ -181,10 +181,10 @@ pub fn parse_period(spec: &str) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::from_secs(total_secs))
 }
 
-/// 规则集配置条目。
+/// Rule set configuration entry.
 ///
-/// 本层定义该类型供下载/存储/调度使用；阶段 2（Configuration subsystem）从
-/// `config.daefile` / `config.json` to fill `name/type/url/update/update_on_start/proxy`.
+/// This layer defines the type for download/storage/scheduling use; phase 2 (Configuration subsystem)
+/// fills `name/type/url/update/update_on_start/proxy` from `config.daefile` / `config.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RuleSetConfig {
@@ -220,7 +220,10 @@ impl RuleSetConfig {
 }
 
 /// Parsed ruleset data (in-memory cache).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serialize/Deserialize are used by the binary cache in `/run/dae-rs/` so a
+/// restart can load already-parsed lists without re-parsing the source text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuleSetData {
     /// geoip dat: `country_code` (lowercase) → CIDR list.
     GeoIp {
@@ -229,7 +232,7 @@ pub enum RuleSetData {
     },
     /// geosite dat: `country_code` (lowercase) → domain pattern list.
     GeoSite {
-        /// `country_code`（统一小写）→ Domain name模式列表。
+        /// `country_code` (normalized to lowercase) → domain name pattern list.
         entries: HashMap<String, Vec<DomainPattern>>,
     },
     /// Text domain list.

@@ -1,13 +1,13 @@
-//! `/var/lib/dae-rs/` 目录管理（设计 §4.1 / §4.3）。
+//! `/var/lib/dae-rs/` directory management (design §4.1 / §4.3).
 //!
-//! 目录布局：
+//! Directory layout:
 //!
 //! ```text
 //! /var/lib/dae-rs/
-//! ├── <name>.dat / <name>.txt        # 实际数据文件（dat→.dat，文本→.txt）
-//! ├── .tmp/                          # 临时下载文件（未校验前）
-//! ├── .checksum/<name>.sha256        # 校验和文件
-//! └── .meta/<name>.json              # 元数据（url/type/last_updated/sha256/size/state）
+//! ├── <name>.dat / <name>.txt        # actual data files (dat→.dat, text→.txt)
+//! ├── .tmp/                          # temp download files (before verification)
+//! ├── .checksum/<name>.sha256        # checksum files
+//! └── .meta/<name>.json              # metadata (url/type/last_updated/sha256/size/state)
 //! ```
 
 use std::collections::HashMap;
@@ -20,10 +20,10 @@ use tracing::{error, warn};
 
 use crate::ruleset::types::{RuleSetConfig, RuleSetData, RuleSetType};
 
-/// 默认数据目录。
+/// Default data directory.
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/dae-rs/";
 
-/// 存储错误。
+/// Storage error.
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to create directory '{path}': {source}")]
@@ -38,26 +38,26 @@ pub enum StoreError {
     Corrupt(String),
 }
 
-/// 数据目录管理。
+/// Data directory management.
 ///
-/// 默认 [`DEFAULT_DATA_DIR`]（`/var/lib/dae-rs/`），测试可注入临时路径。
+/// Defaults to [`DEFAULT_DATA_DIR`] (`/var/lib/dae-rs/`); tests can inject a temporary path.
 #[derive(Debug, Clone)]
 pub struct DataDir {
     root: PathBuf,
 }
 
 impl DataDir {
-    /// 新建数据目录（默认 [`DEFAULT_DATA_DIR`]；测试可注入临时路径）。
+    /// Create a new data directory (defaults to [`DEFAULT_DATA_DIR`]; tests can inject a temporary path).
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 
-    /// 默认 `/var/lib/dae-rs/`。
+    /// The default `/var/lib/dae-rs/`.
     pub fn default_dir() -> Self {
         Self::new(DEFAULT_DATA_DIR)
     }
 
-    /// Data directory根路径。
+    /// Data directory root path.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -74,29 +74,37 @@ impl DataDir {
         self.root.join(".meta")
     }
 
-    /// 数据文件路径：`root/<name><ext>`（dat→`.dat`，文本→`.txt`）。
+    /// Data file path: `root/<name><ext>` (dat→`.dat`, text→`.txt`).
     pub fn data_file_path(&self, name: &str, ty: RuleSetType) -> PathBuf {
         self.root.join(format!("{name}{}", ty.file_extension()))
     }
 
-    /// 临时下载文件路径：`root/.tmp/<name>.tmp.<pid>.<nanos>.<counter>`。
+    /// Temp download file path: `root/.tmp/<name>.tmp.<pid>.<nanos>.<counter>`.
     pub fn tmp_file_path(&self, name: &str) -> PathBuf {
         self.tmp_dir().join(format!("{name}.tmp{}", random_suffix()))
     }
 
-    /// 校验和文件路径：`root/.checksum/<name>.sha256`。
+    /// Checksum file path: `root/.checksum/<name>.sha256`.
     pub fn checksum_file_path(&self, name: &str) -> PathBuf {
         self.checksum_dir().join(format!("{name}.sha256"))
     }
 
-    /// 元数据文件路径：`root/.meta/<name>.json`。
+    /// Metadata file path: `root/.meta/<name>.json`.
     pub fn meta_file_path(&self, name: &str) -> PathBuf {
         self.meta_dir().join(format!("{name}.json"))
     }
 
-    /// 确保 `root/`、`.tmp/`、`.checksum/`、`.meta/` 目录存在。
+    /// Ensure the `root/`, `.tmp/`, `.checksum/`, and `.meta/` directories exist,
+    /// plus the `/run/dae-rs/` binary cache directory.
     pub async fn ensure_dirs(&self) -> Result<(), StoreError> {
-        for dir in [self.root.clone(), self.tmp_dir(), self.checksum_dir(), self.meta_dir()] {
+        let mut dirs = vec![
+            self.root.clone(),
+            self.tmp_dir(),
+            self.checksum_dir(),
+            self.meta_dir(),
+        ];
+        dirs.push(crate::ruleset::compiled::RUN_DATA_DIR.into());
+        for dir in dirs {
             tokio::fs::create_dir_all(&dir).await.map_err(|source| StoreError::CreateDir {
                 path: dir.display().to_string(),
                 source,
@@ -105,8 +113,8 @@ impl DataDir {
         Ok(())
     }
 
-    /// 原子替换：将 `tmp` 重命名为 `dest`（同目录/同文件系统保证原子性）。
-    /// 替换前 fsync 临时文件，替换后 fsync 目标目录以确保持久化。
+    /// Atomic replace: rename `tmp` to `dest` (same directory / same filesystem guarantees atomicity).
+    /// fsync the temp file before replacing and fsync the destination directory afterwards to ensure durability.
     pub async fn atomic_replace(&self, tmp: &Path, dest: &Path) -> Result<(), StoreError> {
         {
             let file = tokio::fs::File::open(tmp)
@@ -127,7 +135,7 @@ impl DataDir {
         Ok(())
     }
 
-    /// 原子写入字节到 `path`（同目录临时文件 + rename）。
+    /// Atomically write bytes to `path` (same-directory temp file + rename).
     async fn atomic_write_bytes(&self, path: &Path, data: &[u8]) -> Result<(), StoreError> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|source| StoreError::CreateDir {
@@ -153,7 +161,7 @@ impl DataDir {
         Ok(())
     }
 
-    /// 读取校验和（不存在返回 `None`）。
+    /// Read the checksum (returns `None` if it does not exist).
     pub async fn read_checksum(&self, name: &str) -> Result<Option<String>, StoreError> {
         let path = self.checksum_file_path(name);
         match tokio::fs::read_to_string(&path).await {
@@ -163,13 +171,13 @@ impl DataDir {
         }
     }
 
-    /// 写入校验和。
+    /// Write the checksum.
     pub async fn write_checksum(&self, name: &str, sha256: &str) -> Result<(), StoreError> {
         let path = self.checksum_file_path(name);
         self.atomic_write_bytes(&path, format!("{sha256}\n").as_bytes()).await
     }
 
-    /// 读取元数据（不存在返回 `None`）。
+    /// Read the metadata (returns `None` if it does not exist).
     pub async fn read_meta(&self, name: &str) -> Result<Option<RuleSetMeta>, StoreError> {
         let path = self.meta_file_path(name);
         match tokio::fs::read(&path).await {
@@ -184,7 +192,7 @@ impl DataDir {
         }
     }
 
-    /// 写入元数据（JSON）。
+    /// Write the metadata (JSON).
     pub async fn write_meta(&self, name: &str, meta: &RuleSetMeta) -> Result<(), StoreError> {
         let json = serde_json::to_vec_pretty(meta).map_err(|e| StoreError::MetaSerialize {
             name: name.to_string(),
@@ -194,12 +202,12 @@ impl DataDir {
         self.atomic_write_bytes(&path, &json).await
     }
 
-    /// 启动扫描：读取并解析已有数据文件到内存缓存。
+    /// Startup scan: read and parse existing data files into the in-memory cache.
     ///
-    /// - 文件缺失 → `data = None`、`damaged = false`（待下载）；
-    /// - 文件存在但校验和（若记录）不匹配或解析失败 → `data = None`、
-    ///   `damaged = true`（损坏，标记待重新下载；本层不删除原文件，由
-    ///   调用方决定恢复策略）。
+    /// - File missing → `data = None`, `damaged = false` (pending download);
+    /// - File present but the checksum (if recorded) mismatches or parsing fails → `data = None`,
+    ///   `damaged = true` (corrupt, marked for re-download; this layer does not delete the original file —
+    ///   the caller decides the recovery strategy).
     pub async fn scan(
         &self,
         entries: &[RuleSetConfig],
@@ -243,8 +251,10 @@ impl DataDir {
                 None
             } else {
                 let ty = cfg.r#type;
+                let name = cfg.name.clone();
+                let sha = actual_sha.clone();
                 match tokio::task::spawn_blocking(move || {
-                    crate::ruleset::parse_rule_set_data(ty, &bytes)
+                    crate::ruleset::compiled::load_rule_set_data_cached(ty, &name, &sha, &bytes)
                 })
                 .await
                 {
@@ -277,63 +287,63 @@ impl DataDir {
     }
 }
 
-/// 规则集元数据（持久化于 `.meta/<name>.json`）。
+/// Rule set metadata (persisted in `.meta/<name>.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleSetMeta {
     /// Unique name.
     pub name: String,
-    /// 数据源 URL。
+    /// Data source URL.
     pub url: String,
     /// Data type.
     pub r#type: RuleSetType,
-    /// 上次成功Update time（RFC3339）。
+    /// Last successful update time (RFC3339).
     pub last_updated: Option<String>,
-    /// 服务端 ETag（用于条件请求）。
+    /// Server ETag (for conditional requests).
     pub etag: Option<String>,
-    /// 服务端 Last-Modified（用于条件请求）。
+    /// Server Last-Modified (for conditional requests).
     pub last_modified: Option<String>,
-    /// 最近一次内容的 sha256。
+    /// sha256 of the most recent content.
     pub sha256: Option<String>,
     /// File size (bytes).
     pub size: u64,
-    /// 状态。
+    /// State.
     pub state: RuleSetState,
 }
 
-/// 规则集状态。
+/// Rule set state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleSetState {
-    /// 正常就绪。
+    /// Ready and normal.
     Ready,
-    /// 待下载 / 待恢复（缺失或损坏）。
+    /// Pending download / recovery (missing or corrupt).
     Pending,
-    /// 下载中。
+    /// Downloading.
     Downloading,
-    /// 连续失败降级（仅告警，不无限重试）。
+    /// Degraded after consecutive failures (warning only, no unlimited retries).
     Degraded,
-    /// 失败（附原因）。
+    /// Failed (with reason).
     Failed(String),
 }
 
-/// 启动扫描结果条目。
+/// Startup scan result entry.
 #[derive(Debug, Clone)]
 pub struct ScannedRuleSet {
     /// Unique name.
     pub name: String,
     /// Data type.
     pub r#type: RuleSetType,
-    /// 解析后的内存数据；`None` = 缺失或损坏（待重新下载）。
+    /// Parsed in-memory data; `None` = missing or corrupt (pending re-download).
     pub data: Option<RuleSetData>,
-    /// 元数据（可能为 `None`）。
+    /// Metadata (may be `None`).
     pub meta: Option<RuleSetMeta>,
-    /// 已记录校验和（可能为 `None`）。
+    /// Recorded checksum (may be `None`).
     pub sha256: Option<String>,
-    /// 文件存在但校验/解析失败。
+    /// File present but checksum/parse failed.
     pub damaged: bool,
 }
 
-/// 生成进程内唯一的随机后缀（pid + 纳秒时间戳 + 原子计数）。
+/// Generate a process-unique random suffix (pid + nanosecond timestamp + atomic counter).
 fn random_suffix() -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -410,15 +420,15 @@ mod tests {
         let data_dir = DataDir::new(dir.path());
         data_dir.ensure_dirs().await.unwrap();
 
-        // 有效文本 IP 列表
+        // Valid text IP list
         let ip_path = data_dir.data_file_path("chinaip", RuleSetType::IpList);
         tokio::fs::write(&ip_path, "1.1.1.0/24\n2.2.2.2\n").await.unwrap();
 
-        // 损坏的 geosite dat（垃圾字节）
+        // Corrupt geosite dat (garbage bytes)
         let bad_path = data_dir.data_file_path("badsite", RuleSetType::GeoSite);
         tokio::fs::write(&bad_path, b"\xff\xff\xff\xff not a protobuf").await.unwrap();
 
-        // 缺失文件
+        // Missing file
         let entries = vec![
             RuleSetConfig {
                 name: "chinaip".into(),

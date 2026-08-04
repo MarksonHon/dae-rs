@@ -1,17 +1,18 @@
-//! 规则集（Rule Set）数据层。
+//! Rule set data layer.
 //!
-//! 本模块实现规则集支持的第一部分：**数据层**（设计文档 §2.2 / §2.3 / §4）。
-//! 负责：
+//! This module implements the first part of rule set support: the **data layer** (design document §2.2 / §2.3 / §4).
+//! It is responsible for:
 //!
-//! - [`types`]：内存数据结构与规则集配置条目类型
-//! - [`decode`]：v2ray `.dat`（geoip / geosite）手写 protobuf 解码
-//! - [`list`]：文本Domain name / IP 列表解析
-//! - [`store`]：`/var/lib/dae-rs/` 目录管理（原子替换、checksum、meta、启动扫描）
-//! - [`download`]：下载器（直连 + 可选 SOCKS5、重试、ETag、sha256 校验）
+//! - [`types`]: in-memory data structures and rule set configuration entry types
+//! - [`decode`]: hand-written protobuf decoding of v2ray `.dat` (geoip / geosite)
+//! - [`list`]: text domain name / IP list parsing
+//! - [`store`]: `/var/lib/dae-rs/` directory management (atomic replace, checksum, meta, startup scan)
+//! - [`download`]: downloader (direct + optional SOCKS5, retries, ETag, sha256 verification)
 //!
-//! 本层**不**接入 matcher / DNS routing / 配置 parser-validator（由后续子任务负责）。
+//! This layer does **not** hook into matcher / DNS routing / configuration parser-validator (handled by later sub-tasks).
 
 pub mod cache;
+pub mod compiled;
 pub mod decode;
 pub mod download;
 pub mod list;
@@ -21,6 +22,7 @@ pub mod store;
 pub mod types;
 
 pub use cache::{load_cache_from_dir, RuleSetCache};
+pub use compiled::{compile_rule_set, CompiledDomainSet, CompiledIpSet, CompiledRuleSet};
 pub use decode::DecodeError;
 pub use download::{DownloadError, DownloadedInfo, DownloadOptions, UpdateOutcome};
 pub use list::ListError;
@@ -32,7 +34,7 @@ pub use scheduler::{ProxyResolver, RuleSetScheduler, SchedulerHandle, UpdateSign
 pub use store::{DataDir, RuleSetMeta, RuleSetState, ScannedRuleSet, StoreError};
 pub use types::{DomainPattern, DomainPatternType, RuleSetConfig, RuleSetData, RuleSetType};
 
-/// 规则集统一错误类型（各子模块错误经 `From` 汇总至此）。
+/// Unified rule set error type (errors from each sub-module are aggregated here via `From`).
 #[derive(Debug, thiserror::Error)]
 pub enum RuleSetError {
     #[error("rule set decode error: {0}")]
@@ -47,7 +49,7 @@ pub enum RuleSetError {
     InvalidUtf8(String),
 }
 
-/// 依据类型解析原始字节为内存数据结构（dat 解码 / 文本解析的统一入口）。
+/// Parse raw bytes into an in-memory data structure based on the type (unified entry point for dat decoding / text parsing).
 pub fn parse_rule_set_data(ty: RuleSetType, bytes: &[u8]) -> Result<RuleSetData, RuleSetError> {
     match ty {
         RuleSetType::GeoIp => decode::decode_geoip_list(bytes).map_err(RuleSetError::Decode),
@@ -69,7 +71,7 @@ pub fn parse_rule_set_data(ty: RuleSetType, bytes: &[u8]) -> Result<RuleSetData,
     }
 }
 
-/// 计算字节的 sha256 十六进制摘要（小写）。
+/// Compute the lowercase hex sha256 digest of bytes.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;

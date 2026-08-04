@@ -288,7 +288,8 @@ See [`docs/design/dns_en.md`](../design/dns_en.md) for the full design. Summary:
 | `starting_dns` | Bootstrap resolver used before the proxy is available. Contains `ip_version_prefer` (`4` or `6`) and a `upstream` list (must be IP literals to avoid a chicken-and-egg problem). |
 | `bind` | Local DNS listener address (default `127.0.0.1:5353`). |
 | `cache` | Cache settings: `enabled`, `max_size`, `max_ttl`, `min_ttl`, `optimistic_cache`, `optimistic_cache_ttl`. |
-| `groups` | DNS groups, each with `proxy` (`direct` or `proxy(<group>)`), `upstream` entries (label + URL like `udp://1.1.1.1:53`, `tcp+udp://dns.google:53`), `request_routing` and `response_routing`. Response routing supports `ip(geoip:<code>)` / `ip(set:<name>)` / `qname(geosite:<code>)` / `qname(set:<name>)` conditions combined with `&&` and `!`. |
+| `groups` | DNS groups, each with `send_by` (`direct` or a proxy group name), `query_mode` (`concurrent` / `random` / `sequence`) and `upstream` entries (label + URL like `udp://1.1.1.1:53`, `tcp+udp://dns.google:53`). |
+| `response_action` | Module-level DNS response action: further filters / processes the obtained DNS results regardless of which group produced them. Rules support `upstream(<label>)` / `ip(geoip:<code>)` / `ip(set:<name>)` / `qname(geosite:<code>)` / `qname(set:<name>)` conditions combined with `&&` and `!`; actions are `accept`, `reject`, or an upstream label (requery with it). |
 | `routing` | Top-level DNS query routing: `qname(geosite:cn) -> china_dns`, `qname(set:chinadomain) -> china_dns`, etc., plus `fallback`. |
 
 URL schemes parsed: `udp://`, `tcp://`, `tcp+udp://`, `https://` / `doh://`,
@@ -321,14 +322,14 @@ rule_set {
 
   chinadomain {
     type: domain_list
-    url: 'https://example.com/rules/chinadomain.txt'   # placeholder URL, replaceable
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt'   # placeholder URL, replaceable
     name: chinadomain
     update: time: 04:30
   }
 
   chinaip {
     type: ip_list
-    url: 'https://example.com/rules/chinaip.txt'       # placeholder URL, replaceable
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt'       # placeholder URL, replaceable
     name: chinaip
     update: period: 1d
     proxy: proxy_primary
@@ -372,8 +373,8 @@ stable error codes:
 | `E2001` – `E2007` | DNS group / routing / starting_dns issues. |
 | `E2101` – `E2106` | Rule sets: duplicate name / unknown reference / missing data / invalid schedule (incl. seconds) / invalid URL / capacity exceeded. |
 
-Warnings (`W1801`, `W1901`, `W1902`, `W2001`, `W2002`) are emitted for
-non-fatal issues such as missing policies or missing DNS response routing.
+Warnings (`W1801`, `W1901`, `W1902`) are emitted for
+non-fatal issues such as missing policies.
 
 ## 6. Defaults at a Glance
 

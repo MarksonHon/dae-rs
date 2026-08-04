@@ -1,16 +1,17 @@
-//! v2ray `.dat` protobuf 轻量解码器（手写，零 protobuf 依赖）。
+//! Lightweight v2ray `.dat` protobuf decoder (hand-written, zero protobuf dependencies).
 //!
-//! 依据设计 §2.2 / §13-3：
+//! Per design §2.2 / §13-3:
 //!
-//! - `geoip.dat`：顶层 `GeoIPList { repeated GeoIP entry = 1 }`，
-//!   `GeoIP { string country_code = 1, repeated CIDR cidr = 2, bool reverse_match = 3 }`，
-//!   `CIDR { bytes ip = 1, uint32 prefix = 2 }`。
-//! - `geosite.dat`：顶层 `GeoSiteList { repeated GeoSite entry = 1 }`，
-//!   `GeoSite { string country_code = 1, repeated Domain domain = 2 }`，
-//!   `Domain { enum DomainType type = 1, string value = 2, repeated Attribute attribute = 3 }`。
+//! - `geoip.dat`: top level `GeoIPList { repeated GeoIP entry = 1 }`,
+//!   `GeoIP { string country_code = 1, repeated CIDR cidr = 2, bool reverse_match = 3 }`,
+//!   `CIDR { bytes ip = 1, uint32 prefix = 2 }`.
+//! - `geosite.dat`: top level `GeoSiteList { repeated GeoSite entry = 1 }`,
+//!   `GeoSite { string country_code = 1, repeated Domain domain = 2 }`,
+//!   `Domain { enum DomainType type = 1, string value = 2, repeated Attribute attribute = 3 }`.
 //!
-//! 文件为未压缩 protobuf 序列化。本模块手写 varint / wire type / length-delimited /
-//! 嵌入式消息解析；对截断或畸形数据一律返回错误（[`DecodeError`]）而非 panic。
+//! Files are uncompressed protobuf serialization. This module hand-writes varint / wire type /
+//! length-delimited / embedded-message parsing; truncated or malformed data always yields an error
+//! ([`DecodeError`]) rather than a panic.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -20,7 +21,7 @@ use thiserror::Error;
 
 use crate::ruleset::types::{DomainPattern, DomainPatternType, RuleSetData};
 
-/// `.dat` 解码错误。
+/// `.dat` decode error.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("protobuf data truncated")]
@@ -47,7 +48,7 @@ pub enum DecodeError {
     UnknownDomainType(u64),
 }
 
-/// 轻量 protobuf wire-format 解码器。
+/// Lightweight protobuf wire-format decoder.
 struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -90,7 +91,7 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
-    /// 读取 length-delimited 字段载荷切片（wire type 2）。
+    /// Read the payload slice of a length-delimited field (wire type 2).
     fn read_bytes(&mut self) -> Result<&'a [u8], DecodeError> {
         let len = self.read_varint()? as usize;
         if self.pos + len > self.buf.len() {
@@ -101,7 +102,7 @@ impl<'a> Decoder<'a> {
         Ok(slice)
     }
 
-    /// 读取下一个字段 tag，返回 `(field_number, wire_type)`；无更多字段返回 `None`。
+    /// Read the next field tag, returning `(field_number, wire_type)`; returns `None` when there are no more fields.
     fn read_tag(&mut self) -> Result<Option<(u64, u8)>, DecodeError> {
         if self.is_empty() {
             return Ok(None);
@@ -110,7 +111,7 @@ impl<'a> Decoder<'a> {
         Ok(Some((tag >> 3, (tag & 0x07) as u8)))
     }
 
-    /// 跳过未知字段（前向兼容：忽略未识别的字段）。
+    /// Skip unknown fields (forward compatibility: ignore unrecognized fields).
     fn skip_field(&mut self, wire: u8) -> Result<(), DecodeError> {
         match wire {
             0 => {
@@ -128,9 +129,9 @@ impl<'a> Decoder<'a> {
     }
 }
 
-/// 解码 `geoip.dat`（`GeoIPList`）为 [`RuleSetData::GeoIp`]。
+/// Decode `geoip.dat` (`GeoIPList`) into [`RuleSetData::GeoIp`].
 ///
-/// `country_code` 统一转为小写存储（设计 §2.2：匹配时大小写不敏感）。
+/// `country_code` is normalized to lowercase for storage (design §2.2: case-insensitive matching).
 pub fn decode_geoip_list(data: &[u8]) -> Result<RuleSetData, DecodeError> {
     let mut entries: HashMap<String, Vec<IpNet>> = HashMap::new();
     let mut dec = Decoder::new(data);
@@ -151,7 +152,7 @@ pub fn decode_geoip_list(data: &[u8]) -> Result<RuleSetData, DecodeError> {
     Ok(RuleSetData::GeoIp { entries })
 }
 
-/// 解码单个 `GeoIP` 消息，返回 `(country_code 小写, cidr 列表)`。
+/// Decode a single `GeoIP` message, returning `(lowercase country_code, cidr list)`.
 fn decode_geoip_entry(data: &[u8]) -> Result<(String, Vec<IpNet>), DecodeError> {
     let mut code = String::new();
     let mut cidrs = Vec::new();
@@ -165,7 +166,7 @@ fn decode_geoip_entry(data: &[u8]) -> Result<(String, Vec<IpNet>), DecodeError> 
             }
             (2, 2) => cidrs.push(decode_cidr(dec.read_bytes()?)?),
             (3, 0) => {
-                // reverse_match（v2ray 中通常为 false，本层仅消费字段、忽略语义）
+                // reverse_match (usually false in v2ray; this layer only consumes the field and ignores its semantics)
                 let _ = dec.read_varint()?;
             }
             _ => dec.skip_field(wire)?,
@@ -174,7 +175,7 @@ fn decode_geoip_entry(data: &[u8]) -> Result<(String, Vec<IpNet>), DecodeError> 
     Ok((code.to_ascii_lowercase(), cidrs))
 }
 
-/// 解码单个 `CIDR` 消息为 [`IpNet`]。
+/// Decode a single `CIDR` message into an [`IpNet`].
 fn decode_cidr(data: &[u8]) -> Result<IpNet, DecodeError> {
     let mut ip: Option<Vec<u8>> = None;
     let mut prefix: u32 = 0;
@@ -203,10 +204,10 @@ fn decode_cidr(data: &[u8]) -> Result<IpNet, DecodeError> {
     IpNet::new(addr, prefix as u8).map_err(|_| DecodeError::InvalidCidr)
 }
 
-/// 解码 `geosite.dat`（`GeoSiteList`）为 [`RuleSetData::GeoSite`]。
+/// Decode `geosite.dat` (`GeoSiteList`) into [`RuleSetData::GeoSite`].
 ///
-/// `country_code`（分类名）统一转为小写存储；`@attribute` 二级分类
-/// （阶段 5 可选）本层忽略（字段 3 被跳过）。
+/// `country_code` (category name) is normalized to lowercase for storage; the `@attribute`
+/// second-level categories (optional in phase 5) are ignored by this layer (field 3 is skipped).
 pub fn decode_geosite_list(data: &[u8]) -> Result<RuleSetData, DecodeError> {
     let mut entries: HashMap<String, Vec<DomainPattern>> = HashMap::new();
     let mut dec = Decoder::new(data);
@@ -227,7 +228,7 @@ pub fn decode_geosite_list(data: &[u8]) -> Result<RuleSetData, DecodeError> {
     Ok(RuleSetData::GeoSite { entries })
 }
 
-/// 解码单个 `GeoSite` 消息，返回 `(country_code 小写, domain 模式列表)`。
+/// Decode a single `GeoSite` message, returning `(lowercase country_code, domain pattern list)`.
 fn decode_geosite_entry(data: &[u8]) -> Result<(String, Vec<DomainPattern>), DecodeError> {
     let mut code = String::new();
     let mut domains = Vec::new();
@@ -246,10 +247,10 @@ fn decode_geosite_entry(data: &[u8]) -> Result<(String, Vec<DomainPattern>), Dec
     Ok((code.to_ascii_lowercase(), domains))
 }
 
-/// 解码单个 `Domain` 消息为 [`DomainPattern`]。
+/// Decode a single `Domain` message into a [`DomainPattern`].
 ///
-/// `DomainType` 映射：Plain=0→Suffix、Regex=1→Regex、Domain=2→Domain、Full=3→Full。
-/// `attribute`（字段 3）被跳过。
+/// `DomainType` mapping: Plain=0→Suffix, Regex=1→Regex, Domain=2→Domain, Full=3→Full.
+/// `attribute` (field 3) is skipped.
 fn decode_domain(data: &[u8]) -> Result<DomainPattern, DecodeError> {
     let mut domain_type: u64 = 0;
     let mut value = String::new();
@@ -283,7 +284,7 @@ mod tests {
     use super::*;
     use crate::ruleset::types::DomainPatternType;
 
-    // ── protobuf 编码辅助（测试用；真实样本：Loyalsoldier/v2ray-rules-dat）──
+    // ── protobuf encoding helpers (for tests; real samples: Loyalsoldier/v2ray-rules-dat) ──
 
     fn varint(mut v: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -383,7 +384,7 @@ mod tests {
             panic!("expected GeoIp");
         };
         assert_eq!(entries.len(), 2);
-        // country_code 统一小写
+        // country_code normalized to lowercase
         let cn = &entries["cn"];
         assert_eq!(cn.len(), 2);
         assert_eq!(cn[0].to_string(), "8.8.8.8/32");
@@ -446,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_decode_geoip_unknown_wire_type() {
-        // 构造一个 wire type 3（StartGroup）的未知字段 → UnsupportedWireType
+        // Construct an unknown field with wire type 3 (StartGroup) → UnsupportedWireType
         let mut data = Vec::new();
         data.extend(tag(9, 3));
         data.extend(varint(0));
@@ -487,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_decode_geosite_invalid_utf8() {
-        // value 字段使用非法 utf8 字节
+        // The value field uses invalid utf8 bytes
         let mut domain = varint_field(1, 0);
         domain.extend(bytes_field(2, &[0xff, 0xfe]));
         let data = encode_geosite_list(&[encode_geosite_entry("cn", &[domain])]);

@@ -563,7 +563,7 @@ async fn node_detail_handler(
     let node = daefile_config
         .as_ref()
         .and_then(|dc| dc.outbounds.nodes.iter().find(|n| n.name == name))
-        .ok_or_else(|| ApiError::NotFound(format!("节点 '{}' 不存在", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("node '{}' not found", name)))?;
 
     Ok(Json(NodeInfo {
         name: node.name.clone(),
@@ -662,7 +662,7 @@ async fn group_detail_handler(
     let group = daefile_config
         .as_ref()
         .and_then(|dc| dc.outbounds.groups.iter().find(|g| g.name == name))
-        .ok_or_else(|| ApiError::NotFound(format!("出站组 '{}' 不存在", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("outbound group '{}' not found", name)))?;
 
     let node_names: Vec<String> = collect_group_node_names(group, {
         if let Some(ref dc) = daefile_config {
@@ -725,19 +725,19 @@ async fn group_policy_handler(
 
     let daefile = daefile_config
         .as_mut()
-        .ok_or_else(|| ApiError::Internal("配置未加载".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("configuration not loaded".to_string()))?;
 
     let group = daefile
         .outbounds
         .groups
         .iter_mut()
         .find(|g| g.name == name)
-        .ok_or_else(|| ApiError::NotFound(format!("出站组 '{}' 不存在", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("outbound group '{}' not found", name)))?;
 
     // Only auto groups support policy modification
     if group.group_type != config::GroupType::Auto {
         return Err(ApiError::Unprocessable(format!(
-            "组 '{}' 的类型为 select，不支持 policy 修改",
+            "group '{}' is of type select, policy modification is not supported",
             name
         )));
     }
@@ -751,7 +751,7 @@ async fn group_policy_handler(
         "min_moving_avg" => config::PolicyType::MinMovingAvg,
         _ => {
             return Err(ApiError::Unprocessable(format!(
-                "未知策略 '{}'，期望 fixed/random/min/min_avg10/min_moving_avg",
+                "unknown policy '{}', expected fixed/random/min/min_avg10/min_moving_avg",
                 body.policy
             )));
         }
@@ -790,19 +790,19 @@ async fn group_selected_handler(
 
     let daefile = daefile_config
         .as_mut()
-        .ok_or_else(|| ApiError::Internal("配置未加载".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("configuration not loaded".to_string()))?;
 
     let group = daefile
         .outbounds
         .groups
         .iter_mut()
         .find(|g| g.name == name)
-        .ok_or_else(|| ApiError::NotFound(format!("出站组 '{}' 不存在", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("outbound group '{}' not found", name)))?;
 
     // Only select groups support selected modification
     if group.group_type != config::GroupType::Select {
         return Err(ApiError::Unprocessable(format!(
-            "组 '{}' 的类型为 auto，不支持 selected 修改",
+            "group '{}' is of type auto, selected modification is not supported",
             name
         )));
     }
@@ -811,7 +811,7 @@ async fn group_selected_handler(
     let node_names: Vec<String> = collect_group_node_names(group, &daefile.outbounds.nodes);
     if !node_names.contains(&body.selected) {
         return Err(ApiError::Unprocessable(format!(
-            "节点 '{}' 不在组 '{}' 的可达集合内",
+            "node '{}' is not in the reachable set of group '{}'",
             body.selected, name
         )));
     }

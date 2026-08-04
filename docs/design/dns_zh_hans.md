@@ -5,7 +5,7 @@
 ## 1. 范围
 
 本文档描述 dae-rs DNS 子系统**当前已实现**的实际情况
-（位于 `control/src/dns/*`），涵盖 DNS 管理器、上游连接池、请求/响应路由、
+（位于 `control/src/dns/*`），涵盖 DNS 管理器、上游连接池、请求/响应动作、
 缓存、监听器，以及与基于域名的 eBPF 路由的集成。
 
 模块结构：
@@ -40,7 +40,7 @@ control/src/dns/
     │      send_by=<代理组>    → 通过该代理组走 TCP 转发到上游
     │      首个成功的响应胜出
     │
-    ├─ 响应路由（accept / reject / requery）
+    ├─ 响应动作（accept / reject / requery）
     │
     ├─ 写入缓存
     │
@@ -113,7 +113,7 @@ control/src/dns/
   2. 查缓存（键 = qname + qtype + class IN）。
   3. 经 `DnsRouter` 路由到分组，再按分组 `query_mode` 选择上游并查询
      （直连或经 `send_by` 代理组）。
-  4. 应用响应路由（accept / reject / 换上游 requery）。
+  4. 应用响应动作（accept / reject / 换上游 requery）。
   5. accept 时写入缓存，并把被接受的 A/AAAA 解析结果喂给域名路由回调。
 - **IP_TRANSPARENT 响应**：回复使用设置了 `IP_TRANSPARENT`/`IPV6_TRANSPARENT`、
   `SO_REUSEADDR`、`SO_REUSEPORT` 与 `SO_MARK=0x100`、并绑定到**上游 DNS
@@ -141,7 +141,7 @@ control/src/dns/
   / `qname(set:chinadomain)` 编译为规则集引用（`DnsMatchType::GeoSite` /
   `DnsMatchType::Set`），运行时对查询名做域名模式匹配（用户空间直接匹配内存
   缓存，不依赖 eBPF）。`qname(suffix:...)` 等普通模式继续走既有后缀逻辑。
-- **DNS 响应路由**（[`handler.rs`](control/src/dns/handler.rs)）：
+- **DNS 响应动作**（[`handler.rs`](control/src/dns/handler.rs)）：
   - `ip(geoip:cn)` / `ip(set:chinaip)` — 解析响应中所有 A/AAAA 地址
     （复用 `extract_answer_addrs()`），任一地址命中 GeoIP / IP 列表 → 条件真；
   - `ip(CIDR)` — 直接 CIDR 匹配；
@@ -187,6 +187,6 @@ DNS 解析结果会写入 eBPF `domain_routing_map`，使 `domain(...)` 路由�
 - DNS 监听任务运行无限收发循环，用 `abort()` 停止（安全：tokio 任务在
   await 点可取消）。
 
-> 规则集求值已实现：DNS 查询路由的 `qname(geosite:/set:)` 与 DNS 响应路由的
+> 规则集求值已实现：DNS 查询路由的 `qname(geosite:/set:)` 与 DNS 响应动作的
 > `ip(geoip:/set:)` / `qname(...)` / `&&` / `!` 均接入规则集数据（§3.6），
 > 不再按简单后缀比较。数据缺失时相关规则编译报错（E2103）。

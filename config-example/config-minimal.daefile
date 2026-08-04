@@ -32,19 +32,50 @@ outbounds {
   }
 }
 
+rule_set {
+  # Surge-format text lists to bypass mainland-China traffic (both mihomo and
+  # Surge formats are supported by the parser).
+  chinadomain {
+    type: domain_list            # domains that should be accessed directly (mostly China)
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt'
+    name: chinadomain            # referenced by set:chinadomain
+    update: time: 04:30          # update daily at 04:30
+    update_on_start: true
+  }
+
+  chinaip {
+    type: ip_list                # mainland-China IP/CIDR list
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt'
+    name: chinaip                # referenced by set:chinaip
+    update: period: 1d           # update once per day
+    update_on_start: true
+    proxy: proxy                 # download through the proxy group
+  }
+}
+
 routing {
-  fallback: proxy(proxy)
+  target_domain(set:chinadomain) -> direct   # domains in the direct list → direct
+  target_ip(set:chinaip) -> direct           # mainland-China IPs → direct
+  fallback: proxy(proxy)                     # everything else → proxy
 }
 
 dns {
   starting_dns {
     ip_version_prefer: 4
-    upstream: ['udp://223.5.5.5:53', 'udp://1.1.1.1:53']
+    upstream: ['udp://223.5.5.5:53', 'udp://119.29.29.29:53']  # Alibaba + Tencent (DNSPod) bootstrap
   }
   bind: '127.0.0.1:5353'
   groups {
+    china_dns {
+      send_by: direct            # query China DNS servers directly
+      query_mode: concurrent
+      upstream {
+        alidns: 'udp://223.5.5.5:53'        # Alibaba public DNS
+        dnspod: 'udp://119.29.29.29:53'     # Tencent (DNSPod) public DNS
+      }
+    }
     default_dns {
-      send_by: proxy
+      send_by: proxy             # resolve foreign domains through the proxy
       query_mode: concurrent
       upstream {
         cloudflare: 'udp://1.1.1.1:53'
@@ -52,6 +83,7 @@ dns {
     }
   }
   routing {
+    qname(set:chinadomain) -> china_dns   # China-related domains → Alibaba/Tencent DNS
     fallback: default_dns
   }
 }

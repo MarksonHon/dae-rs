@@ -1,32 +1,32 @@
-//! Ruleset reference parsing与共享匹配工具（设计 §6）。
+//! Ruleset reference parsing and shared matching utilities (design §6).
 //!
-//! 本模块提供：
+//! This module provides:
 //!
-//! - [`RuleSetRef`]：识别参数中的 `set:<name>` / `geoip:<code>` / `geosite:<code>`
-//!   前缀，其余视为普通值（§6.1 / §6.2）。
-//! - Domain name模式匹配（[`match_domain_pattern`] / [`match_domain_patterns`] /
-//!   [`match_qname_value`]）：供 DNS 查询Routing与 DNS 响应Routing共享，统一
-//!   Suffix / Keyword / Full / Regex / Domain 语义，**qname 大小写不敏感**。
+//! - [`RuleSetRef`]: recognizes the `set:<name>` / `geoip:<code>` / `geosite:<code>`
+//!   prefixes in arguments; anything else is treated as a plain value (§6.1 / §6.2).
+//! - Domain name pattern matching ([`match_domain_pattern`] / [`match_domain_patterns`] /
+//!   [`match_qname_value`]): shared by DNS query routing and DNS response routing, unifying the
+//!   Suffix / Keyword / Full / Regex / Domain semantics; **qname is case-insensitive**.
 //!
-//! 本模块**不依赖** matcher / DNS 具体模块，可被 `matcher`、`dns::router`、
-//! `dns::handler` 复用，避免重复实现。
+//! This module does **not depend** on the matcher / DNS-specific modules; it can be reused by
+//! `matcher`, `dns::router`, and `dns::handler`, avoiding duplicate implementations.
 
 use crate::ruleset::types::{DomainPattern, DomainPatternType};
 
-/// 解析后的规则集引用。
+/// A parsed rule set reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSetRef {
-    /// `geoip:<code>` — geoip dat 中的 `country_code`（如 `cn`、`private`）。
+    /// `geoip:<code>` — a `country_code` in a geoip dat (e.g. `cn`, `private`).
     GeoIp(String),
-    /// `geosite:<code>` — geosite dat 中的分类名（如 `cn`、`geolocation-!cn`）。
+    /// `geosite:<code>` — a category name in a geosite dat (e.g. `cn`, `geolocation-!cn`).
     GeoSite(String),
-    /// `set:<name>` — 配置中的规则集条目名（`domain_list` / `ip_list`）。
+    /// `set:<name>` — a rule set entry name from the configuration (`domain_list` / `ip_list`).
     Set(String),
-    /// 其它：普通值（CIDR / Domain name模式 / 关键字等），无前缀。
+    /// Other: a plain value (CIDR / domain name pattern / keyword, etc.), with no prefix.
     Plain(String),
 }
 
-/// 识别 `set:<name>` / `geoip:<code>` / `geosite:<code>` 前缀；其余视为普通值。
+/// Recognize the `set:<name>` / `geoip:<code>` / `geosite:<code>` prefixes; anything else is treated as a plain value.
 pub fn parse_ref(value: &str) -> RuleSetRef {
     let v = value.trim();
     if let Some(code) = v.strip_prefix("geoip:") {
@@ -40,7 +40,7 @@ pub fn parse_ref(value: &str) -> RuleSetRef {
     }
 }
 
-/// 是否为规则集引用（`geoip:` / `geosite:` / `set:`）。
+/// Whether the value is a rule set reference (`geoip:` / `geosite:` / `set:`).
 pub fn is_ruleset_ref(value: &str) -> bool {
     matches!(
         parse_ref(value),
@@ -48,19 +48,19 @@ pub fn is_ruleset_ref(value: &str) -> bool {
     )
 }
 
-/// 生成可读引用标识（错误信息用）：保留原始前缀形式。
+/// Generate a human-readable reference label (for error messages): preserves the original prefix form.
 pub fn ref_label(value: &str) -> String {
     value.trim().to_string()
 }
 
-/// 判断 `qname` 是否命中单条Domain name模式（**大小写不敏感**）。
+/// Determine whether `qname` matches a single domain name pattern (**case-insensitive**).
 ///
-/// 语义对齐设计 §2.2 / §2.3：
-/// - `Suffix`（Plain/`suffix:`）：命中自身及其所有子域；
-/// - `Domain`（`domain:`）：命中 value 的子域（**不含** value 自身）；
-/// - `Full`（`full:`）：精确匹配 value 本身；
-/// - `Regex`（`regex:`）：value 作为正则匹配完整Domain name；
-/// - `Keyword`（`keyword:`）：子串匹配。
+/// Semantics aligned with design §2.2 / §2.3:
+/// - `Suffix` (Plain/`suffix:`): matches itself and all of its subdomains;
+/// - `Domain` (`domain:`): matches subdomains of the value (**excluding** the value itself);
+/// - `Full` (`full:`): exactly matches the value itself;
+/// - `Regex` (`regex:`): the value is used as a regex to match the full domain name;
+/// - `Keyword` (`keyword:`): substring match.
 pub fn match_domain_pattern(qname: &str, pattern: &DomainPattern) -> bool {
     let qname = normalize_qname(qname);
     match pattern.pattern_type {
@@ -86,15 +86,15 @@ pub fn match_domain_pattern(qname: &str, pattern: &DomainPattern) -> bool {
     }
 }
 
-/// 判断 `qname` 是否命中模式列表（任一命中即真）。
+/// Determine whether `qname` matches any pattern in the list (true if any matches).
 pub fn match_domain_patterns(qname: &str, patterns: &[DomainPattern]) -> bool {
     patterns.iter().any(|p| match_domain_pattern(qname, p))
 }
 
-/// 匹配一个普通 qname 值（`suffix:`/`full:`/`keyword:`/`regex:`/`domain:` 前缀或裸值）。
+/// Match a plain qname value (`suffix:`/`full:`/`keyword:`/`regex:`/`domain:` prefix or a bare value).
 ///
-/// 裸值按**后缀**（含自身）语义处理，与 dae / 设计 §6.4 一致；大小写不敏感。
-/// 供 DNS 查询Routing（`qname(...)`）与 DNS 响应Routing（`qname(...)`）复用。
+/// A bare value is handled with **suffix** semantics (including itself), consistent with dae / design §6.4; case-insensitive.
+/// Reused by DNS query routing (`qname(...)`) and DNS response routing (`qname(...)`).
 pub fn match_qname_value(qname: &str, value: &str) -> bool {
     let qname = normalize_qname(qname);
     let v = value.trim();
@@ -111,25 +111,25 @@ pub fn match_qname_value(qname: &str, value: &str) -> bool {
             .map(|re| re.is_match(&qname))
             .unwrap_or(false)
     } else {
-        // 裸值按后缀（含自身）
+        // Bare value uses suffix semantics (including itself)
         let v = v.trim_start_matches('.').to_ascii_lowercase();
         qname == v || qname.ends_with(&format!(".{v}"))
     }
 }
 
-/// 归一化 qname：去除末尾 `.` 并转小写。
+/// Normalize qname: strip the trailing `.` and lowercase.
 fn normalize_qname(qname: &str) -> String {
     qname.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// 将 [`DomainPattern`] 转换为带 key 前缀的模式字符串（供 matcher `domain_sets`）。
+/// Convert a [`DomainPattern`] into a pattern string with a key prefix (for matcher `domain_sets`).
 ///
-/// `Suffix` → `suffix:<value>`、`Full` → `full:<value>`、`Regex` → `regex:<value>`、
-/// `Domain` → `domain:<value>`、`Keyword` → `keyword:<value>`。
+/// `Suffix` → `suffix:<value>`, `Full` → `full:<value>`, `Regex` → `regex:<value>`,
+/// `Domain` → `domain:<value>`, `Keyword` → `keyword:<value>`.
 ///
-/// eBPF `domain_routing_map` 位图侧只关心规则索引；模式字符串由用户空间
-/// [`crate::routing::matcher::build_domain_routing_bitmap`] 与 eBPF 侧
-/// `route_match_domain_set()`（按位图）协作，key 前缀供用户空间求值。
+/// The eBPF `domain_routing_map` bitmap side only cares about rule indices; the pattern string is
+/// coordinated by the user-space [`crate::routing::matcher::build_domain_routing_bitmap`] with the eBPF side's
+/// `route_match_domain_set()` (by bitmap), and the key prefix is used by user space for evaluation.
 pub fn domain_pattern_to_string(p: &DomainPattern) -> String {
     match p.pattern_type {
         DomainPatternType::Suffix => format!("suffix:{}", p.value),
@@ -165,17 +165,17 @@ mod tests {
             pattern_type: t,
             value: v.to_string(),
         };
-        // Suffix 含自身与子域
+        // Suffix includes itself and subdomains
         assert!(match_domain_pattern("baidu.com", &mk(DomainPatternType::Suffix, "baidu.com")));
         assert!(match_domain_pattern("www.baidu.com", &mk(DomainPatternType::Suffix, "baidu.com")));
         assert!(!match_domain_pattern("notbaidu.com", &mk(DomainPatternType::Suffix, "baidu.com")));
-        // Domain 不含自身
+        // Domain excludes itself
         assert!(!match_domain_pattern("baidu.com", &mk(DomainPatternType::Domain, "baidu.com")));
         assert!(match_domain_pattern("www.baidu.com", &mk(DomainPatternType::Domain, "baidu.com")));
-        // Full 精确
+        // Full exact match
         assert!(match_domain_pattern("google.com", &mk(DomainPatternType::Full, "google.com")));
         assert!(!match_domain_pattern("www.google.com", &mk(DomainPatternType::Full, "google.com")));
-        // Keyword 子串
+        // Keyword substring
         assert!(match_domain_pattern("foo.ads.bar.com", &mk(DomainPatternType::Keyword, "ads")));
         // Regex
         assert!(match_domain_pattern("x.y", &mk(DomainPatternType::Regex, r"^x\.y$")));

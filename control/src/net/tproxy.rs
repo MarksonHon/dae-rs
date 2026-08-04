@@ -1,38 +1,39 @@
-//! TProxy 监听器 + TCP/UDP 双向转发
+//! TProxy listener + bidirectional TCP/UDP forwarding
 //!
-//! 本模块实现透明代理（TProxy）功能，是代理数据路径的核心组件：
+//! This module implements transparent proxying (TProxy), a core component of the
+//! proxy data path:
 //!
-//! # 数据流
+//! # Data flow
 //!
 //! ```text
-//! 客户端 → eBPF/策略Routing → veth pair → 代理命名空间
+//! Client → eBPF/Policy Routing → veth pair → proxy namespace
 //!                                         ↓
-//!                                    TProxy 监听器
+//!                                   TProxy listener
 //!                                         ↓
-//!                                  SOCKS5 出站Dialer
+//!                                SOCKS5 outbound dialer
 //!                                         ↓
-//!                                    上游代理服务器
+//!                                upstream proxy server
 //!                                         ↓
-//!                                    目标服务器
+//!                                  target server
 //! ```
 //!
-//! # 核心组件
+//! # Core components
 //!
-//! * [`TproxyListener`] — TProxy 监听器，在代理命名空间内监听端口
-//! * [`handle_connection`] — TCP 双向中继函数
-//! * [`get_original_dst`] — 获取 TProxy transparent proxy的原始目标地址
+//! * [`TproxyListener`] — TProxy listener, listens on a port inside the proxy namespace
+//! * [`handle_connection`] — TCP bidirectional relay function
+//! * [`get_original_dst`] — gets the original destination address of a TProxy connection
 //!
-//! # 依赖
+//! # Dependencies
 //!
-//! * Linux `IP_TRANSPARENT` socket 选项（需要 `CAP_NET_ADMIN` 权限）
-//! * Linux `IP_RECVORIGDSTADDR` socket 选项（用于 UDP 原始目标地址获取）
-//! * Linux `SO_REUSEADDR` 和 `SO_REUSEPORT` socket 选项
+//! * Linux `IP_TRANSPARENT` socket option (requires `CAP_NET_ADMIN`)
+//! * Linux `IP_RECVORIGDSTADDR` socket option (for getting the UDP original destination)
+//! * Linux `SO_REUSEADDR` and `SO_REUSEPORT` socket options
 //!
-//! # 安全性
+//! # Safety
 //!
-//! * 所有 socket 操作需处理 `EPERM` 错误（缺少 `CAP_NET_ADMIN` 时）
-//! * 连接关闭需正确传播，避免连接泄漏
-//! * 错误不应导致整个监听器崩溃
+//! * All socket operations must handle `EPERM` errors (when `CAP_NET_ADMIN` is missing)
+//! * Connection shutdown must propagate correctly to avoid connection leaks
+//! * An error must not crash the whole listener
 
 use anyhow::{Context, Result};
 use protocols::{OutboundDialer, ProxyStream};
@@ -51,52 +52,57 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
 // ============================================================================
-// TCP 中继常量
+// TCP relay constants
 // ============================================================================
 
-/// 单次 splice() 的数据块大小（内核页接管，块大减少系统调用）
+/// Data chunk size for a single splice() call (kernel page reclaim; larger chunks reduce syscalls)
 const SPLICE_CHUNK: usize = 64 * 1024;
 
-/// splice 不可用时回退路径的双向拷贝缓冲大小（tokio 默认 copy_bidirectional 仅 8KB）
+/// Bidirectional copy buffer size for the fallback path when splice is unavailable
+/// (tokio's default copy_bidirectional is only 8KB)
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
-/// TCP 双向中继的半关闭保护超时。
+/// Half-close protection timeout for the TCP bidirectional relay.
 ///
-/// 当一个方向拷贝完成（源 EOF）后，给另一个方向最多这个时间优雅关闭。
-/// 超时则强制关闭整个连接，避免对端既不发送也不关闭导致的 relay 任务泄漏。
-/// 与 kdae 的 `relayHalfCloseTimeout`（10s）保持一致。
+/// When one direction's copy completes (source EOF), the other direction is given
+/// at most this much time to shut down gracefully.
+/// On timeout the whole connection is force-closed to avoid relay task leaks caused
+/// by a peer that neither sends data nor closes.
+/// Matches kdae's `relayHalfCloseTimeout` (10s).
 const RELAY_HALF_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ============================================================================
-// UDP 中继常量
+// UDP relay constants
 // ============================================================================
 
-/// UDP 数据包最大尺寸
+/// Maximum UDP packet size
 const MAX_UDP_SIZE: usize = 65535;
 
-/// recvmsg 辅助数据（cmsg）缓冲大小
+/// recvmsg ancillary data (cmsg) buffer size
 const CMSG_BUFFER_SIZE: usize = 128;
 
-/// UDP relay flow 空闲超时：超过该时间没有收到中继响应则关闭会话
+/// UDP relay flow idle timeout: the session is closed if no relay response is
+/// received within this time
 const UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// DNS UDP flow 空闲超时（RFC 5452 建议 17s）
+/// DNS UDP flow idle timeout (RFC 5452 recommends 17s)
 const DNS_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(17);
 
-/// QUIC/DTLS 等长连接 UDP flow 空闲超时（与 kdae 的 QuicNatTimeout 一致）
+/// Idle timeout for long-lived UDP flows such as QUIC/DTLS (matches kdae's QuicNatTimeout)
 const QUIC_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// UDP 发送（上游转发 / 回包）写 deadline。
+/// Write deadline for UDP sends (upstream forwarding / responses).
 ///
-/// 防止代理上游停滞或客户端不读取时发送路径无限期阻塞。
-/// 与 kdae 的 `udpEndpointWriteTimeout`（10s）保持一致。
+/// Prevents the send path from blocking indefinitely when the proxy upstream stalls
+/// or the client stops reading.
+/// Matches kdae's `udpEndpointWriteTimeout` (10s).
 const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 按原始目标端口选择 UDP flow 空闲超时（分级超时）。
+/// Select the UDP flow idle timeout by original destination port (tiered timeout).
 ///
-/// * 53（DNS）→ 17s（RFC 5452）
-/// * 443（QUIC/DTLS）→ 2min
-/// * 其他 → 30s（默认）
+/// * 53 (DNS) → 17s (RFC 5452)
+/// * 443 (QUIC/DTLS) → 2min
+/// * others → 30s (default)
 fn udp_flow_idle_timeout(dest: SocketAddr) -> Duration {
     match dest.port() {
         53 => DNS_UDP_IDLE_TIMEOUT,
@@ -105,61 +111,66 @@ fn udp_flow_idle_timeout(dest: SocketAddr) -> Duration {
     }
 }
 
-/// 透明回包 socket 池容量上限（超出时淘汰最久未用条目）
+/// Transparent response socket pool capacity limit (least-recently-used entries are evicted)
 const RESP_SOCKET_POOL_CAP: usize = 256;
 
 // ============================================================================
-// Linux socket 选项常量
+// Linux socket option constants
 // ============================================================================
 
-/// `IP_TRANSPARENT` socket 选项值（Linux）
+/// `IP_TRANSPARENT` socket option value (Linux)
 ///
-/// 使 socket 能透明地接受非本机地址的连接，是 TProxy 的核心机制。
-/// 需要 `CAP_NET_ADMIN` 权限。
+/// Lets a socket transparently accept connections for non-local addresses; this is
+/// the core mechanism of TProxy.
+/// Requires `CAP_NET_ADMIN`.
 const IP_TRANSPARENT: libc::c_int = 19;
 
-/// `IPV6_TRANSPARENT` socket 选项值（Linux）
+/// `IPV6_TRANSPARENT` socket option value (Linux)
 ///
-/// IPv6 版本的 IP_TRANSPARENT，使 IPv6 socket 能透明地接受非本机地址的连接。
+/// The IPv6 counterpart of IP_TRANSPARENT, letting an IPv6 socket transparently
+/// accept connections for non-local addresses.
 const IPV6_TRANSPARENT: libc::c_int = 75;
 
-/// `IP_RECVORIGDSTADDR` socket 选项值（Linux）
+/// `IP_RECVORIGDSTADDR` socket option value (Linux)
 ///
-/// 使 socket 在收到数据包时，通过辅助数据（cmsg）返回原始目标地址。
-/// 这是 UDP TProxy 获取原始目标地址的关键机制。
+/// Makes the socket return the original destination address via ancillary data (cmsg)
+/// when receiving packets.
+/// This is the key mechanism for obtaining the original destination address in UDP TProxy.
 const IP_RECVORIGDSTADDR: libc::c_int = 20;
 
-/// `IPV6_RECVORIGDSTADDR` socket 选项值（Linux）
+/// `IPV6_RECVORIGDSTADDR` socket option value (Linux)
 ///
-/// IPv6 版本的 IP_RECVORIGDSTADDR。
+/// The IPv6 counterpart of IP_RECVORIGDSTADDR.
 const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
 
-/// `SO_REUSEADDR` socket 选项值（Linux）
+/// `SO_REUSEADDR` socket option value (Linux)
 ///
-/// 允许重用处于 TIME_WAIT 状态的 socket 地址。
+/// Allows reusing a socket address in the TIME_WAIT state.
 #[allow(dead_code)]
 const SO_REUSEADDR: libc::c_int = 2;
 
-/// `SO_REUSEPORT` socket 选项值（Linux）
+/// `SO_REUSEPORT` socket option value (Linux)
 ///
-/// 允许多个 socket 绑定到相同的端口，实现负载均衡。
+/// Allows multiple sockets to bind to the same port for load balancing.
 #[allow(dead_code)]
 const SO_REUSEPORT: libc::c_int = 15;
 
-/// `SO_MARK` socket 选项值（Linux）
+/// `SO_MARK` socket option value (Linux)
 ///
-/// 设置 socket 的 fwmark，用于策略Routing和 eBPF program识别自身流量。
-/// original dae uses 0x100 as internal socket mark。
+/// Sets the socket's fwmark, used by policy routing and eBPF programs to identify
+/// self traffic.
+/// original dae uses 0x100 as internal socket mark.
 const SO_MARK: libc::c_int = 36;
 
 // ============================================================================
 // TproxyListener
 // ============================================================================
 
-/// TProxy 监听器
+/// TProxy listener
 ///
-/// 透明代理监听器，接收从内核（通过 eBPF + 策略Routing）重定向到代理命名空间的
-/// TCP 连接，通过 SOCKS5 出站Dialer转发到上游代理。
+/// Transparent proxy listener that receives TCP connections redirected by the kernel
+/// (via eBPF + policy routing) into the proxy namespace, forwarding them to the
+/// upstream proxy via the SOCKS5 outbound dialer.
 ///
 /// # Examples
 ///
@@ -181,46 +192,47 @@ const SO_MARK: libc::c_int = 36;
 /// # }
 /// ```
 pub struct TproxyListener {
-    /// Listen address（在代理命名空间内，如 `0.0.0.0:15080`）
+    /// Listen address (inside the proxy namespace, e.g. `0.0.0.0:15080`)
     listen_addr: SocketAddr,
-    /// 出站Dialer（按配置的协议构造）
+    /// Outbound dialer (constructed per the configured protocol)
     dialer: Arc<dyn OutboundDialer>,
     /// Running flag
     running: Arc<AtomicBool>,
     /// Socket mark value (for eBPF self-exclusion, default 0x100)
     socket_mark: u32,
-    /// 停止信号（通知 accept 循环退出，无需轮询）
+    /// Stop signal (notifies the accept loop to exit; no polling needed)
     stop_signal: Arc<Notify>,
-    /// 内部 DNS handler 地址（跨 namespace DNS 劫持用）。
+    /// Internal DNS handler address (for cross-namespace DNS hijacking).
     ///
-    /// 当 TCP 连接原始目标为 53 端口时，不再走代理 Dialer，而是把
-    /// DNS-over-TCP 会话转发到此地址的 DNS handler（与 UDP 劫持一致）。
-    /// `None` 表示不劫持 TCP DNS。
+    /// When a TCP connection's original destination is port 53, the connection is not
+    /// sent through the proxy dialer; instead the DNS-over-TCP session is forwarded to
+    /// the DNS handler at this address (consistent with UDP hijacking).
+    /// `None` means no TCP DNS hijacking.
     dns_forward_addr: Option<SocketAddr>,
-    /// Host network namespace fd（DNS 劫持上游 socket 在宿主 NS 创建）。
+    /// Host network namespace fd (upstream sockets for DNS hijacking are created in the host NS).
     host_ns_fd: Option<RawFd>,
 }
 
 impl TproxyListener {
-    /// 创建新的 TProxy 监听器
+    /// Create a new TProxy listener
     ///
     /// # Parameters
     ///
-    /// * `listen_addr` — 监听地址（如 `0.0.0.0:15080`）
-    /// * `dialer` — 出站Dialer
+    /// * `listen_addr` — listen address (e.g. `0.0.0.0:15080`)
+    /// * `dialer` — outbound dialer
     pub fn new(listen_addr: SocketAddr, dialer: Arc<dyn OutboundDialer>) -> Self {
         Self {
             listen_addr,
             dialer,
             running: Arc::new(AtomicBool::new(false)),
-            socket_mark: shared::DAE_SOCKET_MARK, // 原版 dae 默认值
+            socket_mark: shared::DAE_SOCKET_MARK, // default value from the original dae
             stop_signal: Arc::new(Notify::new()),
             dns_forward_addr: None,
             host_ns_fd: None,
         }
     }
 
-    /// 创建新的 TProxy 监听器，指定 socket 标记值
+    /// Create a new TProxy listener with a specified socket mark value
     pub fn new_with_mark(
         listen_addr: SocketAddr,
         dialer: Arc<dyn OutboundDialer>,
@@ -237,10 +249,11 @@ impl TproxyListener {
         }
     }
 
-    /// 设置 TCP DNS 劫持目标（内部 DNS handler 地址）。
+    /// Set the TCP DNS hijacking target (the internal DNS handler address).
     ///
-    /// 设置后，原始目标为 53 端口的 TCP 连接会被转发到该 DNS handler，
-    /// 而不是走代理。与 UDP 劫持的 `169.254.0.1:<port>` 保持一致。
+    /// After setting, TCP connections whose original destination is port 53 are forwarded
+    /// to this DNS handler instead of the proxy. Consistent with UDP hijacking's
+    /// `169.254.0.1:<port>`.
     pub fn set_dns_forward_addr(&mut self, addr: SocketAddr) {
         self.dns_forward_addr = Some(addr);
         tracing::info!(
@@ -249,7 +262,8 @@ impl TproxyListener {
         );
     }
 
-    /// 设置宿主网络命名空间 fd（DNS 劫持上游连接在宿主 NS 创建）。
+    /// Set the host network namespace fd (upstream connections for DNS hijacking are
+    /// created in the host NS).
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) {
         self.host_ns_fd = host_ns_fd;
     }
@@ -259,7 +273,7 @@ impl TproxyListener {
         self.listen_addr
     }
 
-    /// 获取出站Dialer的引用
+    /// Get a reference to the outbound dialer
     pub fn dialer(&self) -> &Arc<dyn OutboundDialer> {
         &self.dialer
     }
@@ -269,7 +283,7 @@ impl TproxyListener {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// 获取运行标记的原子引用（用于跨线程通信）
+    /// Get an atomic reference to the running flag (for cross-thread communication)
     pub fn running_flag(&self) -> Arc<AtomicBool> {
         self.running.clone()
     }
@@ -458,11 +472,11 @@ impl TproxyListener {
         self.serve(listener_v4, listener_v6).await
     }
 
-    /// Accept 循环核心（内部使用）
+    /// Core accept loop (internal use)
     async fn run_accept_loop(&self, listener: TcpListener) -> Result<()> {
         let mut accept_count: u64 = 0;
         loop {
-            // 检查运行标记，用于优雅停止
+            // Check the running flag for graceful shutdown
             if !self.running.load(Ordering::SeqCst) {
                 debug!(
                     listen_addr = %self.listen_addr,
@@ -472,10 +486,10 @@ impl TproxyListener {
                 break;
             }
 
-            // 使用 tokio::select! 同时等待 accept 和停止信号：
-            // - accept 到连接 → 处理连接
-            // - 收到停止信号 → 立即退出循环
-            // - accept 错误 → 短暂休眠后重试
+            // Use tokio::select! to wait for both accept and the stop signal:
+            // - accept a connection → handle the connection
+            // - receive the stop signal → exit the loop immediately
+            // - accept error → sleep briefly and retry
             tokio::select! {
                 result = listener.accept() => {
                     match result {
@@ -520,7 +534,7 @@ impl TproxyListener {
                                 error = %e,
                                 "Failed to accept connection"
                             );
-                            // 短暂休眠避免空转
+                            // Sleep briefly to avoid busy-looping
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
@@ -564,31 +578,33 @@ impl std::fmt::Debug for TproxyListener {
 }
 
 // ============================================================================
-// 连接处理
+// Connection handling
 // ============================================================================
 
-/// 处理单个 TProxy 连接（TCP 双向中继）
+/// Handle a single TProxy connection (bidirectional TCP relay)
 ///
-/// 执行完整的 TCP 双向中继流程：
+/// Runs the full bidirectional TCP relay flow:
 ///
-/// 1. **获取原始目标地址** — 从 `TcpStream` 中获取原始目标地址
-///    （利用 TProxy 的 `IP_TRANSPARENT` 特性，`getsockname()` 返回原始目标地址）
-/// 2. **SOCKS5 拨号** — 创建一个 SOCKS5 Dialer实例并调用 `dial(target_addr)` 建立到上游的连接
-/// 3. **获取 `ProxyConn`** — 获取实现了 `AsyncRead + AsyncWrite` 的代理连接
-/// 4. **双向数据拷贝** — 使用 `tokio::io::copy_bidirectional` 进行双向数据拷贝
-/// 5. **连接关闭** — 等待双向拷贝完成，确保干净关闭连接
+/// 1. **Get the original destination address** — obtain it from the `TcpStream`
+///    (via TProxy's `IP_TRANSPARENT` feature, `getsockname()` returns the original destination)
+/// 2. **SOCKS5 dial** — create a SOCKS5 dialer instance and call `dial(target_addr)` to
+///    establish the connection upstream
+/// 3. **Get a `ProxyConn`** — obtain a proxy connection implementing `AsyncRead + AsyncWrite`
+/// 4. **Bidirectional copy** — copy data in both directions with `tokio::io::copy_bidirectional`
+/// 5. **Connection close** — wait for the bidirectional copy to finish, ensuring a clean close
 ///
 /// # Parameters
 ///
-/// * `inbound` — 从 TProxy 接收的客户端连接
-/// * `dialer` — SOCKS5 出站Dialer
+/// * `inbound` — the client connection received from TProxy
+/// * `dialer` — the SOCKS5 outbound dialer
 ///
-/// # 错误处理
+/// # Error handling
 ///
-/// * 如果无法获取原始目标地址，返回错误（可能未正确设置 `IP_TRANSPARENT`）
-/// * 如果 SOCKS5 拨号失败，返回错误（可能上游代理不可达）
-/// * 如果双向拷贝失败，返回错误（可能网络中断）
-/// * 单个连接的错误不会影响监听器的其他连接
+/// * If the original destination address cannot be obtained, an error is returned
+///   (`IP_TRANSPARENT` may not be set correctly)
+/// * If the SOCKS5 dial fails, an error is returned (the upstream proxy may be unreachable)
+/// * If the bidirectional copy fails, an error is returned (the network may be interrupted)
+/// * An error in one connection does not affect the listener's other connections
 async fn handle_connection(
     mut inbound: TcpStream,
     dialer: Arc<dyn OutboundDialer>,
@@ -603,18 +619,19 @@ async fn handle_connection(
         "handle_connection: starting"
     );
 
-    // ---- 步骤 1：获取原始目标地址 ----
+    // ---- Step 1: Get the original destination address ----
     let orig_dst = get_original_dst(&inbound).context(
         "Failed to get original destination address from TProxy connection \
          (ensure IP_TRANSPARENT is set and CAP_NET_ADMIN is available)",
     )?;
     debug!(orig_dst = %orig_dst, "handle_connection: got original destination");
 
-    // ---- 步骤 1.5：TCP DNS 劫持 ----
-    // eBPF 已把 TCP 53 查询重定向到控制平面（ROUTE_STATE_DNS_QUERY）。
-    // 这里把 DNS-over-TCP 会话转发给内部 DNS handler，而不是走代理，
-    // 与 UDP 劫持（dns_forward_addr）保持一致。这样 TCP DNS 也能进入
-    // DNS 模块的缓存/防污染/代理逻辑。
+    // ---- Step 1.5: TCP DNS hijacking ----
+    // eBPF has already redirected TCP port 53 queries to the control plane
+    // (ROUTE_STATE_DNS_QUERY).
+    // Here the DNS-over-TCP session is forwarded to the internal DNS handler instead of
+    // the proxy, consistent with UDP hijacking (dns_forward_addr). This way TCP DNS also
+    // enters the DNS module's caching/anti-pollution/proxy logic.
     if orig_dst.port() == 53 {
         if let Some(handler_addr) = dns_forward_addr {
             info!(
@@ -631,11 +648,12 @@ async fn handle_connection(
         );
     }
 
-    // ---- 步骤 2：禁用 Nagle（TCP_NODELAY），降低交互式小包延迟 ----
-    // 入站连接由内核 accept 默认开启 Nagle；出站连接在 SOCKS5 Dialer中设置。
+    // ---- Step 2: Disable Nagle (TCP_NODELAY) to reduce interactive small-packet latency ----
+    // Inbound connections have Nagle enabled by default on kernel accept; outbound
+    // connections set it in the SOCKS5 dialer.
     set_tcp_nodelay(&inbound);
 
-    // ---- 步骤 2：通过出站Dialer拨号到目标 ----
+    // ---- Step 2: Dial the target via the outbound dialer ----
     let protocol = dialer.protocol_name();
     let proxy_addr = dialer.proxy_addr();
     let dial_result = dialer.dial(&orig_dst.to_string()).await;
@@ -666,9 +684,9 @@ async fn handle_connection(
         }
     };
 
-    // ---- 步骤 2.5：记录出站连接信息（INFO）----
-    // outbound local 地址为宿主 NS 中真实源地址（Tcp 变体）；
-    // TLS/WS/QUIC 包装流无法直接取 socket 地址，显示 n/a。
+    // ---- Step 2.5: Log outbound connection info (INFO) ----
+    // The outbound local address is the real source address in the host NS (Tcp variant);
+    // TLS/WS/QUIC wrapped streams cannot directly read socket addresses, shown as n/a.
     let outbound_local = match &outbound.stream {
         ProxyStream::Tcp(s) => s.local_addr().ok(),
         ProxyStream::Boxed(_) => None,
@@ -688,8 +706,8 @@ async fn handle_connection(
         start.elapsed().as_micros() as f64 / 1000.0,
     );
 
-    // ---- 步骤 3：双向数据拷贝 ----
-    // 纯 TCP 连接走 splice 零拷贝中继；TLS/WS/QUIC 包装流走缓冲拷贝。
+    // ---- Step 3: Bidirectional data copy ----
+    // Pure TCP connections use splice zero-copy relay; TLS/WS/QUIC wrapped streams use buffered copy.
     let result = match outbound.stream {
         ProxyStream::Tcp(outbound_stream) => {
             relay_bidirectional(inbound, outbound_stream).await
@@ -746,15 +764,18 @@ async fn handle_connection(
     Ok(())
 }
 
-/// 转发一个 DNS-over-TCP 会话到内部 DNS handler。
+/// Forward a DNS-over-TCP session to the internal DNS handler.
 ///
-/// DNS-over-TCP 使用 2 字节长度前缀帧（RFC 1035 §4.2.2）。这里把客户端
-/// 连接与内部 DNS handler 之间的字节流双向转发即可：查询帧发给 handler，
-/// 响应帧回传客户端。由于客户端连接是 IP_TRANSPARENT 的 TProxy socket
-/// （本地地址 = 原始目标 DNS 服务器），回程数据源地址正确，客户端不会丢弃。
+/// DNS-over-TCP uses a 2-byte length-prefix framing (RFC 1035 §4.2.2). The byte stream
+/// between the client connection and the internal DNS handler is relayed bidirectionally:
+/// query frames go to the handler, response frames come back to the client. Since the
+/// client connection is an IP_TRANSPARENT TProxy socket (local address = original
+/// destination DNS server), the return-path source address is correct and the client
+/// will not drop the packets.
 ///
-/// 上游 socket 在宿主 NS 创建（`host_ns_fd`）并打 SO_MARK=DAE_SOCKET_MARK，
-/// 与 UDP 劫持路径保持一致，确保 eBPF 放行（防劫持循环）。
+/// The upstream socket is created in the host NS (`host_ns_fd`) and marked with
+/// SO_MARK=DAE_SOCKET_MARK, consistent with the UDP hijack path, ensuring eBPF lets
+/// it through (preventing a hijack loop).
 async fn handle_dns_tcp_connection(
     mut inbound: TcpStream,
     handler_addr: SocketAddr,
@@ -771,7 +792,7 @@ async fn handle_dns_tcp_connection(
     .map_err(|e| anyhow::anyhow!("failed to connect to internal DNS handler {}: {}", handler_addr, e))?;
 
     set_tcp_nodelay(&upstream);
-    // 纯字节中继：长度前缀帧原样透传，无需在此解析 DNS。
+    // Pure byte relay: length-prefixed frames pass through as-is, no DNS parsing here.
     let (a, b) = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await?;
     debug!(
         handler_addr = %handler_addr,
@@ -786,33 +807,33 @@ async fn handle_dns_tcp_connection(
 // Helper function
 // ============================================================================
 
-/// 获取 TProxy 连接的原始目标地址
+/// Get the original destination address of a TProxy connection
 ///
-/// 在 Linux TProxy 模式下，由于设置了 `IP_TRANSPARENT` 选项，
-/// `getsockname()` 系统调用返回的不是 socket 的本地地址，而是
-/// 客户端连接的原始目标地址。这使得我们能够在不修改数据包的情况下
-/// 获取客户端原本要连接的目标地址。
+/// In Linux TProxy mode, with the `IP_TRANSPARENT` option set, the `getsockname()`
+/// system call returns not the socket's local address but the client connection's
+/// original destination address. This lets us obtain the address the client originally
+/// intended to connect to, without modifying packets.
 ///
-/// # 实现原理
+/// # Implementation details
 ///
 /// ```text
-/// 正常模式：  getsockname() → 本地绑定地址（如 0.0.0.0:15080）
-/// TProxy 模式：getsockname() → 原始目标地址（如 1.2.3.4:80）
+/// Normal mode:   getsockname() → local bound address (e.g. 0.0.0.0:15080)
+/// TProxy mode:   getsockname() → original destination address (e.g. 1.2.3.4:80)
 /// ```
 ///
 /// # Parameters
 ///
-/// * `stream` — TProxy 接收的 TCP 连接
+/// * `stream` — the TCP connection received by TProxy
 ///
 /// # Returns
 ///
-/// 返回原始目标地址（`SocketAddr`）。
+/// Returns the original destination address (`SocketAddr`).
 ///
-/// # 错误
+/// # Errors
 ///
-/// * 如果没有 `CAP_NET_ADMIN` 权限或未正确设置 `IP_TRANSPARENT`，
-///   可能返回错误
-/// * 如果地址的端口号为 0，视为无效地址返回错误
+/// * May return an error if `CAP_NET_ADMIN` is missing or `IP_TRANSPARENT` is not
+///   set correctly
+/// * Returns an error if the address's port is 0, treating it as invalid
 fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     use socket2::SockRef;
 
@@ -824,7 +845,7 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
         .as_socket()
         .context("getsockname() returned a non-IP address")?;
 
-    // 验证地址有效性：TProxy 原始目标地址的端口不应为 0
+    // Validate the address: a TProxy original destination address's port must not be 0
     if addr.port() == 0 {
         anyhow::bail!(
             "Invalid original destination address (port is 0): {} — \
@@ -836,11 +857,12 @@ fn get_original_dst(stream: &TcpStream) -> Result<SocketAddr> {
     Ok(addr)
 }
 
-/// 设置 TCP_NODELAY 禁用 Nagle 算法。
+/// Set TCP_NODELAY to disable the Nagle algorithm.
 ///
-/// 代理路径上每个字节流都可能承载交互式小包（SSH、游戏、API 请求等），
-/// Nagle 会把这些小包合并等待 ACK，显著增加 RTT。原版 dae 对入站和出站
-/// 连接都显式设置 TCP_NODELAY。失败仅记录 debug（非致命）。
+/// Every byte stream on the proxy path may carry interactive small packets (SSH, games,
+/// API requests, etc.); Nagle coalesces these and waits for an ACK, significantly
+/// increasing RTT. The original dae explicitly sets TCP_NODELAY on both inbound and
+/// outbound connections. Failure is only logged at debug level (non-fatal).
 fn set_tcp_nodelay(stream: &TcpStream) {
     use socket2::SockRef;
     if let Err(e) = SockRef::from(stream).set_nodelay(true) {
@@ -849,10 +871,10 @@ fn set_tcp_nodelay(stream: &TcpStream) {
 }
 
 // ============================================================================
-// TCP 双向中继：splice 零拷贝 + 大缓冲回退
+// TCP bidirectional relay: splice zero-copy + large-buffer fallback
 // ============================================================================
 
-/// 管道对（RAII，析构时关闭两端 fd）。
+/// Pipe pair (RAII; closes both fds on drop).
 struct PipePair {
     r: RawFd,
     w: RawFd,
@@ -878,10 +900,10 @@ impl Drop for PipePair {
     }
 }
 
-/// 探测 splice() 对 (src, dst) 组合是否可用。
+/// Probe whether splice() supports the (src, dst) combination.
 ///
-/// 用 len=0 的 splice 调用只触发内核的 fd 类型校验而不搬运数据；
-/// 若返回 EINVAL（内核/文件类型不支持）则回退到缓冲拷贝。
+/// A splice call with len=0 only triggers the kernel's fd type check without moving
+/// data; if it returns EINVAL (kernel/file type unsupported), fall back to buffered copy.
 fn splice_supported(src: &TcpStream, dst: &TcpStream, pipe: &PipePair) -> bool {
     use std::os::unix::io::AsRawFd;
     let flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
@@ -920,11 +942,12 @@ fn splice_supported(src: &TcpStream, dst: &TcpStream, pipe: &PipePair) -> bool {
     true
 }
 
-/// 为 splice 就绪等待复制一个独立 fd（dup）。
+/// Duplicate the fd (dup) for splice readiness waiting.
 ///
-/// 原 tokio `TcpStream` 已注册到 reactor，不能直接用其 fd 再注册
-/// AsyncFd（同一 fd 重复注册会与现有注册冲突）；dup 出独立 fd 后
-/// 两个注册互不干扰，且原流仍可用于 shutdown 等操作。
+/// The original tokio `TcpStream` is already registered with the reactor, so its fd
+/// cannot be registered again with AsyncFd (re-registering the same fd conflicts with
+/// the existing registration); after dup-ing an independent fd, the two registrations
+/// do not interfere, and the original stream can still be used for operations like shutdown.
 fn dup_fd_stream(stream: &TcpStream) -> std::io::Result<AsyncFd<std::net::TcpStream>> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let dup_fd = unsafe { libc::dup(stream.as_raw_fd()) };
@@ -935,10 +958,10 @@ fn dup_fd_stream(stream: &TcpStream) -> std::io::Result<AsyncFd<std::net::TcpStr
     AsyncFd::new(std_stream)
 }
 
-/// 用 splice() 单向搬运数据：src socket → 管道 → dst socket（零拷贝）。
+/// Move data in one direction with splice(): src socket → pipe → dst socket (zero-copy).
 ///
-/// 源 EOF 时对 dst 执行 `shutdown(SHUT_WR)` 传播 FIN（半关闭语义），
-/// 然后返回本方向搬运的总字节数。
+/// On source EOF, `shutdown(SHUT_WR)` is called on dst to propagate FIN (half-close
+/// semantics), then the total number of bytes moved in this direction is returned.
 async fn splice_direction(
     src: &TcpStream,
     dst: &TcpStream,
@@ -953,7 +976,7 @@ async fn splice_direction(
     let mut total: u64 = 0;
 
     loop {
-        // 1. 等待源可读，splice 进管道
+        // 1. Wait for the source to be readable, then splice into the pipe
         let n = loop {
             let mut guard = src_ready.readable().await?;
             let n = unsafe {
@@ -970,7 +993,7 @@ async fn splice_direction(
                 break n as usize;
             }
             if n == 0 {
-                // 源 EOF：向对端传播 FIN，本方向结束
+                // Source EOF: propagate FIN to the peer, this direction ends
                 unsafe { libc::shutdown(dst_fd, libc::SHUT_WR) };
                 return Ok(total);
             }
@@ -981,9 +1004,10 @@ async fn splice_direction(
             guard.clear_ready();
         };
 
-        // 2. 等待目标可写，把管道数据全部 splice 进目标。
-        // 必须循环排空管道：若一次只搬走部分字节（m < n），剩余字节若
-        // 留到下一轮外层循环会因等待源可读而滞留（死锁）。
+        // 2. Wait for the target to be writable, then splice all pipe data into it.
+        // Must loop to drain the pipe: if only part of the bytes (m < n) is moved in
+        // one pass, the remaining bytes would stall in the next outer iteration because
+        // it waits for the source to be readable (deadlock).
         let mut remaining = n;
         while remaining > 0 {
             let mut guard = dst_ready.writable().await?;
@@ -1003,7 +1027,7 @@ async fn splice_direction(
                 continue;
             }
             if m == 0 {
-                // 管道 EOF（写端已关），正常结束
+                // Pipe EOF (write end closed), normal end
                 return Ok(total);
             }
             let err = std::io::Error::last_os_error();
@@ -1015,7 +1039,8 @@ async fn splice_direction(
     }
 }
 
-/// 单方向缓冲拷贝（64KB 缓冲），源 EOF 时 shutdown 目标写端传播 FIN。
+/// Single-direction buffered copy (64KB buffer); on source EOF, shuts down the target
+/// write side to propagate FIN.
 async fn buffered_copy_direction<R, W>(src: &mut R, dst: &mut W) -> std::io::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1034,19 +1059,20 @@ where
     }
 }
 
-/// 双向中继半关闭保护：当一个方向完成时，给另一方 [`RELAY_HALF_CLOSE_TIMEOUT`]
-/// 时间优雅关闭；超时则返回错误（调用方会关闭整个连接）。
+/// Bidirectional relay half-close protection: when one direction completes, the other
+/// side is given [`RELAY_HALF_CLOSE_TIMEOUT`] time to shut down gracefully; on timeout an
+/// error is returned (the caller closes the whole connection).
 ///
-/// 镜像 kdae 的 `forceClose()`：防止对端既不发送数据也不关闭连接时，另一方向
-/// 的 `read()` 永久阻塞导致 relay 任务泄漏。
+/// Mirrors kdae's `forceClose()`: prevents the other direction's `read()` from blocking
+/// forever when the peer neither sends data nor closes, which would leak the relay task.
 enum RelaySide {
-    /// 客户端 → 代理方向（`f1`）
+    /// Client → proxy direction (`f1`)
     Up,
-    /// 代理 → 客户端方向（`f2`）
+    /// Proxy → client direction (`f2`)
     Down,
 }
 
-/// 包装两个单向拷贝 future，提供 half-close 超时保护。
+/// Wrap the two single-direction copy futures with half-close timeout protection.
 async fn half_close_guard<F1, F2>(
     f1: F1,
     f2: F2,
@@ -1085,15 +1111,16 @@ where
     }
 }
 
-/// 双向 TCP 中继：优先 splice() 零拷贝路径，不可用时回退到 64KB 缓冲拷贝。
+/// Bidirectional TCP relay: prefers the splice() zero-copy path, falls back to a 64KB
+/// buffered copy when unavailable.
 ///
-/// 返回 `(客户端→代理 字节数, 代理→客户端 字节数)`，与 tokio
-/// `copy_bidirectional` 的顺序一致。
+/// Returns `(client→proxy bytes, proxy→client bytes)`, consistent with tokio's
+/// `copy_bidirectional` ordering.
 async fn relay_bidirectional(
     mut inbound: TcpStream,
     mut outbound: TcpStream,
 ) -> std::io::Result<(u64, u64)> {
-    // ---- splice 零拷贝路径 ----
+    // ---- splice zero-copy path ----
     if let Ok(pipe_ab) = PipePair::new() {
         if let Ok(pipe_ba) = PipePair::new() {
             if splice_supported(&inbound, &outbound, &pipe_ab)
@@ -1108,7 +1135,7 @@ async fn relay_bidirectional(
         }
     }
 
-    // ---- 64KB 缓冲回退路径（splice 不可用）----
+    // ---- 64KB buffered fallback path (splice unavailable) ----
     let (mut inbound_r, mut inbound_w) = inbound.split();
     let (mut outbound_r, mut outbound_w) = outbound.split();
     half_close_guard(
@@ -1243,28 +1270,28 @@ mod tests {
         let flag = listener.running_flag();
         assert!(!flag.load(Ordering::SeqCst));
 
-        // 验证 flag 与 listener 共享同一 AtomicBool
+        // Verify that the flag shares the same AtomicBool as the listener
         flag.store(true, Ordering::SeqCst);
         assert!(listener.is_running());
     }
 
     #[test]
     fn test_get_original_dst_not_tproxy() {
-        // 在没有 IP_TRANSPARENT 的情况下，get_original_dst 的行为测试
-        // 由于没有实际的 TProxy 连接，我们只验证函数签名
-        // 注意：此测试仅验证在非 TProxy 环境下 getsockname 返回正常地址
+        // Behavior test of get_original_dst without IP_TRANSPARENT
+        // Since there is no real TProxy connection, we only verify the function signature
+        // Note: this test only verifies that getsockname returns a normal address in a non-TProxy environment
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         rt.block_on(async {
-            // 绑定到本地地址，非 TProxy 模式
+            // Bind to a local address, non-TProxy mode
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
-            // 这里无法测试 get_original_dst 因为需要真实的 TProxy 连接，
-            // 但我们至少确保函数签名和基本类型正确
+            // get_original_dst cannot be tested here because it needs a real TProxy connection,
+            // but we at least ensure the function signature and basic types are correct
             let dialer: std::sync::Arc<dyn protocols::OutboundDialer> = std::sync::Arc::new(Socks5Dialer::new("127.0.0.1:1080".parse().unwrap(), "", "", 5000));
             let tproxy = TproxyListener::new(addr, dialer);
             assert_eq!(tproxy.listen_addr(), addr);
@@ -1467,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_half_close_guard_both_complete() {
-        // 两个方向都正常完成，返回 (up, down) 字节数。
+        // Both directions complete normally, returning the (up, down) byte counts.
         let (up, down) = half_close_guard(
             std::future::ready(Ok::<u64, std::io::Error>(10)),
             std::future::ready(Ok::<u64, std::io::Error>(20)),
@@ -1479,7 +1506,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_half_close_guard_first_error_propagates() {
-        // 第一个方向立即出错，错误应传播，不等待另一个方向。
+        // The first direction errors immediately; the error should propagate without
+        // waiting for the other direction.
         let err = half_close_guard(
             std::future::ready(Err::<u64, std::io::Error>(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -1494,7 +1522,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_half_close_guard_timeout_forces_close() {
-        // 一个方向完成后，另一个方向永不完成 → 超时强制返回 TimedOut 错误。
+        // After one direction completes, the other never completes → timeout forces a TimedOut error.
         let never = std::future::pending::<std::io::Result<u64>>();
         let err = half_close_guard(std::future::ready(Ok::<u64, std::io::Error>(10)), never)
             .await
@@ -1504,39 +1532,42 @@ mod tests {
 }
 
 // ============================================================================
-// UDP TProxy 监听器
+// UDP TProxy listener
 // ============================================================================
 
-/// UDP TProxy 监听器
+/// UDP TProxy listener
 ///
-/// 透明代理 UDP 流量，通过 `IP_RECVORIGDSTADDR` 获取原始目标地址。
-/// 对于 DNS 流量（目标端口 53），使用 DNS 劫持：将查询转发到内部 DNS handler
-/// 进行处理，而不是通过 SOCKS5 代理。这样可以支持Domain nameRouting、缓存等功能。
+/// Transparently proxies UDP traffic, obtaining the original destination address via
+/// `IP_RECVORIGDSTADDR`.
+/// For DNS traffic (destination port 53), DNS hijacking is used: queries are forwarded
+/// to the internal DNS handler instead of through the SOCKS5 proxy. This enables
+/// domain-based routing, caching, and other features.
 pub struct UdpTproxyListener {
-    /// Listen address（如 `0.0.0.0:15080` 或 `[::]:15080`）
+    /// Listen address (e.g. `0.0.0.0:15080` or `[::]:15080`)
     listen_addr: SocketAddr,
-    /// 出站Dialer
+    /// Outbound dialer
     dialer: Arc<dyn OutboundDialer>,
     /// Running flag
     running: Arc<AtomicBool>,
     /// Socket mark value (for eBPF self-exclusion, default 0x100)
     socket_mark: u32,
-    /// 停止信号（通知接收循环立即退出）
+    /// Stop signal (notifies the receive loop to exit immediately)
     stop_signal: Arc<Notify>,
-    /// DNS 转发目标地址（用于 DNS 劫持）。
-    /// 当收到 DNS 查询时，将查询转发到此地址的 DNS handler 处理，
-    /// 而不是通过 SOCKS5 代理。None 表示不使用 DNS 劫持（回退到 SOCKS5）。
+    /// DNS forwarding target address (for DNS hijacking).
+    /// When a DNS query is received, it is forwarded to the DNS handler at this address
+    /// instead of through the SOCKS5 proxy. None disables DNS hijacking (falls back to SOCKS5).
     dns_forward_addr: Option<SocketAddr>,
     /// Host network namespace fd.
     ///
     /// After setting, all upstream UDP sockets (DNS hijack query sockets, UDP relay responses
-    /// socket）在宿主 NS 中创建并发出（与 kdae 对齐），源地址为宿主真实
-    /// WAN address instead of daens internal address。`None` 表示在当前命名空间中创建。
+    /// sockets) are created and sent from the host NS (aligned with kdae), so the source
+    /// address is the host's real WAN address instead of the daens internal address.
+    /// `None` creates sockets in the current namespace.
     host_ns_fd: Option<RawFd>,
 }
 
 impl UdpTproxyListener {
-    /// 创建新的 UDP TProxy 监听器
+    /// Create a new UDP TProxy listener
     pub fn new(listen_addr: SocketAddr, dialer: Arc<dyn OutboundDialer>) -> Self {
         Self {
             listen_addr,
@@ -1549,7 +1580,7 @@ impl UdpTproxyListener {
         }
     }
 
-    /// 创建新的 UDP TProxy 监听器，指定 socket 标记值
+    /// Create a new UDP TProxy listener with a specified socket mark value
     pub fn new_with_mark(
         listen_addr: SocketAddr,
         dialer: Arc<dyn OutboundDialer>,
@@ -1569,14 +1600,15 @@ impl UdpTproxyListener {
     /// Set host network namespace fd.
     ///
     /// After setting, all upstream UDP sockets (DNS hijack query sockets, UDP relay responses
-    /// socket）在宿主 NS 中创建（与 kdae 对齐）。
+    /// sockets) are created in the host NS (aligned with kdae).
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
     }
 
-    /// 设置 DNS 转发目标地址。
-    /// 设置后，DNS 查询会直接转发到此地址，而不是通过 SOCKS5 代理。
+    /// Set the DNS forwarding target address.
+    /// After setting, DNS queries are forwarded directly to this address instead of
+    /// through the SOCKS5 proxy.
     pub fn set_dns_forward_addr(&mut self, addr: SocketAddr) {
         self.dns_forward_addr = Some(addr);
         info!(
@@ -1595,11 +1627,11 @@ impl UdpTproxyListener {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// 创建并绑定 UDP TProxy socket
+    /// Create and bind the UDP TProxy socket
     ///
-    /// 设置 IP_TRANSPARENT、IP_RECVORIGDSTADDR 和 SO_MARK 等 socket 选项。
-    /// 注意：IP_TRANSPARENT 必须在 bind() 之前设置，否则 bind() 会因为
-    /// 尝试绑定非本机地址而失败。
+    /// Sets socket options such as IP_TRANSPARENT, IP_RECVORIGDSTADDR and SO_MARK.
+    /// Note: IP_TRANSPARENT must be set before bind(), otherwise bind() fails because
+    /// it tries to bind a non-local address.
     pub async fn bind(&self) -> Result<tokio::net::UdpSocket> {
         use socket2::{Domain, Protocol, Socket, Type};
         use std::os::unix::io::AsRawFd;
@@ -1613,7 +1645,7 @@ impl UdpTproxyListener {
             "UDP TProxy bind starting"
         );
 
-        // 使用 socket2 创建原始 socket，在 bind 前设置所有选项
+        // Use socket2 to create the raw socket, setting all options before bind
         let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
             .context("Failed to create UDP TProxy socket")?;
@@ -1621,7 +1653,7 @@ impl UdpTproxyListener {
         let one: libc::c_int = 1;
         let fd = socket.as_raw_fd();
 
-        // IPv6: 设置 IPV6_V6ONLY=0 以启用双栈（在 bind 前设置）
+        // IPv6: set IPV6_V6ONLY=0 to enable dual-stack (before bind)
         if is_ipv6 {
             let zero: libc::c_int = 0;
             unsafe {
@@ -1635,7 +1667,7 @@ impl UdpTproxyListener {
             }
         }
 
-        // 设置 IP_TRANSPARENT（必须在 bind 之前！）
+        // Set IP_TRANSPARENT (must be before bind!)
         if is_ipv6 {
             unsafe {
                 libc::setsockopt(
@@ -1658,11 +1690,11 @@ impl UdpTproxyListener {
             }
         }
 
-        // 设置 IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR（用于获取原始目标地址）
-        // 双栈 (AF_INET6, V6ONLY=0) socket 会同时收到 IPv4 和 IPv6 报文：
-        // IPv4 报文走内核 ip_cmsg_recv，需要 SOL_IP 上的 IP_RECVORIGDSTADDR；
-        // IPv6 报文需要 SOL_IPV6 上的 IPV6_RECVORIGDSTADDR。
-        // 只设置其中一个会导致相应地址族的报文解析不到原始目标地址。
+        // Set IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR (to get the original destination address)
+        // A dual-stack (AF_INET6, V6ONLY=0) socket receives both IPv4 and IPv6 packets:
+        // IPv4 packets go through the kernel's ip_cmsg_recv, needing IP_RECVORIGDSTADDR on SOL_IP;
+        // IPv6 packets need IPV6_RECVORIGDSTADDR on SOL_IPV6.
+        // Setting only one of them leaves the other address family unable to parse the original destination.
         if is_ipv6 {
             unsafe {
                 libc::setsockopt(
@@ -1694,14 +1726,14 @@ impl UdpTproxyListener {
             }
         }
 
-        // 设置 SO_REUSEADDR
+        // Set SO_REUSEADDR
         socket.set_reuse_address(true)?;
 
-        // 设置 SO_REUSEPORT
+        // Set SO_REUSEPORT
         #[cfg(unix)]
         socket.set_reuse_port(true)?;
 
-        // 设置 SO_MARK（用于 eBPF 自排除）
+        // Set SO_MARK (for eBPF self-exclusion)
         if self.socket_mark != 0 {
             let mark_val = self.socket_mark as libc::c_int;
             unsafe {
@@ -1715,7 +1747,7 @@ impl UdpTproxyListener {
             }
         }
 
-        // 绑定地址（此时 IP_TRANSPARENT 已生效）
+        // Bind the address (IP_TRANSPARENT is now in effect)
         let sock_addr = socket2::SockAddr::from(self.listen_addr);
         socket.bind(&sock_addr).with_context(|| {
             format!(
@@ -1724,7 +1756,7 @@ impl UdpTproxyListener {
             )
         })?;
 
-        // 转换为 tokio UdpSocket
+        // Convert to a tokio UdpSocket
         let std_socket: std::net::UdpSocket = socket.into();
         std_socket.set_nonblocking(true)?;
         let tokio_socket = tokio::net::UdpSocket::from_std(std_socket)
@@ -1743,7 +1775,7 @@ impl UdpTproxyListener {
         Ok(tokio_socket)
     }
 
-    /// 启动 UDP TProxy 监听循环
+    /// Start the UDP TProxy receive loop
     pub async fn start(
         &self,
         ebpf_mgr: Option<Arc<Mutex<crate::net::ebpf::EbpfManager>>>,
@@ -1777,21 +1809,25 @@ impl UdpTproxyListener {
         self.run_receive_loop(std_socket).await
     }
 
-    /// UDP 接收循环核心 — 使用 recvmsg 获取 cmsg 以解析原始目标地址，
-    /// 并通过 SOCKS5 UDP ASSOCIATE 将数据包转发到原始目标。
-    /// 对于 DNS 流量，如果配置了 dns_forward_addr，则直接转发到内部的 DNS handler，
-    /// 实现 DNS 劫持，而不是通过 SOCKS5 代理。
+    /// UDP receive loop core — uses recvmsg to get cmsg for parsing the original
+    /// destination address, and forwards packets to the original destination via
+    /// SOCKS5 UDP ASSOCIATE.
+    /// For DNS traffic, if dns_forward_addr is configured, queries are forwarded
+    /// directly to the internal DNS handler, implementing DNS hijacking instead of
+    /// going through the SOCKS5 proxy.
     ///
-    /// # 优化说明
+    /// # Optimization notes
     ///
-    /// - 收包/发送缓冲在循环外复用，避免每个 UDP 包 64KB 堆分配；
-    /// - 用 tokio `AsyncFd` 等待可读，替代 spawn_blocking + 10ms 轮询；
-    /// - SOCKS5 UDP ASSOCIATE 会话按 (dest, peer) 建立 flow，每个 flow 有独立
-    ///   reader 任务持续读取中继响应并回发客户端；发送不持锁，同一目标的并发
-    ///   包（QUIC 多包在途）不再被互斥锁串行化；
-    /// - 回包 socket（IP_TRANSPARENT，绑定原目标地址）按 dest 复用，避免每包
-    ///   socket()+setsockopt()+bind()（host_ns_fd 场景下还包括 2 次 setns）；
-    /// - 包级日志降为 debug。
+    /// - Receive/send buffers are reused outside the loop, avoiding a 64KB heap allocation per UDP packet;
+    /// - tokio `AsyncFd` waits for readability instead of spawn_blocking + 10ms polling;
+    /// - SOCKS5 UDP ASSOCIATE sessions are per (dest, peer) flow, each with an independent
+    ///   reader task continuously reading relay responses and sending them back to the client;
+    ///   sends do not hold the lock, so concurrent packets to the same destination
+    ///   (QUIC multiple in-flight packets) are no longer serialized by the mutex;
+    /// - response sockets (IP_TRANSPARENT, bound to the original destination address) are
+    ///   reused per dest, avoiding socket()+setsockopt()+bind() per packet (2 extra setns
+    ///   calls in the host_ns_fd scenario);
+    /// - per-packet logging is downgraded to debug.
     async fn run_receive_loop(&self, socket: std::net::UdpSocket) -> Result<()> {
         use std::os::unix::io::AsRawFd;
 
@@ -1801,16 +1837,16 @@ impl UdpTproxyListener {
         let dns_forward_addr = self.dns_forward_addr;
         let host_ns_fd = self.host_ns_fd;
 
-        // 缓冲在循环外复用（避免每包 64KB 分配）
+        // Buffers are reused outside the loop (avoiding a 64KB allocation per packet)
         let mut buf = vec![0u8; MAX_UDP_SIZE];
         let mut cmsg_buf = vec![0u8; CMSG_BUFFER_SIZE];
 
-        // SOCKS5 UDP flow 池：(dest, peer) → 会话 + reader 任务
+        // SOCKS5 UDP flow pool: (dest, peer) → session + reader task
         let flows = Arc::new(UdpFlowPool::new());
-        // 透明回包 socket 池：dest → socket（DNS 劫持与 SOCKS5 回包共用）
+        // Transparent response socket pool: dest → socket (shared by DNS hijack and SOCKS5 responses)
         let resp_socks = Arc::new(RespSocketPool::new());
 
-        // 将 fd 注册到 tokio reactor，用可读事件驱动 recvmsg（fd 保持非阻塞）
+        // Register the fd with the tokio reactor, driving recvmsg by readability (fd stays non-blocking)
         let async_fd =
             AsyncFd::new(socket).context("Failed to register UDP socket with reactor")?;
 
@@ -1856,7 +1892,7 @@ impl UdpTproxyListener {
                         }
                     };
 
-                    // 包级日志（QUIC/游戏等高频 UDP 下 info 会刷屏，使用 debug）
+                    // Per-packet logging (info would flood under high-frequency UDP like QUIC/games; use debug)
                     let is_dns = dest.port() == 53 && n > 12;
                     if is_dns {
                         let qname = extract_dns_query_name(&buf[..n]);
@@ -1969,8 +2005,9 @@ impl UdpTproxyListener {
                     }
 
                     // ---- SOCKS5 UDP ASSOCIATE path (non-DNS traffic) ----
-                    // 按 (dest, peer) 复用 flow：发送立即完成，响应由 flow 的
-                    // reader 任务回发（send 与 recv 解耦，不持锁等待）。
+                    // Flows are reused by (dest, peer): sends complete immediately, and responses
+                    // are sent back by the flow's reader task (send and recv are decoupled,
+                    // no lock held while waiting).
                     let flows = flows.clone();
                     let resp_socks = resp_socks.clone();
                     let dialer = dialer.clone();
@@ -1995,8 +2032,9 @@ impl UdpTproxyListener {
                             }
                         };
 
-                        // 通过协议的 UDP 会话转发数据报（无需锁，各协议内部处理）。
-                        // 写 deadline 保护：防止上游停滞时无限期阻塞。
+                        // Forward the datagram through the protocol's UDP session (no lock needed;
+                        // each protocol handles it internally).
+                        // Write deadline protection: prevents indefinite blocking when upstream stalls.
                         let send_fut = session.send(&dest, &payload);
                         match tokio::time::timeout(UDP_WRITE_TIMEOUT, send_fut).await {
                             Ok(Ok(())) => {}
@@ -2017,7 +2055,7 @@ impl UdpTproxyListener {
         Ok(())
     }
 
-    /// 停止 UDP TProxy 监听器
+    /// Stop the UDP TProxy listener
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         self.stop_signal.notify_one();
@@ -2026,25 +2064,27 @@ impl UdpTproxyListener {
 }
 
 // ============================================================================
-// UDP flow 池 & 回包 socket 池
+// UDP flow pool & response socket pool
 // ============================================================================
 
-/// 一个 UDP relay flow：协议无关的 UDP 会话 + 专属 reader 任务。
+/// A UDP relay flow: a protocol-agnostic UDP session + a dedicated reader task.
 ///
-/// reader 任务持续从会话接收中继响应（原始目标地址 + payload），
-/// 通过池化的透明回包 socket 发回对应客户端。这样发送方在 `send()`
-/// 后立即返回，同一 flow 的并发包不会被互斥锁串行化。
+/// The reader task continuously receives relay responses (original destination address +
+/// payload) from the session and sends them back to the corresponding client through the
+/// pooled transparent response socket. This way the sender returns immediately after `send()`,
+/// and concurrent packets in the same flow are not serialized by a mutex.
 struct UdpRelayFlow {
     session: Arc<dyn UdpSession>,
-    /// reader 任务句柄（空闲超时或出错时自行从池中移除自己）
+    /// Reader task handle (removes itself from the pool on idle timeout or error)
     #[allow(dead_code)]
     reader: tokio::task::JoinHandle<()>,
 }
 
-/// UDP flow 池，按 (原始目标地址, 客户端地址) 复用会话。
+/// UDP flow pool, reusing sessions by (original destination address, client address).
 ///
-/// 以 (dest, peer) 为键是因为中继响应的头中只有目标地址，
-/// 没有客户端信息；一个 flow 对应一个客户端，响应才能准确回发。
+/// Keying by (dest, peer) is needed because the relay response header only carries the
+/// destination address, not the client info; one flow corresponds to one client so the
+/// response can be sent back accurately.
 struct UdpFlowPool {
     inner: tokio::sync::Mutex<HashMap<(SocketAddr, Option<SocketAddr>), UdpRelayFlow>>,
 }
@@ -2056,10 +2096,11 @@ impl UdpFlowPool {
         }
     }
 
-    /// 获取或创建 (dest, peer) 对应的会话。
+    /// Get or create the session for (dest, peer).
     ///
-    /// 会话创建（TCP 握手 + ASSOCIATE）在锁外进行，仅插入时短暂持锁，
-    /// 避免并发创建同一 flow 时互相阻塞。
+    /// Session creation (TCP handshake + ASSOCIATE) happens outside the lock; the lock is
+    /// only briefly held for insertion, avoiding concurrent creation of the same flow from
+    /// blocking each other.
     async fn get_or_create(
         self: &Arc<Self>,
         dest: SocketAddr,
@@ -2076,7 +2117,7 @@ impl UdpFlowPool {
             }
         }
 
-        // 通过Dialer建立协议对应的 UDP 中继会话（宿主 NS 中创建）。
+        // Create the protocol-specific UDP relay session via the dialer (in the host NS).
         let session: Arc<dyn UdpSession> = Arc::from(dialer.udp_dial().await?);
         info!(
             "UDP  {} -> {} [PROXY] outbound via {} -> proxy {}",
@@ -2103,11 +2144,12 @@ impl UdpFlowPool {
         self.inner.lock().await.remove(&(dest, peer));
     }
 
-    /// 启动 flow 的 reader 任务：持续读取中继响应并回发客户端。
+    /// Start the flow's reader task: continuously read relay responses and send them back
+    /// to the client.
     ///
-    /// 空闲超过分级超时（[`udp_flow_idle_timeout`]，DNS 17s / QUIC 2min /
-    /// 默认 30s）或中继 recv 出错时退出，并从池中移除自己（替代原先从未被
-    /// 调用的 `UdpEndpointPool::cleanup`）。
+    /// Exits when idle beyond the tiered timeout ([`udp_flow_idle_timeout`]: DNS 17s / QUIC
+    /// 2min / default 30s) or when the relay recv errors, and removes itself from the pool
+    /// (replacing the never-called `UdpEndpointPool::cleanup`).
     fn spawn_reader(
         key: (SocketAddr, Option<SocketAddr>),
         session: Arc<dyn UdpSession>,
@@ -2136,10 +2178,12 @@ impl UdpFlowPool {
                     }
                 };
 
-                // 全锥形中继：响应可能来自任意目标，回包 socket 按响应目标地址取。
+                // Full-cone relay: the response may come from any destination, so the
+                // response socket is taken by the response's destination address.
                 if let Some(peer) = peer {
                     if let Some(sock) = resp_socks.get(&resp_dest, host_ns_fd).await {
-                        // 回包写 deadline：防止客户端不读取 UDP 时无限期阻塞 reader。
+                        // Response write deadline: prevents blocking the reader forever when
+                        // the client is not reading UDP.
                         match tokio::time::timeout(UDP_WRITE_TIMEOUT, sock.send_to(&payload, peer))
                             .await
                         {
@@ -2159,7 +2203,7 @@ impl UdpFlowPool {
                     }
                 }
             }
-            // reader 退出（空闲/出错）：从池中移除自己
+            // Reader exit (idle/error): remove itself from the pool
             if let Some(flows) = flows.upgrade() {
                 flows.remove(dest, peer).await;
             }
@@ -2167,10 +2211,11 @@ impl UdpFlowPool {
     }
 }
 
-/// 透明回包 socket 池：按原始目标地址复用 IP_TRANSPARENT UDP socket。
+/// Transparent response socket pool: reuses IP_TRANSPARENT UDP sockets by original destination.
 ///
-/// 每个 dest 一个 socket，惰性创建（配置 host_ns_fd 时在宿主 NS 创建），
-/// LRU 容量上限防止无界增长。DNS 劫持回包与 SOCKS5 回包共用本池。
+/// One socket per dest, lazily created (in the host NS when host_ns_fd is configured),
+/// with an LRU capacity limit to prevent unbounded growth. DNS hijack responses and
+/// SOCKS5 responses share this pool.
 struct RespSocketPool {
     inner: Mutex<VecDeque<(SocketAddr, Arc<UdpSocket>)>>,
 }
@@ -2182,13 +2227,13 @@ impl RespSocketPool {
         }
     }
 
-    /// 获取 dest 对应的回包 socket；不存在则创建并缓存。
+    /// Get the response socket for dest; create and cache it if absent.
     async fn get(
         &self,
         dest: &SocketAddr,
         host_ns_fd: Option<RawFd>,
     ) -> Option<Arc<UdpSocket>> {
-        // 快路径：池中已有（不持锁跨 await）
+        // Fast path: already in the pool (no lock held across await)
         {
             let mut m = self.inner.lock().unwrap();
             if let Some(i) = m.iter().position(|(d, _)| d == dest) {
@@ -2198,11 +2243,11 @@ impl RespSocketPool {
             }
         }
 
-        // 慢路径：创建（可能在宿主 NS 中 setns，不能持锁）
+        // Slow path: create (may setns into the host NS, so the lock cannot be held)
         let sock = Arc::new(create_marked_udp_socket(dest, host_ns_fd).await?);
         let mut m = self.inner.lock().unwrap();
         if let Some(i) = m.iter().position(|(d, _)| d == dest) {
-            // 并发创建竞态：其他人已插入，直接用已有的
+            // Concurrent creation race: someone else already inserted, just use theirs
             return Some(m[i].1.clone());
         }
         m.push_back((*dest, sock.clone()));
@@ -2213,9 +2258,10 @@ impl RespSocketPool {
     }
 }
 
-/// 非阻塞 recvmsg：返回 `(字节数, 对端地址, 原始目标地址)`。
+/// Non-blocking recvmsg: returns `(byte count, peer address, original destination address)`.
 ///
-/// 通过辅助数据（cmsg）获取 TProxy 的原始目标地址；fd 必须是非阻塞的。
+/// Gets the TProxy original destination address via ancillary data (cmsg); the fd must
+/// be non-blocking.
 fn recvmsg_with_cmsg(
     fd: RawFd,
     buf: &mut [u8],
@@ -2227,15 +2273,16 @@ fn recvmsg_with_cmsg(
     };
 
     let mut msg_name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    // 使用 zeroed + 字段赋值而不是结构体字面量：
-    // musl 的 msghdr 包含私有字段（如 x86_64 上的 __pad1/__pad2），无法用字面量构造
+    // Use zeroed + field assignment instead of a struct literal:
+    // musl's msghdr contains private fields (such as __pad1/__pad2 on x86_64),
+    // which cannot be constructed with a literal
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = &mut msg_name as *mut _ as *mut libc::c_void;
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    // musl 与 glibc 的 msg_controllen 类型不同（int vs size_t），用类型推断
+    // musl and glibc have different msg_controllen types (int vs size_t); use type inference
     msg.msg_controllen = cmsg_buf.len() as _;
     msg.msg_flags = 0;
 
@@ -2291,12 +2338,13 @@ fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// 创建一个带有 IP_TRANSPARENT 和 SO_MARK=0x100 的 UDP socket，并绑定到目标地址。
+/// Create a UDP socket with IP_TRANSPARENT and SO_MARK=0x100, bound to the target address.
 ///
-/// 用于 DNS 劫持与 UDP 回包：IP_TRANSPARENT 允许绑定非本机地址（如上游
-/// DNS 服务器地址），确保响应包源地址正确；SO_MARK=0x100 使 eBPF 放行
-/// （dae-rs 自身流量必须直连）。统一委托
-/// [`protocols::hostns::create_transparent_udp`] 实现。
+/// Used for DNS hijacking and UDP responses: IP_TRANSPARENT allows binding a non-local
+/// address (such as the upstream DNS server address), ensuring the response packet's
+/// source address is correct; SO_MARK=0x100 lets eBPF let it through (dae-rs's own
+/// traffic must connect directly). Delegates to the unified
+/// [`protocols::hostns::create_transparent_udp`] implementation.
 async fn create_marked_udp_socket(
     target: &SocketAddr,
     host_ns_fd: Option<RawFd>,
@@ -2317,54 +2365,57 @@ async fn create_marked_udp_socket(
     }
 }
 
-/// 从辅助数据（cmsg/oob）中解析原始目标地址
+/// Parse the original destination address from ancillary data (cmsg/oob)
 ///
-/// 这是 UDP TProxy 获取原始目标地址的关键函数。当设置了 `IP_RECVORIGDSTADDR` 后，
-/// 内核会在 recvmsg 的辅助数据中返回数据包的原始目标地址。
+/// This is the key function for UDP TProxy to obtain the original destination address.
+/// When `IP_RECVORIGDSTADDR` is set, the kernel returns the packet's original destination
+/// address in recvmsg's ancillary data.
 ///
-/// 使用 `libc::cmsghdr` 结构体读取 cmsg 头部，让编译器根据目标架构自动处理
-/// `cmsg_len` 的大小和对齐差异（64 位系统上 `cmsg_len` 为 8 字节，32 位系统上为 4 字节），
-/// 避免硬编码 `u64` 解析导致的跨架构兼容性问题。
+/// Uses the `libc::cmsghdr` struct to read the cmsg header, letting the compiler handle
+/// the `cmsg_len` size and alignment differences per target architecture
+/// (8 bytes for `cmsg_len` on 64-bit systems, 4 bytes on 32-bit), avoiding
+/// cross-architecture compatibility issues from hardcoding `u64` parsing.
 ///
 /// # Parameters
 ///
-/// * `cmsg_data` — 辅助数据（cmsg）缓冲区
+/// * `cmsg_data` — the ancillary data (cmsg) buffer
 ///
 /// # Returns
 ///
-/// 如果成功解析到原始目标地址，返回 `Some(SocketAddr)`。
+/// Returns `Some(SocketAddr)` if the original destination address is successfully parsed.
 pub fn parse_orig_dst_from_cmsg(cmsg_data: &[u8]) -> Option<SocketAddr> {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    // libc::cmsghdr 在不同架构下的布局：
-    // - 64 位: cmsg_len(usize=8) + cmsg_level(i32) + cmsg_type(i32) = 16 字节
-    // - 32 位: cmsg_len(usize=4) + cmsg_level(i32) + cmsg_type(i32) = 12 字节
+    // libc::cmsghdr layout on different architectures:
+    // - 64-bit: cmsg_len(usize=8) + cmsg_level(i32) + cmsg_type(i32) = 16 bytes
+    // - 32-bit: cmsg_len(usize=4) + cmsg_level(i32) + cmsg_type(i32) = 12 bytes
     let hdr_size = std::mem::size_of::<libc::cmsghdr>();
-    // CMSG_ALIGN 使用 size_t 进行对齐
+    // CMSG_ALIGN uses size_t for alignment
     let cmsg_align = std::mem::size_of::<libc::size_t>();
     let mut offset = 0;
 
     while offset + hdr_size <= cmsg_data.len() {
-        // 使用 libc::cmsghdr 结构体读取 cmsg 头部，读取 cmsg_len 和 cmsg_level、cmsg_type
-        // 字段，让编译器处理不同架构下 cmsg_len 的大小差异（32 位: u32, 64 位: u64），
-        // 替代硬编码的 u64 解析。
+        // Read the cmsg header with libc::cmsghdr, reading the cmsg_len, cmsg_level and
+        // cmsg_type fields, letting the compiler handle the cmsg_len size difference across
+        // architectures (32-bit: u32, 64-bit: u64), instead of hardcoded u64 parsing.
         let cmsg = unsafe {
             std::ptr::read_unaligned(cmsg_data[offset..].as_ptr() as *const libc::cmsghdr)
         };
 
         let cmsg_len = cmsg.cmsg_len as usize;
 
-        // cmsg_len 必须至少包含头部大小，且不超过剩余缓冲区
+        // cmsg_len must at least include the header size and not exceed the remaining buffer
         if cmsg_len < hdr_size || offset + cmsg_len > cmsg_data.len() {
             break;
         }
 
-        // CMSG_DATA 偏移量：紧跟在头部之后，按 CMSG_ALIGN(size_t) 对齐。
-        // 等价于 Linux 内核宏：CMSG_DATA(cmsg) = (unsigned char *)cmsg + CMSG_ALIGN(sizeof(*cmsg))
+        // CMSG_DATA offset: immediately after the header, aligned to CMSG_ALIGN(size_t).
+        // Equivalent to the Linux kernel macro:
+        // CMSG_DATA(cmsg) = (unsigned char *)cmsg + CMSG_ALIGN(sizeof(*cmsg))
         let data_offset = (offset + hdr_size + cmsg_align - 1) & !(cmsg_align - 1);
 
         if cmsg.cmsg_level == libc::SOL_IP && cmsg.cmsg_type == IP_RECVORIGDSTADDR {
-            // IPv4: 数据是 struct sockaddr_in（16 字节）
+            // IPv4: the data is a struct sockaddr_in (16 bytes)
             if data_offset + std::mem::size_of::<libc::sockaddr_in>() <= cmsg_data.len() {
                 let addr = unsafe {
                     std::ptr::read_unaligned(
@@ -2376,7 +2427,7 @@ pub fn parse_orig_dst_from_cmsg(cmsg_data: &[u8]) -> Option<SocketAddr> {
                 return Some(SocketAddr::new(ip.into(), port));
             }
         } else if cmsg.cmsg_level == libc::SOL_IPV6 && cmsg.cmsg_type == IPV6_RECVORIGDSTADDR {
-            // IPv6: 数据是 struct sockaddr_in6（28 字节）
+            // IPv6: the data is a struct sockaddr_in6 (28 bytes)
             if data_offset + std::mem::size_of::<libc::sockaddr_in6>() <= cmsg_data.len() {
                 let addr = unsafe {
                     std::ptr::read_unaligned(
@@ -2389,7 +2440,7 @@ pub fn parse_orig_dst_from_cmsg(cmsg_data: &[u8]) -> Option<SocketAddr> {
             }
         }
 
-        // 移动到下一个 cmsg（按 CMSG_ALIGN 对齐）
+        // Move to the next cmsg (aligned by CMSG_ALIGN)
         offset = (offset + cmsg_len + cmsg_align - 1) & !(cmsg_align - 1);
     }
 

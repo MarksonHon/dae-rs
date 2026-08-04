@@ -1,4 +1,4 @@
-//! SOCKS5 协议Dialer
+//! SOCKS5 protocol dialer
 //!
 //! Implements the SOCKS5 outbound proxy protocol, supporting:
 //! - No Authentication
@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::{OutboundDialer, ProxyConn};
 
-/// SOCKS5 Dialer错误
+/// SOCKS5 Dialer error
 #[derive(Debug, thiserror::Error)]
 pub enum Socks5Error {
     /// Connection timeout
@@ -66,13 +66,13 @@ pub struct Socks5Dialer {
 }
 
 impl Socks5Dialer {
-    /// 创建新的 SOCKS5 Dialer
+    /// Create a new SOCKS5 Dialer
     ///
     /// # Parameters
     /// * `proxy_addr` - Upstream SOCKS5 proxy server address
     /// * `username` - Authentication username (empty string means no authentication required)
     /// * `password` - Authentication password
-    /// * `dial_timeout_ms` - Dial timeout时间（毫秒）
+    /// * `dial_timeout_ms` - Dial timeout in milliseconds
     pub fn new(
         proxy_addr: SocketAddr,
         username: impl Into<String>,
@@ -206,13 +206,13 @@ impl Socks5Dialer {
 
         // Build connection request
         let mut request = Vec::with_capacity(256);
-        request.push(0x05); // SOCKS5 版本
-        request.push(0x01); // CONNECT 命令
-        request.push(0x00); // 保留位
+        request.push(0x05); // SOCKS5 version
+        request.push(0x01); // CONNECT command
+        request.push(0x00); // reserved
 
         // Try to parse as IPv4 address
         if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-            request.push(0x01); // IPv4 地址类型
+            request.push(0x01); // IPv4 address type
             request.extend_from_slice(&ip.octets());
         }
         // Try to parse as IPv6 address (need to remove brackets)
@@ -221,12 +221,12 @@ impl Socks5Dialer {
             .trim_end_matches(']')
             .parse::<std::net::Ipv6Addr>()
         {
-            request.push(0x04); // IPv6 地址类型
+            request.push(0x04); // IPv6 address type
             request.extend_from_slice(&ip.octets());
         }
         // Otherwise send as domain name
         else {
-            request.push(0x03); // 域名类型
+            request.push(0x03); // domain name type
             let host_bytes = host.as_bytes();
             if host_bytes.len() > 255 {
                 return Err(Socks5Error::ProtocolError(

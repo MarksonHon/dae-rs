@@ -1,23 +1,23 @@
-//! 规则集**全局内存缓存**（设计 §4.4 / §6.3）。
+//! Rule set **global in-memory cache** (design §4.4 / §6.3).
 //!
-//! 提供：
+//! Provides:
 //!
-//! - [`RuleSetCache`]：`name → RuleSetData` 的内存映射，供 matcher 编译期、
-//!   DNS 查询Routing与 DNS 响应Routing运行时查询。内部为
-//!   `Arc<RwLock<HashMap<String, RuleSetData>>>`，可被更新流程（调度器通知 →
-//!   重新加载）安全替换。
-//! - [`load_cache_from_dir`]：从磁盘数据目录扫描并填充缓存（启动与更新后共用）。
+//! - [`RuleSetCache`]: an in-memory map of `name → RuleSetData`, queried at matcher compile time and
+//!   at runtime by DNS query routing and DNS response routing. Internally an
+//!   `Arc<RwLock<HashMap<String, RuleSetData>>>`, it can be safely replaced by the update flow
+//!   (scheduler notification → reload).
+//! - [`load_cache_from_dir`]: scans the on-disk data directory and fills the cache (shared by startup and post-update).
 //!
-//! 类型化查询语义：
+//! Typed query semantics:
 //!
-//! - `geoip:<code>` → [`RuleSetCache::find_geoip_code`]（跨所有 GeoIp 数据，
-//!   code 大小写不敏感）；
-//! - `geosite:<code>` → [`RuleSetCache::find_geosite_code`]；
-//! - `set:<name>`（ip_list）→ [`RuleSetCache::get_set_ips`]；
-//! - `set:<name>`（domain_list）→ [`RuleSetCache::get_set_domains`]。
+//! - `geoip:<code>` → [`RuleSetCache::find_geoip_code`] (across all GeoIp data,
+//!   code case-insensitive);
+//! - `geosite:<code>` → [`RuleSetCache::find_geosite_code`];
+//! - `set:<name>` (ip_list) → [`RuleSetCache::get_set_ips`];
+//! - `set:<name>` (domain_list) → [`RuleSetCache::get_set_domains`].
 //!
-//! 类型不匹配或数据缺失均返回 `None`，由调用方按 E2103（编译期）或
-//! warn+false（运行时）处理。
+//! Type mismatch or missing data both return `None`, handled by the caller as E2103 (compile time) or
+//! warn+false (runtime).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -25,61 +25,86 @@ use std::sync::{Arc, RwLock};
 use ipnet::IpNet;
 use tracing::warn;
 
+use crate::ruleset::compiled::{CompiledRuleSet, compile_rule_set};
 use crate::ruleset::store::DataDir;
 use crate::ruleset::types::{DomainPattern, RuleSetConfig, RuleSetData};
 
-/// 规则集内存缓存。
+/// Raw parsed data + the compiled matching view of a rule set.
+#[derive(Debug)]
+struct CacheInner {
+    data: HashMap<String, RuleSetData>,
+    compiled: HashMap<String, CompiledRuleSet>,
+}
+
+impl Default for CacheInner {
+    fn default() -> Self {
+        Self {
+            data: HashMap::new(),
+            compiled: HashMap::new(),
+        }
+    }
+}
+
+/// In-memory rule set cache.
+///
+/// Holds both the raw parsed [`RuleSetData`] (used by the data-plane rule compiler, which needs
+/// the original CIDR / domain lists to build eBPF LPM tries) and a **compiled matching view**
+/// ([`CompiledRuleSet`]) used by the runtime DNS matcher for O(log N) / O(labels) lookups.
 #[derive(Debug, Clone, Default)]
 pub struct RuleSetCache {
-    inner: Arc<RwLock<HashMap<String, RuleSetData>>>,
+    inner: Arc<RwLock<CacheInner>>,
 }
 
 impl RuleSetCache {
-    /// 创建空缓存。
+    /// Create an empty cache.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// 插入（或覆盖）一个规则集数据。
+    /// Insert (or overwrite) a rule set data entry.
     pub fn insert(&self, name: String, data: RuleSetData) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.insert(name, data);
+            let compiled = compile_rule_set(&data);
+            guard.compiled.insert(name.clone(), compiled);
+            guard.data.insert(name, data);
         }
     }
 
-    /// 整体替换缓存内容（更新完成后使用）。
+    /// Replace the entire cache content (used after an update completes).
     pub fn replace_all(&self, map: HashMap<String, RuleSetData>) {
         if let Ok(mut guard) = self.inner.write() {
-            *guard = map;
+            let compiled = map.iter().map(|(k, v)| (k.clone(), compile_rule_set(v))).collect();
+            guard.data = map;
+            guard.compiled = compiled;
         }
     }
 
-    /// 按 name 读取规则集数据。
+    /// Read rule set data by name.
     pub fn get(&self, name: &str) -> Option<RuleSetData> {
-        self.inner.read().ok()?.get(name).cloned()
+        self.inner.read().ok()?.data.get(name).cloned()
     }
 
-    /// 是否存在该 name 的规则集数据。
+    /// Whether rule set data exists for the name.
     pub fn contains(&self, name: &str) -> bool {
-        self.inner.read().map(|g| g.contains_key(name)).unwrap_or(false)
+        self.inner.read().map(|g| g.data.contains_key(name)).unwrap_or(false)
     }
 
-    /// 缓存条目数。
+    /// Number of cache entries.
     pub fn len(&self) -> usize {
-        self.inner.read().map(|g| g.len()).unwrap_or(0)
+        self.inner.read().map(|g| g.data.len()).unwrap_or(0)
     }
 
-    /// 缓存是否为空。
+    /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// 查找 geoip `country_code`（大小写不敏感）对应的 CIDR 列表。
+    /// Find the CIDR list for a geoip `country_code` (case-insensitive).
     ///
-    /// 遍历缓存中所有 `GeoIp` 数据；未找到返回 `None`。
+    /// Iterates over all `GeoIp` data in the cache; returns `None` if not found.
     pub fn find_geoip_code(&self, code: &str) -> Option<Vec<IpNet>> {
         let guard = self.inner.read().ok()?;
-        for data in guard.values() {
+        for data in guard.data.values() {
             if let RuleSetData::GeoIp { entries } = data {
                 for (k, v) in entries {
                     if k.eq_ignore_ascii_case(code) {
@@ -91,12 +116,12 @@ impl RuleSetCache {
         None
     }
 
-    /// 查找 geosite `country_code`（分类名）对应的Domain name模式列表。
+    /// Find the domain name pattern list for a geosite `country_code` (category name).
     ///
-    /// geosite dat 的 `country_code` 为小写分类名；这里也做大小写不敏感匹配以容错。
+    /// A geosite dat's `country_code` is a lowercase category name; matching here is also case-insensitive for robustness.
     pub fn find_geosite_code(&self, code: &str) -> Option<Vec<DomainPattern>> {
         let guard = self.inner.read().ok()?;
-        for data in guard.values() {
+        for data in guard.data.values() {
             if let RuleSetData::GeoSite { entries } = data {
                 for (k, v) in entries {
                     if k.eq_ignore_ascii_case(code) {
@@ -108,7 +133,7 @@ impl RuleSetCache {
         None
     }
 
-    /// 读取 `set:<name>`（类型必须为 `IpList`）的 CIDR 列表。
+    /// Read the CIDR list for `set:<name>` (type must be `IpList`).
     pub fn get_set_ips(&self, name: &str) -> Option<Vec<IpNet>> {
         match self.get(name)? {
             RuleSetData::IpList(nets) => Some(nets),
@@ -116,19 +141,76 @@ impl RuleSetCache {
         }
     }
 
-    /// 读取 `set:<name>`（类型必须为 `DomainList`）的Domain name模式列表。
+    /// Read the domain name pattern list for `set:<name>` (type must be `DomainList`).
     pub fn get_set_domains(&self, name: &str) -> Option<Vec<DomainPattern>> {
         match self.get(name)? {
             RuleSetData::DomainList(pats) => Some(pats),
             _ => None,
         }
     }
+
+    // ==========================================================================
+    // Compiled (fast) matching — used by the runtime DNS matcher.
+    // ==========================================================================
+
+    /// Whether `ip` belongs to any CIDR in the `geoip:<code>` set.
+    pub fn geoip_contains(&self, code: &str, ip: std::net::IpAddr) -> bool {
+        if let Ok(g) = self.inner.read() {
+            for set in g.compiled.values() {
+                if let CompiledRuleSet::GeoIp(entries) = set {
+                    for (k, v) in entries {
+                        if k.eq_ignore_ascii_case(code) && v.contains(ip) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `ip` belongs to any CIDR in the `set:<name>` ip_list.
+    pub fn ip_set_contains(&self, name: &str, ip: std::net::IpAddr) -> bool {
+        if let Ok(g) = self.inner.read() {
+            if let Some(CompiledRuleSet::IpList(c)) = g.compiled.get(name) {
+                return c.contains(ip);
+            }
+        }
+        false
+    }
+
+    /// Whether `qname` matches any domain pattern in the `geosite:<code>` set.
+    pub fn geosite_matches(&self, code: &str, qname: &str) -> bool {
+        if let Ok(g) = self.inner.read() {
+            for set in g.compiled.values() {
+                if let CompiledRuleSet::GeoSite(entries) = set {
+                    for (k, v) in entries {
+                        if k.eq_ignore_ascii_case(code) && v.matches(qname) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `qname` matches any pattern in the `set:<name>` domain_list.
+    pub fn domain_set_matches(&self, name: &str, qname: &str) -> bool {
+        if let Ok(g) = self.inner.read() {
+            if let Some(CompiledRuleSet::DomainList(c)) = g.compiled.get(name) {
+                return c.matches(qname);
+            }
+        }
+        false
+    }
 }
 
-/// 从磁盘数据目录扫描并Build rulesets内存缓存（启动与更新后共用）。
+/// Scan the on-disk data directory and build the rule sets in-memory cache (shared by startup and post-update).
 ///
-/// 对每个配置条目调用 [`DataDir::scan`]；仅把解析成功的条目装入缓存，
-/// 缺失/损坏的条目跳过并记录 warn（编译期由 matcher 以 E2103 报错）。
+/// Calls [`DataDir::scan`] for each configuration entry; only successfully parsed entries are put
+/// into the cache, while missing/corrupt entries are skipped with a warn (at compile time, the
+/// matcher reports E2103).
 pub async fn load_cache_from_dir(
     dir: &DataDir,
     entries: &[RuleSetConfig],
@@ -209,7 +291,7 @@ mod tests {
         assert!(cache.find_geosite_code("CN").is_some());
         assert!(cache.find_geosite_code("ads").is_none());
 
-        // 类型化 set 查询
+        // Typed set queries
         assert!(cache.get_set_ips("chinaip").is_some());
         assert!(cache.get_set_ips("chinadom").is_none(), "type mismatch");
         assert!(cache.get_set_domains("chinadom").is_some());
@@ -222,10 +304,10 @@ mod tests {
         use crate::ruleset::store::DataDir;
         let dir = DataDir::new(tempfile::tempdir().unwrap().path());
         dir.ensure_dirs().await.unwrap();
-        // 有效 ip_list 文件
+        // Valid ip_list file
         let path = dir.data_file_path("chinaip", RuleSetType::IpList);
         tokio::fs::write(&path, "1.1.1.0/24\n2.2.2.2\n").await.unwrap();
-        // 缺失条目
+        // Missing entry
         let entries = vec![
             RuleSetConfig {
                 name: "chinaip".into(),

@@ -209,7 +209,7 @@
     },
     "chinadomain": {
       "type": "domain_list",
-      "url": "https://example.com/rules/chinadomain.txt",
+      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt",
       "name": "chinadomain",
       "update": {
         "time": "04:30"
@@ -218,7 +218,7 @@
     },
     "chinaip": {
       "type": "ip_list",
-      "url": "https://example.com/rules/chinaip.txt",
+      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt",
       "name": "chinaip",
       "update": {
         "period": "1d"
@@ -294,24 +294,7 @@
             "label": "cloudflare",
             "address": "udp://1.1.1.1:53"
           }
-        ],
-        "response_routing": {
-          "rules": [
-            {
-              "match": "upstream(googledns)",
-              "action": "accept"
-            },
-            {
-              "match": "ip(geoip:private) && !qname(geosite:cn)",
-              "action": "googledns"
-            },
-            {
-              "match": "ip(set:chinaip)",
-              "action": "googledns"
-            }
-          ],
-          "fallback": "accept"
-        }
+        ]
       },
       {
         "name": "china_dns",
@@ -329,6 +312,23 @@
         ]
       }
     ],
+    "response_action": {
+      "rules": [
+        {
+          "match": "upstream(googledns)",
+          "action": "accept"
+        },
+        {
+          "match": "ip(geoip:private) && !qname(geosite:cn)",
+          "action": "googledns"
+        },
+        {
+          "match": "ip(set:chinaip)",
+          "action": "googledns"
+        }
+      ],
+      "fallback": "accept"
+    },
     "routing": {
       "rules": [
         {

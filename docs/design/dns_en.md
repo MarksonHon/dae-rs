@@ -7,7 +7,7 @@
 
 This document describes the DNS subsystem of dae-rs **as it is implemented
 today** (`control/src/dns/*`). It covers the DNS manager, upstream pools,
-request/response routing, caching, the listener, and the integration with
+request/response action, caching, the listener, and the integration with
 domain-based eBPF routing.
 
 Module layout:
@@ -40,7 +40,7 @@ control/src/dns/
     ├─ DnsUpstreamPool.query(...)  → forward to upstream DNS server
     │      (sockets marked SO_MARK=0x100 to bypass the proxy pipeline)
     │
-    ├─ response routing (accept / reject / requery)
+    ├─ response action (accept / reject / requery)
     │
     ├─ cache insert
     │
@@ -122,7 +122,7 @@ The actual UDP/TCP listener and per-query processing.
   2. Cache lookup (key = qname + qtype + class IN).
   3. Route via `DnsRouter` to a group, then pick the upstream according to the
      group's `query_mode` and query it (direct, or through the `send_by` proxy group).
-  4. Apply response routing (accept / reject / requery with another upstream).
+  4. Apply response action (accept / reject / requery with another upstream).
   5. On accept, insert into cache and feed accepted A/AAAA resolutions into the
      domain-routing callback.
 - **IP_TRANSPARENT responses**: the reply is sent from a socket created with
@@ -157,7 +157,7 @@ contaminate each other's cache. `max_size` is the per-group capacity.
   query name is matched against the domain patterns in userspace (directly
   against the in-memory cache, no eBPF involvement). Plain patterns like
   `qname(suffix:...)` keep using the existing suffix logic.
-- **DNS response routing** ([`handler.rs`](control/src/dns/handler.rs)):
+- **DNS response action** ([`handler.rs`](control/src/dns/handler.rs)):
   - `ip(geoip:cn)` / `ip(set:chinaip)` — parse all A/AAAA addresses in the
     response (reusing `extract_answer_addrs()`); the condition is true when any
     address hits the GeoIP / IP list;
@@ -211,6 +211,6 @@ This mirrors the original dae `control/domain_routing_tracker.go`.
   `abort()` (safe because tokio tasks are cancel-safe at await points).
 
 > Rule-set evaluation is implemented: DNS query routing `qname(geosite:/set:)`
-> and DNS response routing `ip(geoip:/set:)` / `qname(...)` / `&&` / `!` are all
+> and DNS response action `ip(geoip:/set:)` / `qname(...)` / `&&` / `!` are all
 > wired to rule-set data (§3.6), no longer simple suffix comparison. A missing
 > dataset referenced at compile time raises E2103.

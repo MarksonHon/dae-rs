@@ -51,7 +51,7 @@ The key defects, all fixed by Phases 0–3, were:
 | 2 | [`matcher.rs`](control/src/routing/matcher.rs) `build_match_set_for_function()` | `geoip:cn` resolution failures were **silently dropped** |
 | 3 | [`matcher.rs`](control/src/routing/matcher.rs) domain collection | `domain(geosite:cn)` was treated as a bare suffix pattern `cn` → degraded to "ends with .cn" matching |
 | 4 | [`router.rs`](control/src/dns/router.rs) `compile_route_rule()` | DNS query routing `qname(geosite:cn)` was compiled as a plain suffix string, never matching |
-| 5 | [`handler.rs`](control/src/dns/handler.rs) `evaluate_response_condition()` | DNS response routing `ip(geoip:...)` was unimplemented, the condition was always `true` |
+| 5 | [`handler.rs`](control/src/dns/handler.rs) `evaluate_response_condition()` | DNS response action `ip(geoip:...)` was unimplemented, the condition was always `true` |
 | 6 | Global | No data-file loading/parsing/update mechanism, no data-source config item |
 
 ### 1.2 Current architecture constraints
@@ -323,7 +323,7 @@ rule_set {
   # ── text domain list ──
   chinadomain {
     type: domain_list
-    url: 'https://example.com/rules/chinadomain.txt'
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt'
     name: chinadomain
     update: time: 04:30
     update_on_start: false
@@ -332,7 +332,7 @@ rule_set {
   # ── text IP list ──
   chinaip {
     type: ip_list
-    url: 'https://example.com/rules/chinaip.txt'
+    url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt'
     name: chinaip
     update: period: 1d
     proxy: proxy_primary         # explicit download proxy group (optional; default first group)
@@ -360,14 +360,14 @@ rule_set {
     },
     "chinadomain": {
       "type": "domain_list",
-      "url": "https://example.com/rules/chinadomain.txt",
+      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt",
       "name": "chinadomain",
       "update": { "time": "04:30" },
       "update_on_start": false
     },
     "chinaip": {
       "type": "ip_list",
-      "url": "https://example.com/rules/chinaip.txt",
+      "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/surge/cn.txt",
       "name": "chinaip",
       "update": { "period": "1d" },
       "proxy": "proxy_primary"
@@ -492,7 +492,7 @@ prefix) stays a plain domain function.
   domain patterns (userspace directly matches the in-memory cache, no eBPF).
 - Plain `qname(suffix:...)` patterns continue via the existing suffix logic.
 
-### 6.5 DNS response routing (`handler.rs`) evaluation semantics (fixes the "always true" defect)
+### 6.5 DNS response action (`handler.rs`) evaluation semantics (fixes the "always true" defect)
 
 - `evaluate_response_condition()` is extended:
   - `ip(geoip:cn)` / `ip(set:chinaip)`: parse all A/AAAA addresses in the
@@ -557,7 +557,7 @@ prefix) stays a plain domain function.
   3. `update` mutual exclusion + time/period format (seconds rejected);
   4. `set:<name>` / `geoip:<code>` / `geosite:<code>` reference integrity in
      routing rules (E2102);
-  5. same for DNS routing / DNS response routing (E2102).
+  5. same for DNS routing / DNS response action (E2102).
 
 ### 8.3 New error codes
 
@@ -652,7 +652,7 @@ functions.
 - **DNS query routing** ([`router.rs`](control/src/dns/router.rs)): upgraded to
   support `&&`/`!` combinations (reusing the §6.5 condition evaluator),
   aligned with the data plane.
-- **DNS response routing** ([`handler.rs`](control/src/dns/handler.rs)): the
+- **DNS response action** ([`handler.rs`](control/src/dns/handler.rs)): the
   condition evaluator supports `&&`/`!` and rule-set conditions (§6.5).
 
 ## 11. Alignment & Differences vs. dae
@@ -704,7 +704,7 @@ functions.
 - matcher: `compile_rules()` wired to rule sets → LPM trie / domain_sets;
   missing-data handling (E2103); capacity check (E2106).
 - DNS query routing: `qname(geosite:cn)` / `qname(set:...)` evaluation.
-- DNS response routing: `ip(geoip:cn)` / `ip(set:...)` evaluation, fixing
+- DNS response action: `ip(geoip:cn)` / `ip(set:...)` evaluation, fixing
   "always true"; condition evaluator (`&&`/`!`).
 - **Verify**: routing compile tests (rule sets → MatchSet/LPM/domain_sets), DNS
   routing tests.

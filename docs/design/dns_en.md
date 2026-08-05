@@ -162,10 +162,16 @@ contaminate each other's cache. `max_size` is the per-group capacity.
     response (reusing `extract_answer_addrs()`); the condition is true when any
     address hits the GeoIP / IP list;
   - `ip(CIDR)` — direct CIDR match;
+  - `upstream(label)` — true when the response actually came from the upstream
+    with the given label, useful for distinguishing responses from different
+    upstreams within the same group;
+  - `nocontent` — response has no answer records (NODATA);
   - `qname(geosite:cn)` / `qname(set:chinadomain)` — domain-pattern match on the
-    query name.
+    query name;
   - Conditions support `&&` (AND) and `!` (NOT), e.g.
     `ip(geoip:private) && !qname(geosite:cn)`.
+  - Unknown conditions default to false with a warning (no longer returning true
+    as in the original implementation).
 
 ## 4. Bootstrap / starting_dns
 
@@ -182,7 +188,12 @@ contaminate each other's cache. `max_size` is the per-group capacity.
   ```
 - All of its DNS servers are queried **directly** (never through a proxy). They
   resolve hostname-based group upstreams (e.g. `udp://dns.google:53`) at init
-  time by iterating the bootstrap servers in order (A first, then AAAA).
+  time by iterating the bootstrap servers in order, querying A records first and
+  then AAAA, stopping at the first usable IP.
+- The `ip_version_prefer` field (`4` or `6`) is declared and validated in
+  config, but **the current code does not use it** — bootstrap resolution is
+  hardcoded to A-first-then-AAAA. To support IPv6-priority resolution,
+  `resolve_via_bootstrap()` in `mod.rs` must be changed.
 
 ## 5. Integration with Domain-Based eBPF Routing
 
@@ -206,7 +217,8 @@ This mirrors the original dae `control/domain_routing_tracker.go`.
 ## 6. Current Limitations
 
 - DoH / DoT transports are parsed but not functional.
-- `upstream(...)` response conditions currently match everything.
+- The `ip_version_prefer` config field exists but is not used by bootstrap
+  resolution (hardcoded A-first-then-AAAA).
 - The DNS listener tasks run infinite receive loops and are stopped by
   `abort()` (safe because tokio tasks are cancel-safe at await points).
 

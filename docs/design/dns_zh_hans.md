@@ -145,9 +145,13 @@ control/src/dns/
   - `ip(geoip:cn)` / `ip(set:chinaip)` — 解析响应中所有 A/AAAA 地址
     （复用 `extract_answer_addrs()`），任一地址命中 GeoIP / IP 列表 → 条件真；
   - `ip(CIDR)` — 直接 CIDR 匹配；
+  - `upstream(label)` — 当实际响应来自指定标签的上游时条件为真，可用于区分
+    同一组内不同上游的响应；
+  - `nocontent` — 响应中无 answer 记录（NODATA）；
   - `qname(geosite:cn)` / `qname(set:chinadomain)` — 对查询名做域名模式匹配。
   - 条件支持 `&&`（AND）与 `!`（NOT）组合，如
     `ip(geoip:private) && !qname(geosite:cn)`。
+  - 未知条件默认返回 false 并告警（不再像早期实现那样始终返回 true）。
 
 ## 4. 引导解析 / starting_dns
 
@@ -162,8 +166,11 @@ control/src/dns/
   }
   ```
 - 该组 DNS **全部直连**（不经过代理），用于初始化时解析 DNS 组中带域名的
-  上游（如 `udp://dns.google:53`）。查询时按顺序遍历全部引导 DNS（先 A 后
-  AAAA）解析主机名。
+  上游（如 `udp://dns.google:53`）。查询时按顺序遍历全部引导 DNS，先查 A
+  记录再查 AAAA 记录，找到任一可用 IP 即停止。
+- `ip_version_prefer` 字段（`4` 或 `6`）在配置中声明且会被校验，但**当前
+  代码未使用**——bootstrap 解析固定按"先 A 后 AAAA"的顺序。如需支持 IPv6
+  优先解析，需修改 `mod.rs` 中的 `resolve_via_bootstrap()` 函数。
 
 ## 5. 与基于域名的 eBPF 路由集成
 
@@ -183,7 +190,8 @@ DNS 解析结果会写入 eBPF `domain_routing_map`，使 `domain(...)` 路由�
 ## 6. 当前限制
 
 - DoH / DoT 传输仅解析、不可用。
-- `upstream(...)` 响应条件当前匹配一切。
+- `ip_version_prefer` 字段在配置中存在但 bootstrap 解析未使用（固定先 A 后
+  AAAA）。
 - DNS 监听任务运行无限收发循环，用 `abort()` 停止（安全：tokio 任务在
   await 点可取消）。
 

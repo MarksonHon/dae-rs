@@ -94,9 +94,17 @@ pub struct Daeparam {
     pub padding_after_mac: [u8; 2],
     pub use_redirect_peer: u8,
     pub has_bpf_get_current_task: u8,
+    /// When set, port 53 traffic is treated as DNS queries and hijacked to the
+    /// control-plane DNS module. When cleared (no `dns` section in the daefile),
+    /// DNS traffic follows the normal routing rules like any other traffic.
+    pub dns_hijack_enabled: u8,
+    /// Reserved for alignment; keep in sync with `struct dae_param` in tproxy.c.
+    pub reserved: u8,
     /// Datapath generation counter. Initial value is 0; incremented on datapath
     /// reload (e.g. configuration change). Must match `struct dae_param` in tproxy.c.
     pub datapath_generation: u16,
+    /// Reserved for alignment; keep in sync with `struct dae_param` in tproxy.c.
+    pub padding_before_mark: [u8; 2],
     pub dae_socket_mark: u32,
 }
 
@@ -111,7 +119,10 @@ impl Default for Daeparam {
             padding_after_mac: [0u8; 2],
             use_redirect_peer: 0,
             has_bpf_get_current_task: 0,
+            dns_hijack_enabled: 0,
+            reserved: 0,
             datapath_generation: 0,
+            padding_before_mark: [0u8; 2],
             // original dae uses 0x100 as internal socket mark
             // used for mark check in bpf_sock_is_dae_socket() and pid_is_control_plane()
             dae_socket_mark: shared::DAE_SOCKET_MARK,
@@ -3089,7 +3100,7 @@ mod tests {
     }
     #[test]
     fn test_daeparam_size() {
-        assert_eq!(std::mem::size_of::<Daeparam>(), 32);
+        assert_eq!(std::mem::size_of::<Daeparam>(), 36);
     }
     #[test]
     fn test_match_set_size() {

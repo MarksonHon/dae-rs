@@ -502,66 +502,113 @@ async fn run_tcp_listener(
         let refreshing = refreshing.clone();
 
         tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
             let mut stream = stream;
 
-            // TCP DNS: 2-byte length prefix, read exactly.
-            // Bound by TCP_DNS_READ_TIMEOUT so a peer that connects but never
-            // sends a length prefix cannot block this task forever.
-            let mut len_buf = [0u8; 2];
-            if tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut len_buf))
+            // Serve multiple length-prefixed queries per connection (RFC 7766
+            // persistent connections). Previously this was one-shot: a single
+            // query was read, answered, and the connection was dropped.
+            // Dropping a TCP socket that still has unread data in its receive
+            // buffer makes the kernel send an RST instead of a FIN, and
+            // clients that reuse/pipeline the connection (e.g.
+            // systemd-resolved's TCP queries to the router DNS) saw
+            // "Connection reset by peer" and the resolution failed.
+            loop {
+                // TCP DNS: 2-byte length prefix, read exactly.
+                // Bound by TCP_DNS_READ_TIMEOUT so a peer that connects but never
+                // sends a length prefix cannot block this task forever.
+                let mut len_buf = [0u8; 2];
+                match tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut len_buf))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    // EOF / reset / timeout: the client is done with this connection.
+                    Ok(Err(e)) => {
+                        debug!(peer = %_src, error = %e, "TCP DNS read length failed; closing connection");
+                        break;
+                    }
+                    Err(_) => {
+                        debug!("TCP DNS read length timed out");
+                        break;
+                    }
+                }
+                let msg_len = u16::from_be_bytes(len_buf) as usize;
+                if msg_len == 0 || msg_len > 4096 {
+                    debug!(msg_len, "TCP DNS invalid message length; closing connection");
+                    break;
+                }
+
+                // Read message body exactly (bounded by the same timeout)
+                let mut request = vec![0u8; msg_len];
+                match tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut request))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        debug!(peer = %_src, error = %e, "TCP DNS read body failed; closing connection");
+                        break;
+                    }
+                    Err(_) => {
+                        debug!("TCP DNS read body timed out");
+                        break;
+                    }
+                }
+
+                debug!(
+                    peer = %_src,
+                    msg_len = msg_len,
+                    "DNS TCP query received"
+                );
+
+                if let Ok((response, _upstream_addr)) = handle_dns_internal(
+                    &request,
+                    &config,
+                    &upstream_pools,
+                    &cache,
+                    &router,
+                    &on_resolve,
+                    &rule_set_cache,
+                    &dialers,
+                    &inflight,
+                    &refreshing,
+                    false,
+                )
                 .await
-                .is_err()
-            {
-                debug!("TCP DNS read length timed out");
-                return;
-            }
-            let msg_len = u16::from_be_bytes(len_buf) as usize;
-            if msg_len == 0 || msg_len > 4096 {
-                return;
+                {
+                    // Write response with length prefix. write_all (with a
+                    // timeout) must be used instead of try_write: a partial
+                    // write or WouldBlock must not silently drop the response.
+                    let resp_len = (response.len() as u16).to_be_bytes();
+                    let mut framed = Vec::with_capacity(2 + response.len());
+                    framed.extend_from_slice(&resp_len);
+                    framed.extend_from_slice(&response);
+
+                    if tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.write_all(&framed))
+                        .await
+                        .is_err()
+                    {
+                        debug!("TCP DNS write timed out; closing connection");
+                        break;
+                    }
+                }
             }
 
-            // Read message body exactly (bounded by the same timeout)
-            let mut request = vec![0u8; msg_len];
-            if tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut request))
-                .await
-                .is_err()
-            {
-                debug!("TCP DNS read body timed out");
-                return;
-            }
-
-            debug!(
-                peer = %_src,
-                msg_len = msg_len,
-                "DNS TCP query received"
-            );
-
-            if let Ok((response, _upstream_addr)) = handle_dns_internal(
-                &request,
-                &config,
-                &upstream_pools,
-                &cache,
-                &router,
-                &on_resolve,
-                &rule_set_cache,
-                &dialers,
-                &inflight,
-                &refreshing,
-                false,
-            )
-            .await
-            {
-                // Write response with length prefix
-                let resp_len = (response.len() as u16).to_be_bytes();
-                let mut framed = Vec::with_capacity(2 + response.len());
-                framed.extend_from_slice(&resp_len);
-                framed.extend_from_slice(&response);
-
-                let _ = stream.writable().await;
-                let _ = stream.try_write(&framed);
-            }
+            // Graceful half-close: flush pending data and send FIN. Draining
+            // any remaining unread data first prevents the socket drop from
+            // emitting an RST (which surfaces as "Connection reset by peer"
+            // in the TProxy TCP DNS relay).
+            let _ = stream.shutdown().await;
+            let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                let mut drain = [0u8; 4096];
+                loop {
+                    match stream.read(&mut drain).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+            })
+            .await;
         });
     }
 }

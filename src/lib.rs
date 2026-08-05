@@ -159,6 +159,10 @@ pub async fn run(
         // dae-rs's own sockets and skip them (prevents self-loop).
         // Must match socket_mark used by TProxy and SOCKS5 dialers.
         dae_socket_mark: shared::DAE_SOCKET_MARK,
+        // When no `dns` section exists in the config file, disable DNS
+        // hijacking in the datapath so all DNS traffic is treated as ordinary
+        // traffic (routed by the normal routing rules).
+        dns_hijack_enabled: cp.config.dns_config.is_some() as u8,
         // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
         ..Default::default()
     };
@@ -167,6 +171,7 @@ pub async fn run(
         tproxy_port = ebpf_param.tproxy_port,
         control_plane_pid = ebpf_param.control_plane_pid,
         dae_socket_mark = ebpf_param.dae_socket_mark,
+        dns_hijack_enabled = ebpf_param.dns_hijack_enabled,
         "Initial eBPF PARAM configured"
     );
 

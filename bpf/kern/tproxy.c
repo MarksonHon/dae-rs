@@ -197,7 +197,15 @@ struct dae_param {
 	__u8 padding_after_mac[2]; // pad to align use_redirect_peer
 	__u8 use_redirect_peer;
 	__u8 has_bpf_get_current_task;
+	// When set, port 53 traffic is treated as DNS queries and hijacked to the
+	// control-plane DNS module. When cleared (no `dns` section in the daefile),
+	// DNS traffic follows the normal routing rules like any other traffic.
+	__u8 dns_hijack_enabled;
+	// Reserved for alignment; keep in sync with the Rust Daeparam struct.
+	__u8 reserved;
 	__u16 datapath_generation;
+	// Reserved for alignment; keep in sync with the Rust Daeparam struct.
+	__u8 padding_before_mark[2];
 	// dae_socket_mark is set on dae's own sockets (Anyfrom pool) to identify them.
 	// When bpf_sk_lookup_* finds a socket, we check this mark to skip dae's own sockets.
 	// This prevents false positives in NAT loopback detection for transparent proxying.
@@ -1703,8 +1711,10 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 	// Rule is like: domain(suffix:baidu.com, suffix:google.com) && port(443) ->
 	// proxy Subrule is like: domain(suffix:baidu.com, suffix:google.com) Match
 	// set is like: suffix:baidu.com
+	// Port 53 is only hijacked as a DNS query when the DNS module is enabled.
+	// Otherwise DNS traffic is routed like any other traffic.
 	ctx->route_state =
-		(ctx->h_dport == 53 &&
+		(PARAM.dns_hijack_enabled && ctx->h_dport == 53 &&
 		 (_l4proto_type == L4ProtoType_UDP ||
 		  _l4proto_type == L4ProtoType_TCP))
 		? ROUTE_STATE_DNS_QUERY
@@ -2028,7 +2038,9 @@ static __always_inline void copy_reversed_tuples(struct tuples_key *key,
 
 static __always_inline bool is_short_lived_udp_traffic(struct tuples_key *key)
 {
-	return key->l4proto == IPPROTO_UDP &&
+	// Port 53 is only short-lived when the DNS module hijacks it. Otherwise
+	// DNS is ordinary UDP traffic and gets normal conn-state caching.
+	return PARAM.dns_hijack_enabled && key->l4proto == IPPROTO_UDP &&
 	       (key->dport == bpf_htons(53) || key->sport == bpf_htons(53));
 }
 
@@ -2349,7 +2361,9 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 			      0, NULL, 0,
 			      ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
-		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
+		if (PARAM.dns_hijack_enabled &&
+		    (ctx->udph.source == bpf_htons(53) ||
+		     ctx->udph.dest == bpf_htons(53)))
 			return TC_ACT_PIPE;
 
 		struct tuples tuples;
@@ -2808,7 +2822,9 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			      0, NULL, 0,
 			      ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
-		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
+		if (PARAM.dns_hijack_enabled &&
+		    (ctx->udph.source == bpf_htons(53) ||
+		     ctx->udph.dest == bpf_htons(53)))
 			return TC_ACT_PIPE;
 
 		struct tuples tuples;
@@ -2844,8 +2860,10 @@ static __noinline bool
 wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
 		      __be16 dport)
 {
-	/* DNS must always reach control plane; userspace handles fallback. */
-	if (dport == bpf_htons(53))
+	/* When DNS hijacking is enabled, DNS must always reach the control
+	 * plane; userspace handles fallback. When disabled, DNS is ordinary
+	 * traffic and its outbound liveness is judged like any other flow. */
+	if (PARAM.dns_hijack_enabled && dport == bpf_htons(53))
 		return true;
 
 	// ARRAY map key: outbound_id * 6 + domain * 2 + ipversion
@@ -2856,7 +2874,7 @@ wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
 	__u32 *alive;
 
 	if (l4proto == IPPROTO_UDP) {
-		if (dport == bpf_htons(53))
+		if (PARAM.dns_hijack_enabled && dport == bpf_htons(53))
 			domain_idx = 1;
 		else
 			domain_idx = 2;
@@ -3159,7 +3177,12 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	routing_epoch_slot = routing_epoch_slot_from_route_result(s64_ret);
 
 fast_path_skip_routing:
-		if (udp_conn_state && tuples->five.dport != bpf_htons(53)) {
+		// Hijacked DNS flows skip the conn-state meta update (they are
+		// transient and re-routed every packet). When DNS hijacking is
+		// disabled, DNS is ordinary UDP and gets cached routing.
+		if (udp_conn_state &&
+		    (tuples->five.dport != bpf_htons(53) ||
+		     !PARAM.dns_hijack_enabled)) {
 			if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
 				__builtin_memcpy(udp_conn_state->mac, mac, 6);
 				if (pid_pname) {

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set +e
 
 LOG="/tmp/dae-rs-debug.log"
 DAE_RS_BIN="./target/debug/dae-rs"
@@ -13,10 +13,82 @@ export RUST_LOG
 echo "=== dae-rs Debug Collection Script ===" > "$LOG"
 echo "Start time: $(date)" >> "$LOG"
 
-# Helper: find bpf map ID by name prefix
-find_map_id() {
-    local pattern="$1"
-    bpftool map show 2>/dev/null | grep "$pattern" | awk '{print $1}' | tr -d ':'
+BPF_PIN="/sys/fs/bpf/dae"
+
+# Helper: dump a pinned BPF map
+dump_pinned_map() {
+    local pin="$1" label="$2"
+    echo "" >> "$LOG"
+    echo "=== $label ===" >> "$LOG"
+    if [ -e "$BPF_PIN/$pin" ]; then
+        bpftool map dump pinned "$BPF_PIN/$pin" >> "$LOG" 2>&1 || echo "Failed to dump $pin" >> "$LOG"
+    else
+        echo "Map not found at $BPF_PIN/$pin" >> "$LOG"
+    fi
+}
+
+# Helper: annotate debug counter values with human-readable meaning
+annotate_debug_counters() {
+    local pin="$1"
+    echo "" >> "$LOG"
+    echo "--- Debug Counter Legend ---" >> "$LOG"
+    echo "  [0] listen_sock_null  = listen_socket_map lookup returned NULL" >> "$LOG"
+    echo "  [1] assign_listener_fail = bpf_sk_assign() failed" >> "$LOG"
+    echo "  [2] wan_redirect_fail = bpf_redirect() to dae0 returned < 0" >> "$LOG"
+    echo "  [3] wan_route_fail    = route() returned < 0 (TCP SYN failed routing)" >> "$LOG"
+    echo "  [4] wan_outbound_dead = wan_outbound_is_alive() returned false" >> "$LOG"
+    echo "  [5] wan_parse_fail    = parse_transport failed" >> "$LOG"
+    echo "  [6] wan_egress_entered = WAN egress entered" >> "$LOG"
+    echo "  [7] wan_egress_skipped = WAN egress skipped" >> "$LOG"
+    echo "  [8] wan_tcp_entered   = TCP entered WAN egress" >> "$LOG"
+    echo "  [9] wan_tcp_direct    = TCP matched direct (no proxy)" >> "$LOG"
+    echo " [10] wan_tcp_proxy     = TCP matched proxy" >> "$LOG"
+    echo " [11] wan_udp_entered   = UDP entered WAN egress" >> "$LOG"
+    echo " [12] wan_udp_direct    = UDP matched direct" >> "$LOG"
+    echo " [13] wan_udp_proxy     = UDP matched proxy" >> "$LOG"
+    echo " [14] dae0peer_entered  = dae0 peer entered" >> "$LOG"
+    echo " [15] assign_called     = bpf_sk_assign() called" >> "$LOG"
+    echo " [16] bpf_sk_assign_ok  = bpf_sk_assign() returned 0" >> "$LOG"
+    echo " [17] sk_match          = skb->sk matches assigned sk" >> "$LOG"
+    echo " [18] sk_null           = skb->sk is NULL after assign" >> "$LOG"
+    echo " [19] sk_mismatch       = skb->sk mismatch after assign" >> "$LOG"
+    echo " [20] dae0_ingress_entered = dae0 ingress entered" >> "$LOG"
+    echo " [21] dae0_redirect_tuple_ok = redirect tuple lookup OK" >> "$LOG"
+    echo " [22] dae0_redirect_track_hit = redirect track hit" >> "$LOG"
+    echo " [23] dae0_redirect_success = dae0 redirect success" >> "$LOG"
+    echo " [24] chg_type_fail     = bpf_skb_change_type failed" >> "$LOG"
+    echo " [25] redirect_track_publish = redirect track entry published" >> "$LOG"
+    echo " [26] redirect_tuple_load_fail = redirect tuple load failed" >> "$LOG"
+    echo " [27] redirect_track_miss = redirect track miss" >> "$LOG"
+    echo " [28] redirect_tuple_fast_fallback = fast path fallback to slow" >> "$LOG"
+    echo " [29] redirect_tuple_slow_fail = slow path load failed" >> "$LOG"
+    echo " [30] redirect_invalid_ifindex = ifindex is 0" >> "$LOG"
+    echo " [31] redirect_track_reverse_hit = reverse-key lookup hit" >> "$LOG"
+    echo " [32] redirect_track_update_fail = map update failed" >> "$LOG"
+    echo " [33] select_tcp4       = listener selected TCP/IPv4" >> "$LOG"
+    echo " [34] select_udp        = listener selected UDP" >> "$LOG"
+    echo " [35] select_tcp6       = listener selected TCP/IPv6" >> "$LOG"
+    echo "" >> "$LOG"
+    echo "--- Raw Counter Values ---" >> "$LOG"
+    if [ -e "$BPF_PIN/$pin" ]; then
+        bpftool map dump pinned "$BPF_PIN/$pin" >> "$LOG" 2>&1 || echo "Failed to dump $pin" >> "$LOG"
+    else
+        echo "Map not found at $BPF_PIN/$pin" >> "$LOG"
+    fi
+}
+
+# Helper: capture bpf_printk trace_pipe output (route failures)
+capture_trace_pipe() {
+    local duration="${1:-3}"
+    echo "" >> "$LOG"
+    echo "=== bpf_printk trace_pipe (${duration}s capture, filtered for route FAILED) ===" >> "$LOG"
+    if [ -r /sys/kernel/debug/tracing/trace_pipe ]; then
+        timeout "$duration" cat /sys/kernel/debug/tracing/trace_pipe 2>/dev/null | \
+            grep -i "route FAILED\|wan_egress" | head -50 >> "$LOG" 2>&1
+        echo "(captured ${duration}s)" >> "$LOG"
+    else
+        echo "trace_pipe not accessible (try: mount -t debugfs none /sys/kernel/debug)" >> "$LOG"
+    fi
 }
 
 # Helper: collect DNS-related dae-rs log lines
@@ -36,23 +108,17 @@ cleanup() {
     echo "=== Stopping dae-rs ===" >> "$LOG"
 
     # Collect diagnostics BEFORE killing dae-rs so BPF state is still live
-    DEBUG_MAP_ID=$(find_map_id "debug_counter_m")
-    if [ -n "$DEBUG_MAP_ID" ]; then
-        echo "" >> "$LOG"
-        echo "=== Debug Counter Map (id $DEBUG_MAP_ID) ===" >> "$LOG"
-        bpftool map dump id $DEBUG_MAP_ID >> "$LOG" 2>&1 || echo "Failed to dump debug_counter_map" >> "$LOG"
-    fi
-
-    SOCK_MAP_ID=$(find_map_id "listen_socket_m")
-    if [ -n "$SOCK_MAP_ID" ]; then
-        echo "" >> "$LOG"
-        echo "=== Listen Socket Map (id $SOCK_MAP_ID) ===" >> "$LOG"
-        bpftool map dump id $SOCK_MAP_ID >> "$LOG" 2>&1 || echo "Failed to dump listen_socket_map" >> "$LOG"
-    fi
+    annotate_debug_counters "debug_counter_map"
+    dump_pinned_map "listen_socket_map" "Listen Socket Map (TCP4=0, UDP=1, TCP6=2)"
+    dump_pinned_map "active_routing_epoch_map" "active_routing_epoch_map (slot 0 = active epoch)"
+    dump_pinned_map "routing_meta_map" "routing_meta_map (per-slot rule count)"
+    dump_pinned_map "routing_epoch_map" "routing_epoch_map (per-slot epoch metadata)"
+    dump_pinned_map "route_ctx_scratch_map" "route_ctx_scratch_map (per-CPU route scratch)"
+    capture_trace_pipe 2
 
     echo "" >> "$LOG"
     echo "=== BPF Programs ===" >> "$LOG"
-    bpftool prog show 2>&1 | grep -E "tproxy|dae" >> "$LOG" 2>&1 || echo "Failed to show programs" >> "$LOG"
+    bpftool prog show 2>&1 >> "$LOG" 2>&1 || echo "bpftool not available" >> "$LOG"
 
     echo "" >> "$LOG"
     echo "=== Socket Listening State ===" >> "$LOG"
@@ -64,17 +130,22 @@ cleanup() {
         echo "=== Proxy NS listening sockets ===" >> "$LOG"
         ip netns exec "$NETNS_NAME" ss -tulnp >> "$LOG" 2>&1 || echo "Failed to show proxy NS sockets" >> "$LOG"
 
-        echo "" >> "$LOG"
-        echo "=== Proxy NS DNS (UDP 53) tcpdump ===" >> "$LOG"
-        timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i any -n 'udp port 53' -c 30 >> "$LOG" 2>&1 || echo "proxy NS DNS tcpdump not available or timeout" >> "$LOG"
+        if command -v tcpdump >/dev/null 2>&1; then
+            echo "" >> "$LOG"
+            echo "=== Proxy NS DNS (UDP 53) tcpdump ===" >> "$LOG"
+            timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i any -n 'udp port 53' -c 30 >> "$LOG" 2>&1 || echo "proxy NS DNS tcpdump timeout" >> "$LOG"
 
-        echo "" >> "$LOG"
-        echo "=== Proxy NS tcpdump (SYN packets) ===" >> "$LOG"
-        timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i any -n 'tcp[tcpflags] & tcp-syn != 0' -c 20 >> "$LOG" 2>&1 || echo "tcpdump not available or timeout" >> "$LOG"
+            echo "" >> "$LOG"
+            echo "=== Proxy NS tcpdump (SYN packets) ===" >> "$LOG"
+            timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i any -n 'tcp[tcpflags] & tcp-syn != 0' -c 20 >> "$LOG" 2>&1 || echo "proxy NS SYN tcpdump timeout" >> "$LOG"
 
-        echo "" >> "$LOG"
-        echo "=== Proxy NS loopback tcpdump (TCP) ===" >> "$LOG"
-        timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i lo -n 'tcp' -c 20 >> "$LOG" 2>&1 || echo "lo tcpdump not available or timeout" >> "$LOG"
+            echo "" >> "$LOG"
+            echo "=== Proxy NS loopback tcpdump (TCP) ===" >> "$LOG"
+            timeout 3 ip netns exec "$NETNS_NAME" tcpdump -i lo -n 'tcp' -c 20 >> "$LOG" 2>&1 || echo "proxy NS lo tcpdump timeout" >> "$LOG"
+        else
+            echo "" >> "$LOG"
+            echo "=== Proxy NS tcpdump skipped (tcpdump not installed) ===" >> "$LOG"
+        fi
 
         echo "" >> "$LOG"
         echo "=== Proxy NS interfaces ===" >> "$LOG"
@@ -98,8 +169,9 @@ cleanup() {
     sleep 2
 
     echo "" >> "$LOG"
-    echo "=== dmesg (last 30 lines, kernel BPF messages) ===" >> "$LOG"
+    echo "=== dmesg (last 30 lines, kernel messages) ===" >> "$LOG"
     dmesg | tail -30 >> "$LOG" 2>&1 || echo "dmesg not available" >> "$LOG"
+    capture_trace_pipe 2
 
     echo "" >> "$LOG"
     echo "End time: $(date)" >> "$LOG"
@@ -136,21 +208,18 @@ ss -tulnp | grep -E "169\.254\.0\.1" >> "$LOG" 2>&1 || echo "No 169.254.0.1 list
 # Pre-traffic snapshot
 echo "" >> "$LOG"
 echo "=== Pre-traffic Debug Counter Map ===" >> "$LOG"
-DEBUG_MAP_ID=$(find_map_id "debug_counter_m")
-if [ -n "$DEBUG_MAP_ID" ]; then
-    bpftool map dump id $DEBUG_MAP_ID >> "$LOG" 2>&1 || echo "Failed" >> "$LOG"
-else
-    echo "debug_counter_map not found" >> "$LOG"
-fi
+annotate_debug_counters "debug_counter_map"
 
 echo "" >> "$LOG"
 echo "=== Pre-traffic Listen Socket Map ===" >> "$LOG"
-SOCK_MAP_ID=$(find_map_id "listen_socket_m")
-if [ -n "$SOCK_MAP_ID" ]; then
-    bpftool map dump id $SOCK_MAP_ID >> "$LOG" 2>&1 || echo "Failed" >> "$LOG"
-else
-    echo "listen_socket_map not found" >> "$LOG"
-fi
+dump_pinned_map "listen_socket_map" "Listen Socket Map (TCP4=0, UDP=1, TCP6=2)"
+
+echo "" >> "$LOG"
+echo "=== Pre-traffic Routing State ===" >> "$LOG"
+dump_pinned_map "active_routing_epoch_map" "active_routing_epoch_map (slot 0 = active epoch)"
+dump_pinned_map "routing_meta_map" "routing_meta_map (per-slot rule count)"
+dump_pinned_map "routing_epoch_map" "routing_epoch_map (per-slot epoch metadata)"
+capture_trace_pipe 2
 
 # DNS resolution tests (before TCP traffic, to isolate DNS path)
 echo "" >> "$LOG"
@@ -168,10 +237,15 @@ fi
 # Host NS DNS (UDP 53) tcpdump snapshot during resolution
 echo "" >> "$LOG"
 echo "=== Host NS DNS (UDP 53) tcpdump during resolution ===" >> "$LOG"
+if command -v tcpdump >/dev/null 2>&1; then
 (
-    timeout 5 tcpdump -i any -n 'udp port 53' -c 40 >> "$LOG" 2>&1 || echo "Host NS DNS tcpdump not available or timeout" >> "$LOG"
+    timeout 5 tcpdump -i any -n 'udp port 53' -c 40 >> "$LOG" 2>&1 || echo "tcpdump timeout or error" >> "$LOG"
 ) &
 TCPDUMP_PID=$!
+else
+    echo "tcpdump not installed" >> "$LOG"
+    TCPDUMP_PID=""
+fi
 sleep 1
 # Trigger a few more DNS queries while tcpdump is running
 if command -v dig >/dev/null 2>&1; then
@@ -181,7 +255,7 @@ else
     nslookup -timeout=3 baidu.com >/dev/null 2>&1 || true
     nslookup -timeout=3 example.com >/dev/null 2>&1 || true
 fi
-wait $TCPDUMP_PID 2>/dev/null || true
+[ -n "$TCPDUMP_PID" ] && wait $TCPDUMP_PID 2>/dev/null || true
 
 # Concurrent DNS query stress test to expose EADDRINUSE
 echo "" >> "$LOG"
@@ -238,21 +312,18 @@ collect_dns_log
 # Post-traffic snapshot
 echo "" >> "$LOG"
 echo "=== Post-traffic Debug Counter Map ===" >> "$LOG"
-DEBUG_MAP_ID=$(find_map_id "debug_counter_m")
-if [ -n "$DEBUG_MAP_ID" ]; then
-    bpftool map dump id $DEBUG_MAP_ID >> "$LOG" 2>&1 || echo "Failed" >> "$LOG"
-else
-    echo "debug_counter_map not found" >> "$LOG"
-fi
+annotate_debug_counters "debug_counter_map"
 
 echo "" >> "$LOG"
 echo "=== Post-traffic Listen Socket Map ===" >> "$LOG"
-SOCK_MAP_ID=$(find_map_id "listen_socket_m")
-if [ -n "$SOCK_MAP_ID" ]; then
-    bpftool map dump id $SOCK_MAP_ID >> "$LOG" 2>&1 || echo "Failed" >> "$LOG"
-else
-    echo "listen_socket_map not found" >> "$LOG"
-fi
+dump_pinned_map "listen_socket_map" "Listen Socket Map (TCP4=0, UDP=1, TCP6=2)"
+
+echo "" >> "$LOG"
+echo "=== Post-traffic Routing State ===" >> "$LOG"
+dump_pinned_map "active_routing_epoch_map" "active_routing_epoch_map (slot 0 = active epoch)"
+dump_pinned_map "routing_meta_map" "routing_meta_map (per-slot rule count)"
+dump_pinned_map "routing_epoch_map" "routing_epoch_map (per-slot epoch metadata)"
+capture_trace_pipe 2
 
 # Generate more traffic
 curl -s -o /dev/null -w "curl github.com: %{http_code}\n" --connect-timeout 5 https://github.com >> "$LOG" 2>&1 || echo "curl github.com failed" >> "$LOG"
@@ -263,20 +334,17 @@ sleep 5
 
 echo "" >> "$LOG"
 echo "=== Final Debug Counter Map ===" >> "$LOG"
-DEBUG_MAP_ID=$(find_map_id "debug_counter_m")
-if [ -n "$DEBUG_MAP_ID" ]; then
-    bpftool map dump id $DEBUG_MAP_ID >> "$LOG" 2>&1 || echo "Failed" >> "$LOG"
-else
-    echo "debug_counter_map not found" >> "$LOG"
-fi
+annotate_debug_counters "debug_counter_map"
 
 echo "" >> "$LOG"
 echo "=== Final Listen Socket Map ===" >> "$LOG"
-SOCK_MAP_ID=$(find_map_id "listen_socket_m")
-if [ -n "$SOCK_MAP_ID" ]; then
-    bpftool map dump id $SOCK_MAP_ID >> "$LOG" 2>&1 || echo "Failed" >> "$LOG"
-else
-    echo "listen_socket_map not found" >> "$LOG"
-fi
+dump_pinned_map "listen_socket_map" "Listen Socket Map (TCP4=0, UDP=1, TCP6=2)"
+
+echo "" >> "$LOG"
+echo "=== Final Routing State ===" >> "$LOG"
+dump_pinned_map "active_routing_epoch_map" "active_routing_epoch_map (slot 0 = active epoch)"
+dump_pinned_map "routing_meta_map" "routing_meta_map (per-slot rule count)"
+dump_pinned_map "routing_epoch_map" "routing_epoch_map (per-slot epoch metadata)"
+capture_trace_pipe 2
 
 echo "Debug collection complete. Output in $LOG"

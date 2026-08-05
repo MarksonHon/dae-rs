@@ -13,5 +13,6 @@
 pub mod ebpf;
 pub mod iface_mgr;
 pub mod netns;
+pub mod socks5_server;
 pub mod tproxy;
 pub mod udp_tracker;

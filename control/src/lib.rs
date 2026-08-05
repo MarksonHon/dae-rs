@@ -357,6 +357,13 @@ pub struct ControlPlane {
     /// Rule set update completion notification receiver (value increments on successful update).
     /// Used for Phase 3 hot-reload wiring (Routing recompilation / eBPF double-buffer switch).
     pub rule_set_notifier: Option<tokio::sync::watch::Receiver<u64>>,
+    /// Pre-compiled routing rules (compiled before eBPF loading).
+    ///
+    /// Compilation is moved before eBPF loading so that once TC is attached
+    /// (Step 3), the routing maps can be written immediately instead of waiting
+    /// ~33 seconds for CIDR processing. This eliminates the `wan_route_fail`
+    /// spike during startup where TCP SYNs arrive before any rules exist.
+    compiled_routing: Option<routing::matcher::CompiledRouting>,
     /// Ruleset in-memory cache (shared by matcher compilation / DNS routing / DNS response Routing).
     ///
     /// Scanned and populated from `/var/lib/dae-rs/` at startup; refreshed by background watcher after scheduler updates complete.
@@ -425,6 +432,7 @@ impl ControlPlane {
             rule_set_scheduler: None,
             rule_set_notifier: None,
             rule_set_cache: ruleset::cache::RuleSetCache::new(),
+            compiled_routing: None,
             rule_set_reload_rx: None,
         }
     }
@@ -433,6 +441,8 @@ impl ControlPlane {
     ///
     /// Executes the following startup sequence in order:
     ///
+    /// 0. **Download rule set data files** — Fetch missing sets (with SOCKS5 proxy if needed)
+    /// 0.5. **Compile routing rules** — CPU-intensive compilation before eBPF is even loaded
     /// 1. **Create network namespace** — Call [`NetnsManager::create()`]
     ///    - Create anonymous network namespace
     ///    - Create and configure veth pair
@@ -441,8 +451,8 @@ impl ControlPlane {
     ///    - Load eBPF object from bytecode file
     /// 3. **Attach TC programs** — Call [`EbpfManager::attach_tc()`]
     ///    - Attach ingress/egress programs to the host-side veth interface
-    ///      3.5. **Write eBPF maps** — Write exclusion list and routing rules
-    ///    - Compile process exclusion list from daefile config
+    /// 3.5. **Write eBPF maps** — Write exclusion list and pre-compiled routing rules
+    ///    - Write process exclusion list from daefile config
     ///    - Compile routing rules from daefile config
     /// 4. **Start TProxy listener** — Start TProxy inside the proxy namespace
     ///    - Create SOCKS5 dialer
@@ -464,6 +474,180 @@ impl ControlPlane {
             proxy_addr = %self.config.proxy_addr,
             "Control plane start() invoked with config"
         );
+
+        // ---- Step 0: Download missing rule set data files ----
+        // Before creating the network namespace or loading eBPF, ensure all rule set
+        // data files are available on disk. This prevents E2103 compilation errors
+        // in Step 3.5 when rule set data is referenced in routing rules but the
+        // corresponding files have not been downloaded yet.
+        //
+        // If the download requires a proxy (e.g., the rule set URL is only
+        // reachable through the proxy), we start a local SOCKS5 server that
+        // forwards through the outbound dialer. This way, any protocol
+        // (Shadowsocks, Trojan, etc.) is supported — the download only needs
+        // a plain SOCKS5 endpoint on localhost.
+        if let Some(ref dc) = self.daefile_config {
+            if !dc.rule_set.is_empty() {
+                let dir = ruleset::DataDir::default_dir();
+                let scanned = match dir.scan(&dc.rule_set).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "rule set scan failed; proceeding without pre-download");
+                        Default::default()
+                    }
+                };
+                let missing: Vec<&str> = scanned
+                    .iter()
+                    .filter(|(_, s)| s.data.is_none() && !s.damaged)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    info!(
+                        "Step 0/5: {} rule set data file(s) missing — downloading before startup: {:?}",
+                        missing.len(),
+                        missing
+                    );
+                    // Build the outbound dialer and start a local SOCKS5 server
+                    // so downloads can use any proxy protocol (Shadowsocks,
+                    // Trojan, etc.) not just SOCKS5.
+                    let (socks5_server, socks5_addr) =
+                        if !dc.outbounds.nodes.is_empty() {
+                            match self.build_outbound_dialer(None, 0) {
+                                Ok(dialer) => {
+                                    let local_addr: SocketAddr =
+                                        ([127, 0, 0, 1], 0).into();
+                                    match crate::net::socks5_server::Socks5LocalServer::start(
+                                        dialer, local_addr,
+                                    )
+                                    .await
+                                    {
+                                        Ok(server) => {
+                                            let addr = server.addr();
+                                            info!(
+                                                "Local SOCKS5 proxy started at {} for rule set downloads",
+                                                addr
+                                            );
+                                            (Some(server), Some(addr))
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                "Failed to start local SOCKS5 server; \
+                                                 falling back to direct download"
+                                            );
+                                            (None, None)
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "Failed to build outbound dialer; \
+                                         falling back to direct download"
+                                    );
+                                    (None, None)
+                                }
+                            }
+                        } else {
+                            (None, None)
+                        };
+                    for cfg in &dc.rule_set {
+                        if missing.contains(&cfg.name.as_str()) {
+                            info!("Downloading rule set '{}' (url: {})", cfg.name, cfg.url);
+                            match ruleset::download::update_rule_set(
+                                cfg,
+                                &dir,
+                                socks5_addr,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => {
+                                    match outcome {
+                                        ruleset::UpdateOutcome::Updated(_) => {
+                                            info!(
+                                                "Rule set '{}' downloaded successfully",
+                                                cfg.name
+                                            );
+                                        }
+                                        ruleset::UpdateOutcome::NotModified => {
+                                            info!("Rule set '{}' not modified (304)", cfg.name);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        name = %cfg.name,
+                                        error = %e,
+                                        "Failed to download rule set; \
+                                         will retry in background via scheduler"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Drop the SOCKS5 server (shuts down the background task)
+                    drop(socks5_server);
+                } else {
+                    debug!("All rule set data files present on disk");
+                }
+            }
+        }
+
+        // ---- Step 0.4: Suppress redundant update_on_start ----
+        // Step 0 just verified all rule set data files are on disk (either
+        // already existed or were freshly downloaded). The scheduler's
+        // `update_on_start` would fire another HTTP request for the same data,
+        // which is redundant — Step 0 already got the latest version via ETag.
+        // Clear the flag so the scheduler skips the startup download.
+        if let Some(ref mut dc) = self.daefile_config {
+            for entry in &mut dc.rule_set {
+                entry.update_on_start = false;
+            }
+        }
+
+        // ---- Step 0.5: Compile routing rules before eBPF loading ----
+        // Compilation is done here so that once TC is attached (Step 3), the
+        // routing maps can be written immediately. This eliminates the ~33s
+        // window where TCP SYNs arrive before any rules exist.
+        if let Some(ref dc) = self.daefile_config {
+            if self.compiled_routing.is_none() {
+                let compile_start = std::time::Instant::now();
+                // Load rule set cache from disk if not already loaded.
+                if !dc.rule_set.is_empty() && self.rule_set_cache.is_empty() {
+                    let dir = ruleset::DataDir::default_dir();
+                    let map = ruleset::load_cache_from_dir(&dir, &dc.rule_set).await;
+                    info!(
+                        n = map.len(),
+                        n_configured = dc.rule_set.len(),
+                        "Pre-loaded rule set memory cache from disk"
+                    );
+                    self.rule_set_cache.replace_all(map);
+                }
+                let proxy_server_ips = collect_proxy_server_ips(&self.config, &dc.outbounds);
+                if !proxy_server_ips.is_empty() {
+                    info!(
+                        "Collected {} proxy server IP(s) for auto-direct rules: {:?}",
+                        proxy_server_ips.len(),
+                        proxy_server_ips
+                    );
+                }
+                let compiled = routing::matcher::compile_rules(
+                    &dc.routing,
+                    &dc.outbounds,
+                    &proxy_server_ips,
+                    Some(&self.rule_set_cache),
+                )
+                .context("Failed to compile routing rules")?;
+                info!(
+                    "Step 0.5/5: Routing rules pre-compiled ({} match_sets, {} lpm_tries, {} domain_sets) in {}ms",
+                    compiled.match_sets.len(),
+                    compiled.lpm_tries.len(),
+                    compiled.domain_sets.len(),
+                    compile_start.elapsed().as_millis(),
+                );
+                self.compiled_routing = Some(compiled);
+            }
+        }
 
         // ---- Step 1: Create network namespace ----
         info!("Step 1/5: Creating network namespace and veth pair");
@@ -803,126 +987,83 @@ impl ControlPlane {
         //      real socket cookies → pid_is_control_plane cookie match
         //   2. SO_MARK=0x100 fallback on dae-rs's outgoing sockets
 
-        // 3.5b. Compile routing rules into MatchSet and write to eBPF maps
-        // NOTE: Even if the configuration has no explicit rules, the fallback match set must be compiled and written,
-        // otherwise eBPF route() active_rules_len=0 → bpf_loop doesn't iterate → all SHOT.
-        if let Some(ref dc) = self.daefile_config {
+        // 3.5b. Write pre-compiled routing rules to eBPF maps.
+        // Compilation was done in Step 0.5; this is just fast map writes.
+        if let Some(ref compiled) = self.compiled_routing {
             debug!(
-                n_rules = dc.routing.rules.len(),
-                n_outbounds = dc.outbounds.nodes.len(),
-                fallback = %dc.routing.fallback,
-                "Processing routing rules"
+                match_sets = compiled.match_sets.len(),
+                lpm_tries = compiled.lpm_tries.len(),
+                domain_sets = compiled.domain_sets.len(),
+                "Writing pre-compiled routing rules to eBPF maps"
             );
-            // 3.5b-0. Load ruleset in-memory cache (scan from /var/lib/dae-rs/).
-            // matcher compilation needs geoip/geosite/set data; missing data causes E2103 compilation error.
-            if !dc.rule_set.is_empty() && self.rule_set_cache.is_empty() {
-                let dir = ruleset::DataDir::default_dir();
-                let map = ruleset::load_cache_from_dir(&dir, &dc.rule_set).await;
+
+            let init_slot = self.current_epoch_slot;
+
+            // Write MatchSet entries to routing_map
+            if !compiled.match_sets.is_empty() {
+                let write_start = std::time::Instant::now();
+                self.ebpf().write_routing_rules(&compiled.match_sets, init_slot)?;
                 info!(
-                    n = map.len(),
-                    n_configured = dc.rule_set.len(),
-                    "Loaded rule set memory cache from disk"
+                    "Wrote {} MatchSet entries to routing_map slot {} ({}ms)",
+                    compiled.match_sets.len(),
+                    init_slot,
+                    write_start.elapsed().as_millis()
                 );
-                self.rule_set_cache.replace_all(map);
             }
+
+            // Write LPM trie data to inner LPM trie maps
             {
-                // Collect proxy server IPs from all outbound nodes for auto-direct rules.
-                // This prevents traffic destined for proxy servers from being re-proxied (loop prevention).
-                let proxy_server_ips = collect_proxy_server_ips(&self.config, &dc.outbounds);
-                if !proxy_server_ips.is_empty() {
-                    info!(
-                        "Collected {} proxy server IP(s) for auto-direct rules: {:?}",
-                        proxy_server_ips.len(),
-                        proxy_server_ips
-                    );
-                } else {
-                    debug!("No proxy server IPs collected (no auto-direct rules needed)");
+                let mut all_cidr_entries: Vec<(u32, CidrEntry)> = Vec::new();
+                for (trie_idx, cidrs) in compiled.lpm_tries.iter().enumerate() {
+                    let entries = crate::routing::matcher::cidrs_to_cidr_entries(cidrs);
+                    for (_, entry) in entries {
+                        all_cidr_entries.push((trie_idx as u32, entry));
+                    }
                 }
-                let compile_start = std::time::Instant::now();
-                let compiled = routing::matcher::compile_rules(
-                    &dc.routing,
-                    &dc.outbounds,
-                    &proxy_server_ips,
-                    Some(&self.rule_set_cache),
-                )
-                .context("Failed to compile routing rules")?;
-                debug!(
-                    compile_ms = compile_start.elapsed().as_millis(),
-                    match_sets = compiled.match_sets.len(),
-                    lpm_tries = compiled.lpm_tries.len(),
-                    domain_sets = compiled.domain_sets.len(),
-                    "Routing rules compiled"
-                );
-
-                // Write MatchSet entries to routing_map (initial slot = 0)
-                let init_slot = self.current_epoch_slot;
-                if !compiled.match_sets.is_empty() {
+                if !all_cidr_entries.is_empty() {
                     let write_start = std::time::Instant::now();
-                    self.ebpf().write_routing_rules(&compiled.match_sets, init_slot)?;
+                    self.ebpf().write_cidr_table(&all_cidr_entries, init_slot)?;
                     info!(
-                        "Wrote {} MatchSet entries to routing_map slot {} ({}ms)",
-                        compiled.match_sets.len(),
+                        "Wrote {} CIDR entries across {} LPM tries slot {} ({}ms)",
+                        all_cidr_entries.len(),
+                        compiled.lpm_tries.len(),
                         init_slot,
-                        write_start.elapsed().as_millis()
+                        write_start.elapsed().as_millis(),
                     );
-                }
-
-                // Write LPM trie data to inner LPM trie maps via lpm_array_map
-                // Each trie (at index trie_idx) gets its CIDR entries written to
-                // the inner LPM_TRIE map at that position in the ARRAY_OF_MAPS.
-                {
-                    let mut all_cidr_entries: Vec<(u32, CidrEntry)> = Vec::new();
-                    for (trie_idx, cidrs) in compiled.lpm_tries.iter().enumerate() {
-                        let entries = crate::routing::matcher::cidrs_to_cidr_entries(cidrs);
-                        for (_, entry) in entries {
-                            all_cidr_entries.push((trie_idx as u32, entry));
-                        }
-                    }
-                    if !all_cidr_entries.is_empty() {
-                        let write_start = std::time::Instant::now();
-                        self.ebpf().write_cidr_table(&all_cidr_entries, init_slot)?;
-                        info!(
-                            "Wrote {} CIDR entries across {} LPM tries slot {} ({}ms)",
-                            all_cidr_entries.len(),
-                            compiled.lpm_tries.len(),
-                            init_slot,
-                            write_start.elapsed().as_millis(),
-                        );
-                    } else {
-                        debug!("No CIDR entries to write (no LPM rules)");
-                    }
-                }
-
-                // Set the initial active routing epoch
-                if let Err(e) = self.ebpf().update_active_routing_epoch(init_slot) {
-                    warn!("Failed to set initial active_routing_epoch: {}", e);
                 } else {
-                    info!("Initial active_routing_epoch set to slot {}", init_slot);
+                    debug!("No CIDR entries to write (no LPM rules)");
                 }
+            }
 
-                // Set up userspace routing matcher (used by RoutingHandoffConsumer)
-                self.routing_matcher = Some(Arc::new(
-                    crate::routing::matcher::RoutingMatcher::from_compiled(&compiled),
+            // Set the initial active routing epoch
+            if let Err(e) = self.ebpf().update_active_routing_epoch(init_slot) {
+                warn!("Failed to set initial active_routing_epoch: {}", e);
+            } else {
+                info!("Initial active_routing_epoch set to slot {}", init_slot);
+            }
+
+            // Set up userspace routing matcher
+            self.routing_matcher = Some(Arc::new(
+                crate::routing::matcher::RoutingMatcher::from_compiled(compiled),
+            ));
+            debug!("RoutingMatcher built from pre-compiled rules");
+
+            // Set up domain routing tracker
+            if !compiled.domain_sets.is_empty() {
+                let n_sets = compiled.domain_sets.len();
+                let tracker = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::routing::domain_routing::DomainRoutingTracker::new(
+                        std::sync::Arc::new(compiled.domain_sets.clone()),
+                        init_slot,
+                    ),
                 ));
-                debug!("RoutingMatcher built from compiled rules");
-
-                // Set up domain routing tracker
-                if !compiled.domain_sets.is_empty() {
-                    let n_sets = compiled.domain_sets.len();
-                    let tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                        crate::routing::domain_routing::DomainRoutingTracker::new(
-                            std::sync::Arc::new(compiled.domain_sets),
-                            init_slot,
-                        ),
-                    ));
-                    self.domain_routing =
-                        Some(std::sync::Arc::new(std::sync::Mutex::new(Some(tracker))));
-                    info!(
-                        "Domain routing tracker initialized with {} domain sets",
-                        n_sets
-                    );
-                    debug!(n_sets, "Domain routing tracker created");
-                }
+                self.domain_routing =
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(Some(tracker))));
+                info!(
+                    "Domain routing tracker initialized with {} domain sets",
+                    n_sets
+                );
+                debug!(n_sets, "Domain routing tracker created");
             }
         }
         debug!("Step 3.5 completed: {}ms", step_start.elapsed().as_millis());

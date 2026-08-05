@@ -27,7 +27,7 @@ outbounds {
   groups {
     proxy {
       policy: min_avg10
-      nodes(regex: '*')
+      nodes(regex: '.*')
     }
   }
 }

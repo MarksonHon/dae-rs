@@ -15,7 +15,7 @@ use tracing::debug;
 /// DNS upstream connection pool
 ///
 /// Manages connections to a single DNS upstream server.
-/// Supports udp://, tcp://, tcp+udp:// schemes.
+/// Supports udp://, tcp://, udp+tcp://, tcp+udp:// schemes.
 /// DoH and DoT require additional dependencies and are not yet implemented.
 ///
 /// All upstream sockets are created with SO_MARK=0x100 so that the eBPF program
@@ -50,7 +50,9 @@ pub enum DnsTransport {
     Udp,
     /// Plain TCP
     Tcp,
-    /// UDP with TCP fallback
+    /// UDP first, fallback to TCP
+    UdpTcp,
+    /// TCP first, fallback to UDP
     TcpUdp,
     /// DNS-over-HTTPS (not yet implemented)
     Doh,
@@ -99,10 +101,16 @@ impl DnsUpstreamPool {
         match self.transport {
             DnsTransport::Udp => self.query_udp(request).await,
             DnsTransport::Tcp => self.query_tcp(request).await,
-            DnsTransport::TcpUdp => {
+            DnsTransport::UdpTcp => {
                 match self.query_udp(request).await {
                     Ok(resp) => Ok(resp),
                     Err(_) => self.query_tcp(request).await,
+                }
+            }
+            DnsTransport::TcpUdp => {
+                match self.query_tcp(request).await {
+                    Ok(resp) => Ok(resp),
+                    Err(_) => self.query_udp(request).await,
                 }
             }
             DnsTransport::Doh => {
@@ -578,7 +586,8 @@ fn set_tcp_nodelay(stream: &tokio::net::TcpStream) {
 ///
 /// - `Udp` — via the proxy's UDP relay session (`dialer.udp_dial()`);
 /// - `Tcp` — via a proxied TCP connection to the upstream DNS server;
-/// - `TcpUdp` — try UDP relay first, fall back to TCP;
+/// - `UdpTcp` — try UDP relay first, fall back to TCP;
+/// - `TcpUdp` — try TCP first, fall back to UDP;
 /// - `Doh`/`Dot` — not supported through the proxy yet.
 ///
 /// This allows DNS queries to be routed through proxy groups when
@@ -590,27 +599,43 @@ pub async fn query_dns_via_proxy(
     request: &[u8],
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
+    // Single shared deadline across the whole fallback chain so the total time
+    // never exceeds `timeout`. Previously each sub-attempt (UDP relay dial, UDP
+    // query, TCP fallback) was given the FULL `timeout` independently, so a
+    // broken/slow UDP relay could burn 5s (dial) + 3.75s (UDP query) + 5s (TCP
+    // fallback) ≈ 13.75s against a 5s per-query budget. The DNS response then
+    // arrived after the client's resolver had given up and after the tproxy
+    // DNS-hijack window, so it was silently lost and the client retried.
+    //
+    // Each UDP sub-attempt (relay dial or query) is also individually capped at
+    // `udp_step_budget` so a hung relay cannot eat the whole deadline and starve
+    // the TCP fallback. The TCP fallback always gets whatever time is left.
+    let deadline = std::time::Instant::now() + timeout;
+    // At most 2s per UDP sub-attempt, and never more than the time left.
+    let udp_step_budget = || remaining_time(deadline).min(Duration::from_secs(2));
     match transport {
         // UDP transport through a proxy: try the proxy's UDP relay first, and
         // fall back to TCP if UDP relay is unsupported/unreachable (e.g. some
         // Shadowsocks servers only implement TCP). DNS servers commonly serve
         // both UDP and TCP on port 53, so the TCP fallback keeps DNS working.
-        // The UDP attempt gets most of the timeout budget (leaving some margin
-        // for the TCP fallback) instead of a hard 2s cap, so a working but
-        // slow relay is not forced over to TCP unnecessarily.
         DnsTransport::Udp => {
-            let udp_budget = (timeout * 3 / 4).max(Duration::from_secs(2));
-            let session = match udp_dial_with_timeout(dialer, timeout).await {
+            let session = match udp_dial_with_timeout(dialer, udp_step_budget()).await {
                 Ok(s) => s,
                 Err(e) => {
                     debug!(
                         "DNS proxy UDP relay unavailable ({}), falling back to TCP",
                         e
                     );
-                    return query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await;
+                    return query_dns_tcp_via_proxy(
+                        dialer,
+                        upstream_addr,
+                        request,
+                        remaining_time(deadline),
+                    )
+                    .await;
                 }
             };
-            match query_dns_udp_via_proxy(session.as_ref(), upstream_addr, request, udp_budget)
+            match query_dns_udp_via_proxy(session.as_ref(), upstream_addr, request, udp_step_budget())
                 .await
             {
                 Ok(resp) => Ok(resp),
@@ -619,30 +644,81 @@ pub async fn query_dns_via_proxy(
                         "DNS proxy UDP relay query failed ({}), falling back to TCP",
                         e
                     );
-                    query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await
+                    query_dns_tcp_via_proxy(
+                        dialer,
+                        upstream_addr,
+                        request,
+                        remaining_time(deadline),
+                    )
+                    .await
                 }
             }
         }
         DnsTransport::Tcp => query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await,
-        DnsTransport::TcpUdp => {
-            let udp_budget = (timeout * 3 / 4).max(Duration::from_secs(2));
-            let session = match udp_dial_with_timeout(dialer, timeout).await {
+        DnsTransport::UdpTcp => {
+            let session = match udp_dial_with_timeout(dialer, udp_step_budget()).await {
                 Ok(s) => s,
                 Err(_) => {
-                    return query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await
+                    return query_dns_tcp_via_proxy(
+                        dialer,
+                        upstream_addr,
+                        request,
+                        remaining_time(deadline),
+                    )
+                    .await
                 }
             };
-            match query_dns_udp_via_proxy(session.as_ref(), upstream_addr, request, udp_budget)
+            match query_dns_udp_via_proxy(session.as_ref(), upstream_addr, request, udp_step_budget())
                 .await
             {
                 Ok(resp) => Ok(resp),
-                Err(_) => query_dns_tcp_via_proxy(dialer, upstream_addr, request, timeout).await,
+                Err(_) => query_dns_tcp_via_proxy(
+                    dialer,
+                    upstream_addr,
+                    request,
+                    remaining_time(deadline),
+                )
+                .await,
+            }
+        }
+        DnsTransport::TcpUdp => {
+            match query_dns_tcp_via_proxy(
+                dialer,
+                upstream_addr,
+                request,
+                remaining_time(deadline),
+            )
+            .await
+            {
+                Ok(resp) => Ok(resp),
+                Err(_) => {
+                    let session = match udp_dial_with_timeout(dialer, udp_step_budget()).await {
+                        Ok(s) => s,
+                        Err(_) => {
+                            return Err(anyhow::anyhow!(
+                                "DNS TCP query failed and UDP relay also unavailable"
+                            ))
+                        }
+                    };
+                    query_dns_udp_via_proxy(
+                        session.as_ref(),
+                        upstream_addr,
+                        request,
+                        udp_step_budget(),
+                    )
+                    .await
+                }
             }
         }
         DnsTransport::Doh | DnsTransport::Dot => Err(anyhow::anyhow!(
             "DoH/DoT through proxy not implemented; use udp://, tcp://, or tcp+udp://"
         )),
     }
+}
+
+/// Time left before `deadline`, never negative.
+fn remaining_time(deadline: std::time::Instant) -> Duration {
+    deadline.saturating_duration_since(std::time::Instant::now())
 }
 
 /// Open a proxy UDP relay session, bounded by `timeout`.
@@ -706,7 +782,8 @@ pub struct DnsUrlParts {
 /// Supported formats:
 /// - `udp://1.1.1.1:53`, `udp://dns.google` (default port 53)
 /// - `tcp://1.1.1.1:53`
-/// - `tcp+udp://dns.google:53`
+/// - `udp+tcp://dns.google:53` (UDP first, TCP fallback)
+/// - `tcp+udp://dns.google:53` (TCP first, UDP fallback)
 /// - `https://cloudflare-dns.com/dns-query` (parsed, not yet functional)
 /// - `tls://dns.google:853` (parsed, not yet functional)
 /// - `1.1.1.1:53` (default: UDP)
@@ -715,6 +792,8 @@ pub fn parse_dns_url_parts(url: &str) -> anyhow::Result<DnsUrlParts> {
         (DnsTransport::Udp, r)
     } else if let Some(r) = url.strip_prefix("tcp://") {
         (DnsTransport::Tcp, r)
+    } else if let Some(r) = url.strip_prefix("udp+tcp://") {
+        (DnsTransport::UdpTcp, r)
     } else if let Some(r) = url.strip_prefix("tcp+udp://") {
         (DnsTransport::TcpUdp, r)
     } else if url.starts_with("https://") || url.starts_with("doh://") {
@@ -786,7 +865,8 @@ fn split_host_port(authority: &str) -> anyhow::Result<(String, Option<u16>)> {
 /// Supported formats:
 /// - `udp://1.1.1.1:53`
 /// - `tcp://1.1.1.1:53`
-/// - `tcp+udp://dns.google:53` (parsed, not yet functional for hostnames)
+/// - `udp+tcp://dns.google:53` (UDP first, TCP fallback)
+/// - `tcp+udp://dns.google:53` (TCP first, UDP fallback) (parsed, not yet functional for hostnames)
 /// - `https://cloudflare-dns.com/dns-query` (parsed, not yet functional)
 /// - `tls://dns.google:853` (parsed, not yet functional)
 /// - `1.1.1.1:53` (default: UDP)
@@ -992,6 +1072,10 @@ mod tests {
 
     #[test]
     fn test_parse_dns_url_parts_hostname() {
+        let parts = parse_dns_url_parts("udp+tcp://dns.google:53").unwrap();
+        assert_eq!(parts.transport, DnsTransport::UdpTcp);
+        assert_eq!(parts.host, "dns.google");
+        assert_eq!(parts.port, 53);
         let parts = parse_dns_url_parts("tcp+udp://dns.google:53").unwrap();
         assert_eq!(parts.transport, DnsTransport::TcpUdp);
         assert_eq!(parts.host, "dns.google");

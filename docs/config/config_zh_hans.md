@@ -276,11 +276,12 @@ routing {
 | `starting_dns` | 代理可用前的引导解析器。包含 `ip_version_prefer`（`4` 或 `6`）与 `upstream` 列表（必须是 IP 字面量，避免先有鸡还是先有蛋的问题）。 |
 | `bind` | 本地 DNS 监听地址（默认 `127.0.0.1:5353`）。 |
 | `cache` | 缓存设置：`enabled`、`max_size`、`max_ttl`、`min_ttl`、`optimistic_cache`、`optimistic_cache_ttl`。 |
-| `groups` | DNS 分组。每组含 `send_by`（`direct` 或代理组名）、`query_mode`（`concurrent` / `random` / `sequence`）与 `upstream` 条目（label + URL，如 `udp://1.1.1.1:53`、`tcp+udp://dns.google:53`）。 |
+| `groups` | DNS 分组。每组含 `send_by`（`direct` 或代理组名）、`query_mode`（`concurrent` / `random` / `sequence`）与 `upstream` 条目（label + URL，如 `udp+tcp://1.1.1.1:53`、`tcp+udp://dns.google:53`）。 |
 | `response_action` | DNS 模块级响应动作：对查询得到的结果做进一步筛选（无论来自哪个分组）。规则支持 `upstream(<label>)` / `ip(geoip:<code>)` / `ip(set:<name>)` / `qname(geosite:<code>)` / `qname(set:<name>)` 条件，可用 `&&` 与 `!` 组合；动作可取 `accept`、`reject` 或某个上游 label（改用该上游重查）。 |
 | `routing` | 顶层 DNS 查询路由：`qname(geosite:cn) -> china_dns`、`qname(set:chinadomain) -> china_dns` 等，外加 `fallback`。 |
 
-可解析的 URL scheme：`udp://`、`tcp://`、`tcp+udp://`、`https://` / `doh://`、
+可解析的 URL scheme：`udp://`、`tcp://`、`udp+tcp://`（UDP 优先，失败回退 TCP）、
+`tcp+udp://`（TCP 优先，失败回退 UDP）、`https://` / `doh://`、
 `tls://` / `dot://`。DoH 与 DoT 目前**仅能解析、不可用**，使用会返回错误。
 
 ### 4.8 `rule_set`

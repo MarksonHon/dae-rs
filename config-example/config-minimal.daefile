@@ -62,7 +62,7 @@ routing {
 dns {
   starting_dns {
     ip_version_prefer: 4
-    upstream: ['udp://223.5.5.5:53', 'udp://119.29.29.29:53']  # Alibaba + Tencent (DNSPod) bootstrap
+    upstream: ['udp+tcp://223.5.5.5:53', 'udp+tcp://119.29.29.29:53']  # Alibaba + Tencent (DNSPod) bootstrap
   }
   bind: '127.0.0.1:5353'
   groups {
@@ -70,15 +70,15 @@ dns {
       send_by: direct            # query China DNS servers directly
       query_mode: concurrent
       upstream {
-        alidns: 'udp://223.5.5.5:53'        # Alibaba public DNS
-        dnspod: 'udp://119.29.29.29:53'     # Tencent (DNSPod) public DNS
+        alidns: 'udp+tcp://223.5.5.5:53'        # Alibaba public DNS
+        dnspod: 'udp+tcp://119.29.29.29:53'     # Tencent (DNSPod) public DNS
       }
     }
     default_dns {
       send_by: proxy             # resolve foreign domains through the proxy
       query_mode: concurrent
       upstream {
-        cloudflare: 'udp://1.1.1.1:53'
+        cloudflare: 'udp+tcp://1.1.1.1:53'
       }
     }
   }

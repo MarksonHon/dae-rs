@@ -136,7 +136,7 @@ impl TrojanDialer {
         Ok(TlsConnector::from(Arc::new(config)))
     }
 
-    /// Perform TLS handshake
+    /// Perform TLS handshake with timeout (reuses dial_timeout).
     async fn tls_handshake(
         &self,
         stream: TcpStream,
@@ -152,10 +152,25 @@ impl TrojanDialer {
         let domain = ServerName::try_from(sni)
             .map_err(|e| TrojanError::Tls(format!("invalid SNI: {}", e)))?;
 
-        let tls_stream = connector
-            .connect(domain, stream)
-            .await
-            .map_err(|e| TrojanError::Tls(format!("TLS handshake failed: {}", e)))?;
+        let tls_stream = tokio::time::timeout(
+            self.dial_timeout,
+            connector.connect(domain, stream),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                proxy = %self.proxy_addr,
+                sni = %self.sni,
+                timeout_ms = self.dial_timeout.as_millis(),
+                "Trojan TLS handshake timed out — proxy server may not be serving TLS on this port"
+            );
+            TrojanError::Timeout(format!(
+                "TLS handshake with {} timed out ({}ms)",
+                self.proxy_addr,
+                self.dial_timeout.as_millis(),
+            ))
+        })?
+        .map_err(|e| TrojanError::Tls(format!("TLS handshake failed: {}", e)))?;
 
         Ok(tls_stream)
     }
@@ -278,14 +293,62 @@ fn decode_addr(data: &[u8]) -> Result<(SocketAddr, usize), TrojanError> {
 #[async_trait]
 impl OutboundDialer for TrojanDialer {
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
-        // 1. TCP connect to proxy (host-ns aware)
-        let stream = self.connect_with_mark().await?;
+        let dial_start = std::time::Instant::now();
 
-        // 2. TLS handshake
-        let mut tls_stream = self.tls_handshake(stream).await?;
+        // 1. TCP connect to proxy (host-ns aware)
+        let stream = self.connect_with_mark().await.map_err(|e| {
+            tracing::warn!(
+                proxy = %self.proxy_addr,
+                tcp_elapsed_ms = dial_start.elapsed().as_millis(),
+                error = %e,
+                "Trojan TCP connect to proxy failed"
+            );
+            e
+        })?;
+
+        tracing::debug!(
+            proxy = %self.proxy_addr,
+            tcp_elapsed_ms = dial_start.elapsed().as_millis(),
+            "Trojan TCP connect to proxy succeeded, starting TLS handshake"
+        );
+
+        // 2. TLS handshake (with timeout)
+        let mut tls_stream = self.tls_handshake(stream).await.map_err(|e| {
+            tracing::warn!(
+                proxy = %self.proxy_addr,
+                sni = %self.sni,
+                total_elapsed_ms = dial_start.elapsed().as_millis(),
+                error = %e,
+                "Trojan TLS handshake failed"
+            );
+            e
+        })?;
+
+        tracing::debug!(
+            proxy = %self.proxy_addr,
+            sni = %self.sni,
+            tls_elapsed_ms = dial_start.elapsed().as_millis(),
+            "Trojan TLS handshake succeeded, sending protocol header"
+        );
 
         // 3. Trojan handshake (auth + target address)
-        self.handshake(&mut tls_stream, target).await?;
+        self.handshake(&mut tls_stream, target).await.map_err(|e| {
+            tracing::warn!(
+                proxy = %self.proxy_addr,
+                target = %target,
+                total_elapsed_ms = dial_start.elapsed().as_millis(),
+                error = %e,
+                "Trojan protocol handshake failed"
+            );
+            e
+        })?;
+
+        tracing::debug!(
+            proxy = %self.proxy_addr,
+            target = %target,
+            total_elapsed_ms = dial_start.elapsed().as_millis(),
+            "Trojan dial completed successfully"
+        );
 
         // 4. Return the TLS stream as a boxed duplex stream
         Ok(ProxyConn::new_boxed(Box::new(tls_stream)))

@@ -98,6 +98,16 @@ const QUIC_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Matches kdae's `udpEndpointWriteTimeout` (10s).
 const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum time the UDP DNS hijack task waits for the internal DNS handler's
+/// response before giving up.
+///
+/// MUST be >= the handler's worst-case response time. The DNS handler may take
+/// its full per-query timeout (handler.rs `timeout`, 5s) plus a proxied
+/// UDP->TCP fallback, so a 5s window here caused the handler's response (or
+/// SERVFAIL) to arrive after this socket was dropped — the UDP datagram was
+/// silently lost and the client saw a hard timeout instead of a SERVFAIL.
+const DNS_HIJACK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Select the UDP flow idle timeout by original destination port (tiered timeout).
 ///
 /// * 53 (DNS) → 17s (RFC 5452)
@@ -656,6 +666,14 @@ async fn handle_connection(
     // ---- Step 2: Dial the target via the outbound dialer ----
     let protocol = dialer.protocol_name();
     let proxy_addr = dialer.proxy_addr();
+    debug!(
+        orig_dst = %orig_dst,
+        protocol = %protocol,
+        proxy_addr = %proxy_addr,
+        elapsed_ms = start.elapsed().as_millis(),
+        "handle_connection: dialing outbound..."
+    );
+
     let dial_result = dialer.dial(&orig_dst.to_string()).await;
 
     debug!(
@@ -1951,10 +1969,15 @@ impl UdpTproxyListener {
                                 }
 
                                 // Wait for the handler's DNS response.
+                                // The wait window must cover the handler's
+                                // worst-case response time (see
+                                // DNS_HIJACK_WAIT_TIMEOUT); otherwise a
+                                // response/SERVFAIL arriving after the timeout
+                                // is silently dropped.
                                 let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
                                 let recv_fut = query_socket.recv_from(&mut recv_buf);
                                 let len = match tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
+                                    DNS_HIJACK_WAIT_TIMEOUT,
                                     recv_fut,
                                 )
                                 .await

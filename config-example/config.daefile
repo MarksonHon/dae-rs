@@ -257,7 +257,7 @@ routing {
 dns {
   starting_dns {
     ip_version_prefer: 4
-    upstream: ['udp://1.1.1.1:53', 'udp://223.5.5.5:53']
+    upstream: ['udp+tcp://1.1.1.1:53', 'udp+tcp://223.5.5.5:53']
   }
   bind: '127.0.0.1:5353'
   cache {
@@ -277,14 +277,14 @@ dns {
       query_mode: concurrent
       upstream {
         googledns: 'tcp+udp://dns.google:53'
-        cloudflare: 'udp://1.1.1.1:53'
+        cloudflare: 'udp+tcp://1.1.1.1:53'
       }
     }
     china_dns {
       send_by: direct
       query_mode: sequence
       upstream {
-        alidns: 'udp://dns.alidns.com:53'
+        alidns: 'udp+tcp://dns.alidns.com:53'
         cnnic: 'udp://1.2.4.8:53'
       }
     }

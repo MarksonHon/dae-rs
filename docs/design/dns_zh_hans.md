@@ -68,12 +68,13 @@ control/src/dns/
 
 单个上游 DNS 服务器的连接池。
 
-- URL 解析（`parse_dns_url_parts`）支持 `udp://`、`tcp://`、`tcp+udp://`、
-  `https://` / `doh://`、`tls://` / `dot://`，以及裸 `host:port`（默认 UDP）。
-  默认端口：53（明文）、443（DoH）、853（DoT）。
-- 传输枚举：`Udp`、`Tcp`、`TcpUdp`、`Doh`、`Dot`。**DoH 与 DoT 仅解析、
-  未实现**——对它们调用 `query()` 会返回错误。
-- `tcp+udp` 先走 UDP，失败回退 TCP。
+- URL 解析（`parse_dns_url_parts`）支持 `udp://`、`tcp://`、`udp+tcp://`、
+  `tcp+udp://`、`https://` / `doh://`、`tls://` / `dot://`，以及裸 `host:port`
+  （默认 UDP）。默认端口：53（明文）、443（DoH）、853（DoT）。
+- 传输枚举：`Udp`、`Tcp`、`UdpTcp`、`TcpUdp`、`Doh`、`Dot`。**DoH 与 DoT
+  仅解析、未实现**——对它们调用 `query()` 会返回错误。
+- `udp+tcp://` 先走 UDP，失败回退 TCP。
+- `tcp+udp://` 先走 TCP，失败回退 UDP。
 - **关键细节**：每个上游 socket 都以 `SO_MARK=0x100`（`DAE_SOCKET_MARK`）
   创建。这使 eBPF 程序把该查询视为 dae-rs 控制面流量放行而不拦截——
   否则 dae-rs 自身的 DNS 解析会被重新劫持进代理，形成解析死循环。
@@ -162,7 +163,7 @@ control/src/dns/
   ```
   starting_dns {
     ip_version_prefer: 4
-    upstream: ['udp://223.5.5.5:53', 'udp://1.1.1.1:53']
+    upstream: ['udp+tcp://223.5.5.5:53', 'udp+tcp://1.1.1.1:53']
   }
   ```
 - 该组 DNS **全部直连**（不经过代理），用于初始化时解析 DNS 组中带域名的

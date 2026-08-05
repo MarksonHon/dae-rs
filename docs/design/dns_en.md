@@ -70,12 +70,13 @@ The orchestrator. Holds the config, a map of upstream pools (keyed
 
 A connection pool for a single upstream DNS server.
 
-- URL parsing (`parse_dns_url_parts`) supports `udp://`, `tcp://`, `tcp+udp://`,
-  `https://` / `doh://`, `tls://` / `dot://`, and bare `host:port` (default UDP).
-  Default ports: 53 (plain), 443 (DoH), 853 (DoT).
-- Transport enum: `Udp`, `Tcp`, `TcpUdp`, `Doh`, `Dot`. **DoH and DoT are parsed
-  but not implemented** — calling `query()` on them returns an error.
-- `tcp+udp` queries UDP first and falls back to TCP.
+- URL parsing (`parse_dns_url_parts`) supports `udp://`, `tcp://`, `udp+tcp://`,
+  `tcp+udp://`, `https://` / `doh://`, `tls://` / `dot://`, and bare `host:port`
+  (default UDP). Default ports: 53 (plain), 443 (DoH), 853 (DoT).
+- Transport enum: `Udp`, `Tcp`, `UdpTcp`, `TcpUdp`, `Doh`, `Dot`. **DoH and DoT
+  are parsed but not implemented** — calling `query()` on them returns an error.
+- `udp+tcp://` queries UDP first and falls back to TCP on failure.
+- `tcp+udp://` queries TCP first and falls back to UDP on failure.
 - **Critical detail**: every upstream socket is created with
   `SO_MARK=0x100` (`DAE_SOCKET_MARK`). This makes the eBPF program treat the
   query as dae-rs control-plane traffic and let it pass without interception —
@@ -183,7 +184,7 @@ contaminate each other's cache. `max_size` is the per-group capacity.
   ```
   starting_dns {
     ip_version_prefer: 4
-    upstream: ['udp://223.5.5.5:53', 'udp://1.1.1.1:53']
+    upstream: ['udp+tcp://223.5.5.5:53', 'udp+tcp://1.1.1.1:53']
   }
   ```
 - All of its DNS servers are queried **directly** (never through a proxy). They

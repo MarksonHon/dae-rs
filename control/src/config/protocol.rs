@@ -318,6 +318,9 @@ fn parse_vmess_json(json: &serde_json::Value, node: &mut OutboundNodeConfig) -> 
 
 /// Split `main?key=value&key2=value2` into its main part and query pairs.
 fn split_url(rest: &str) -> (&str, Vec<(String, String)>) {
+    // Strip the URL fragment (#name) from share links. The fragment is not part
+    // of the query string and would corrupt the last key-value pair.
+    let rest = rest.split_once('#').map_or(rest, |(r, _)| r);
     let (main, query) = match rest.split_once('?') {
         Some((m, q)) => (m, q),
         None => (rest, ""),
@@ -451,6 +454,30 @@ mod tests {
         assert_eq!(node.protocol, "juicity");
         assert_eq!(node.uuid.as_deref(), Some("d0529668-8835-11ec-a8a3-0242ac120002"));
         assert_eq!(node.sni.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn test_juicity_import_with_fragment() {
+        let node = parse_ok(
+            "juicity://a8eb0027-f7ac-da79-12b4-5433da6fdfce:33440f5a7608@103.238.129.103:23182/?allow_insecure=false&congestion_control=bbr&sni=jp02.2333ma.top#JP02-IPv4-Juicity",
+        );
+        assert_eq!(node.protocol, "juicity");
+        assert_eq!(node.uuid.as_deref(), Some("a8eb0027-f7ac-da79-12b4-5433da6fdfce"));
+        assert_eq!(node.password.as_deref(), Some("33440f5a7608"));
+        assert_eq!(node.address, "103.238.129.103:23182/");
+        assert_eq!(node.sni.as_deref(), Some("jp02.2333ma.top"));
+        assert_eq!(node.congestion_control.as_deref(), Some("bbr"));
+    }
+
+    #[test]
+    fn test_trojan_import_with_fragment() {
+        let node = parse_ok(
+            "trojan://31d8b885-8431-48dd-a6ae-d92329ca235a@103.238.129.103:10443?headerType=tcp&sni=jp02.2333ma.top&type=tcp#JP02-Trojan-IPv4",
+        );
+        assert_eq!(node.protocol, "trojan");
+        assert_eq!(node.password.as_deref(), Some("31d8b885-8431-48dd-a6ae-d92329ca235a"));
+        assert_eq!(node.address, "103.238.129.103:10443");
+        assert_eq!(node.sni.as_deref(), Some("jp02.2333ma.top"));
     }
 
     #[test]

@@ -1329,7 +1329,7 @@ routing {
         // starting_dns is a flat IP list; config-minimal uses 2 bootstrap servers
         let dns = config.dns.as_ref().expect("dns config");
         assert_eq!(dns.starting_dns.upstream.len(), 2);
-        assert!(dns.starting_dns.upstream.iter().all(|a| a.starts_with("udp://")));
+        assert!(dns.starting_dns.upstream.iter().all(|a| a.starts_with("udp://") || a.starts_with("udp+tcp://")));
         // default query_mode is Concurrent when not specified
         let g = dns.groups.iter().find(|g| g.name == "default_dns").unwrap();
         assert_eq!(g.query_mode, DnsQueryMode::Concurrent);

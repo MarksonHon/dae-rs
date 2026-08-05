@@ -32,6 +32,16 @@ const IPV6_TRANSPARENT: libc::c_int = 75;
 /// control plane traffic and lets it pass without proxy interception.
 const SO_MARK: libc::c_int = 36;
 
+/// Maximum time to wait for a full TCP DNS request to arrive.
+///
+/// Bounds the per-connection reads so a half-open connection (a peer that
+/// connects but never sends a complete request) is reaped instead of blocking
+/// its task forever. Without this, each half-open connection leaks one tokio
+/// task + one TCP fd monotonically until the fd table is exhausted — at which
+/// point every DNS query fails (each UDP response allocates a fresh socket),
+/// i.e. "DNS dies after long uptime".
+const TCP_DNS_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 use crate::config::DnsConfig;
 use crate::dns::cache::{CacheLookup, DnsCache};
 use crate::dns::router::{DnsResponseAction, DnsRouter};
@@ -496,10 +506,15 @@ async fn run_tcp_listener(
 
             let mut stream = stream;
 
-            // TCP DNS: 2-byte length prefix, read exactly
+            // TCP DNS: 2-byte length prefix, read exactly.
+            // Bound by TCP_DNS_READ_TIMEOUT so a peer that connects but never
+            // sends a length prefix cannot block this task forever.
             let mut len_buf = [0u8; 2];
-            if let Err(e) = stream.read_exact(&mut len_buf).await {
-                debug!("TCP DNS read length error: {}", e);
+            if tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut len_buf))
+                .await
+                .is_err()
+            {
+                debug!("TCP DNS read length timed out");
                 return;
             }
             let msg_len = u16::from_be_bytes(len_buf) as usize;
@@ -507,10 +522,13 @@ async fn run_tcp_listener(
                 return;
             }
 
-            // Read message body exactly
+            // Read message body exactly (bounded by the same timeout)
             let mut request = vec![0u8; msg_len];
-            if let Err(e) = stream.read_exact(&mut request).await {
-                debug!("TCP DNS read body error: {}", e);
+            if tokio::time::timeout(TCP_DNS_READ_TIMEOUT, stream.read_exact(&mut request))
+                .await
+                .is_err()
+            {
+                debug!("TCP DNS read body timed out");
                 return;
             }
 
@@ -584,11 +602,24 @@ async fn handle_dns_query(
     // - Upstream query result: bind to the upstream DNS server address with IP_TRANSPARENT
     //   so the response appears to come from the DNS server the client queried.
     // - Cache hit (None): bind to ephemeral port as fallback.
-    let bind_addr = upstream_addr.unwrap_or_else(|| {
+    let mut bind_addr = upstream_addr.unwrap_or_else(|| {
         // Fallback: ephemeral address (0.0.0.0:0). The kernel assigns a local
         // source address. This is the same behavior as before IP_TRANSPARENT support.
         ([0u8; 4], 0u16).into()
     });
+    // The response socket must share the address family of the client `src`,
+    // otherwise send_to() fails (an AF_INET6 socket cannot send_to an IPv4
+    // address, EAFNOSUPPORT) and the response is silently lost. This happens
+    // when the upstream is IPv6 while the client is IPv4 on the internal
+    // 169.254.0.1 handler path (and vice versa). Fall back to an ephemeral
+    // bind in the client's family in that case.
+    if bind_addr.is_ipv6() != src.is_ipv6() {
+        bind_addr = if src.is_ipv6() {
+            ([0u16; 8], 0u16).into()
+        } else {
+            ([0u8; 4], 0u16).into()
+        };
+    }
 
     let resp_socket = create_marked_udp_socket_for_dns(bind_addr, shared::DAE_SOCKET_MARK).await
         .ok_or_else(|| anyhow::anyhow!(
@@ -874,7 +905,9 @@ async fn handle_dns_internal(
                 }
             }
             if futures.is_empty() {
-                return Err(anyhow::anyhow!("no queryable upstreams in concurrent mode"));
+                let empty = build_empty_response(request);
+                leader.notify(Ok(empty.clone()));
+                return Ok((empty, None));
             }
             match select_ok(futures).await {
                 Ok((result, _remaining)) => Ok(result),
@@ -898,9 +931,20 @@ async fn handle_dns_internal(
         }
         crate::config::DnsQueryMode::Sequence => {
             // Try upstreams in order, use the first success.
+            // The per-query timeout is a shared overall budget across ALL
+            // upstreams, so the whole sequence never exceeds `timeout`. This
+            // keeps the handler's worst-case response (including SERVFAIL)
+            // within the tproxy DNS-hijack wait window; otherwise the response
+            // arrives after that socket is dropped and is silently lost, and
+            // the client sees a hard timeout instead of a SERVFAIL.
+            let start = std::time::Instant::now();
             let mut last_err: Option<String> = None;
             let mut result: Option<anyhow::Result<(Vec<u8>, SocketAddr, String)>> = None;
             for (label, addr, pool) in &candidates {
+                let remaining = timeout.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
                 match query_one(
                     is_proxied,
                     dialer,
@@ -908,7 +952,7 @@ async fn handle_dns_internal(
                     *addr,
                     label.clone(),
                     request,
-                    timeout,
+                    remaining,
                 )
                 .await
                 {
@@ -957,10 +1001,16 @@ async fn handle_dns_internal(
         DnsResponseAction::Accept => {
             // Cache the response
             let ttl = extract_min_ttl(&response);
-            let mut cache_guard = cache.write().unwrap();
-            cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
+            {
+                let mut cache_guard = cache.write().unwrap();
+                cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
+            }
             // Feed accepted resolutions into the domain routing tracker so the
             // eBPF domain_routing_map is populated for domain-based routing.
+            // NOTE: notify_resolve acquires the eBPF lock (see
+            // add_dns_result_to_tracker). Do NOT hold the cache write lock while
+            // taking it — an eBPF op stalled behind long-running map updates
+            // would otherwise block every DNS query at the cache lock.
             notify_resolve(on_resolve, &qname, &response);
             leader.notify(Ok(response.clone()));
             Ok((response, Some(upstream_addr)))
@@ -976,33 +1026,58 @@ async fn handle_dns_internal(
                 let new_upstream_addr = new_pool.address();
                 let response = if is_proxied {
                     if let Some(d) = dialer {
-                        query_dns_via_proxy(
+                        match query_dns_via_proxy(
                             d,
                             new_upstream_addr,
                             new_pool.transport(),
                             request,
                             timeout,
                         )
-                        .await?
+                        .await
+                        {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                warn!("DNS requery via proxy failed: {}", e);
+                                let empty = build_empty_response(request);
+                                leader.notify(Ok(empty.clone()));
+                                return Ok((empty, None));
+                            }
+                        }
                     } else {
                         let empty = build_empty_response(request);
                         leader.notify(Ok(empty.clone()));
                         return Ok((empty, None));
                     }
                 } else {
-                    new_pool.query(request).await?
+                    match new_pool.query(request).await {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            warn!("DNS requery direct failed: {}", e);
+                            let empty = build_empty_response(request);
+                            leader.notify(Ok(empty.clone()));
+                            return Ok((empty, None));
+                        }
+                    }
                 };
                 let ttl = extract_min_ttl(&response);
-                let mut cache_guard = cache.write().unwrap();
-                cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
+                {
+                    let mut cache_guard = cache.write().unwrap();
+                    cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
+                }
+                // Keep the cache write lock out of the eBPF lock path (see the
+                // Accept branch above).
                 notify_resolve(on_resolve, &qname, &response);
                 leader.notify(Ok(response.clone()));
                 Ok((response, Some(new_upstream_addr)))
             } else {
                 // Fallback: accept original response
                 let ttl = extract_min_ttl(&response);
-                let mut cache_guard = cache.write().unwrap();
-                cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
+                {
+                    let mut cache_guard = cache.write().unwrap();
+                    cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
+                }
+                // Keep the cache write lock out of the eBPF lock path (see the
+                // Accept branch above).
                 notify_resolve(on_resolve, &qname, &response);
                 leader.notify(Ok(response.clone()));
                 Ok((response, Some(upstream_addr)))

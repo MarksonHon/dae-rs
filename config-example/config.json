@@ -267,8 +267,8 @@
     "starting_dns": {
       "ip_version_prefer": 4,
       "upstream": [
-        "udp://1.1.1.1:53",
-        "udp://223.5.5.5:53"
+        "udp+tcp://1.1.1.1:53",
+        "udp+tcp://223.5.5.5:53"
       ]
     },
     "bind": "127.0.0.1:5353",
@@ -292,7 +292,7 @@
           },
           {
             "label": "cloudflare",
-            "address": "udp://1.1.1.1:53"
+            "address": "udp+tcp://1.1.1.1:53"
           }
         ]
       },
@@ -303,7 +303,7 @@
         "upstream": [
           {
             "label": "alidns",
-            "address": "udp://dns.alidns.com:53"
+            "address": "udp+tcp://dns.alidns.com:53"
           },
           {
             "label": "cnnic",

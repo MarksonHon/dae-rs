@@ -144,7 +144,7 @@ pub struct DnsListener {
     /// Upstream pools (key: "group__label" -> pool)
     upstream_pools: Arc<HashMap<String, Arc<DnsUpstreamPool>>>,
     /// DNS response cache
-    cache: Arc<std::sync::RwLock<DnsCache>>,
+    cache: Arc<tokio::sync::RwLock<DnsCache>>,
     /// DNS router
     router: DnsRouter,
     /// UDP listener task handle
@@ -172,7 +172,7 @@ impl DnsListener {
         bind_addr: SocketAddr,
         config: DnsConfig,
         upstream_pools: Arc<HashMap<String, Arc<DnsUpstreamPool>>>,
-        cache: Arc<std::sync::RwLock<DnsCache>>,
+        cache: Arc<tokio::sync::RwLock<DnsCache>>,
         router: DnsRouter,
         on_resolve: Option<DnsResolveCallback>,
         rule_set_cache: RuleSetCache,
@@ -401,7 +401,7 @@ async fn run_udp_listener(
     socket: UdpSocket,
     config: Arc<DnsConfig>,
     upstream_pools: Arc<HashMap<String, Arc<DnsUpstreamPool>>>,
-    cache: Arc<std::sync::RwLock<DnsCache>>,
+    cache: Arc<tokio::sync::RwLock<DnsCache>>,
     router: Arc<DnsRouter>,
     on_resolve: Option<DnsResolveCallback>,
     rule_set_cache: RuleSetCache,
@@ -474,7 +474,7 @@ async fn run_tcp_listener(
     listener: TcpListener,
     config: Arc<DnsConfig>,
     upstream_pools: Arc<HashMap<String, Arc<DnsUpstreamPool>>>,
-    cache: Arc<std::sync::RwLock<DnsCache>>,
+    cache: Arc<tokio::sync::RwLock<DnsCache>>,
     router: Arc<DnsRouter>,
     on_resolve: Option<DnsResolveCallback>,
     rule_set_cache: RuleSetCache,
@@ -532,6 +532,12 @@ async fn run_tcp_listener(
                 return;
             }
 
+            debug!(
+                peer = %_src,
+                msg_len = msg_len,
+                "DNS TCP query received"
+            );
+
             if let Ok((response, _upstream_addr)) = handle_dns_internal(
                 &request,
                 &config,
@@ -575,7 +581,7 @@ async fn handle_dns_query(
     request: &[u8],
     config: &Arc<DnsConfig>,
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
-    cache: &Arc<std::sync::RwLock<DnsCache>>,
+    cache: &Arc<tokio::sync::RwLock<DnsCache>>,
     router: &Arc<DnsRouter>,
     on_resolve: &Option<DnsResolveCallback>,
     rule_set_cache: &RuleSetCache,
@@ -628,6 +634,14 @@ async fn handle_dns_query(
         ))?;
 
     resp_socket.send_to(&response, src).await?;
+    debug!(
+        src = %src,
+        upstream = %upstream_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "cache".into()),
+        resp_len = response.len(),
+        "DNS response sent"
+    );
     Ok(())
 }
 
@@ -650,7 +664,7 @@ async fn handle_dns_internal(
     request: &[u8],
     config: &Arc<DnsConfig>,
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
-    cache: &Arc<std::sync::RwLock<DnsCache>>,
+    cache: &Arc<tokio::sync::RwLock<DnsCache>>,
     router: &Arc<DnsRouter>,
     on_resolve: &Option<DnsResolveCallback>,
     rule_set_cache: &RuleSetCache,
@@ -664,6 +678,14 @@ async fn handle_dns_internal(
 
     // Route to group (needed for the per-group cache partition)
     let route = router.match_query(&qname, qtype);
+    debug!(
+        qname = %qname,
+        qtype,
+        group = %route.group.name,
+        send_by = %route.send_by.as_deref().unwrap_or("direct"),
+        query_mode = %query_mode_label(route.group.query_mode),
+        "DNS query routed"
+    );
     if route.group.name == "null" || route.group.upstream.is_empty() {
         return Ok((build_empty_response(request), None));
     }
@@ -673,7 +695,7 @@ async fn handle_dns_internal(
     // `skip_cache = true` so it always queries upstream for fresh data.
     let cache_key = DnsCache::cache_key(&qname, qtype, 1); // class IN = 1
     if !skip_cache {
-        let cache_guard = cache.read().unwrap();
+        let cache_guard = cache.read().await;
         match cache_guard.lookup_state(&group_name, cache_key) {
             Some(CacheLookup::Fresh {
                 bytes,
@@ -856,9 +878,20 @@ async fn handle_dns_internal(
                 anyhow::anyhow!("DNS group has send_by configured but no dialer available")
             })?;
             let transport = pool.transport();
+            debug!(
+                upstream = %upstream_addr,
+                label = %upstream_label,
+                transport = ?transport,
+                "DNS query via proxy started"
+            );
             let resp = query_dns_via_proxy(d, upstream_addr, transport, request, timeout).await?;
             Ok((resp, upstream_addr, upstream_label))
         } else {
+            debug!(
+                upstream = %upstream_addr,
+                label = %upstream_label,
+                "DNS query direct started"
+            );
             let resp = pool.query(request).await?;
             Ok((resp, upstream_addr, upstream_label))
         }
@@ -999,10 +1032,18 @@ async fn handle_dns_internal(
 
     match action {
         DnsResponseAction::Accept => {
+            debug!(
+                qname = %qname,
+                qtype,
+                group = %group_name,
+                upstream = %upstream_label,
+                ttl = extract_min_ttl(&response),
+                "DNS response accepted"
+            );
             // Cache the response
             let ttl = extract_min_ttl(&response);
             {
-                let mut cache_guard = cache.write().unwrap();
+                let mut cache_guard = cache.write().await;
                 cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
             }
             // Feed accepted resolutions into the domain routing tracker so the
@@ -1016,11 +1057,26 @@ async fn handle_dns_internal(
             Ok((response, Some(upstream_addr)))
         }
         DnsResponseAction::Reject => {
+            debug!(
+                qname = %qname,
+                qtype,
+                group = %group_name,
+                upstream = %upstream_label,
+                "DNS response rejected"
+            );
             let empty = build_empty_response(request);
             leader.notify(Ok(empty.clone()));
             Ok((empty, Some(upstream_addr)))
         }
         DnsResponseAction::Requery(new_upstream) => {
+            debug!(
+                qname = %qname,
+                qtype,
+                group = %group_name,
+                original_upstream = %upstream_label,
+                new_upstream = %new_upstream,
+                "DNS response action: requery"
+            );
             let new_pool_key = format!("{}__{}", route.group.name, new_upstream);
             if let Some(new_pool) = upstream_pools.get(&new_pool_key) {
                 let new_upstream_addr = new_pool.address();
@@ -1061,7 +1117,7 @@ async fn handle_dns_internal(
                 };
                 let ttl = extract_min_ttl(&response);
                 {
-                    let mut cache_guard = cache.write().unwrap();
+                    let mut cache_guard = cache.write().await;
                     cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
                 }
                 // Keep the cache write lock out of the eBPF lock path (see the
@@ -1073,7 +1129,7 @@ async fn handle_dns_internal(
                 // Fallback: accept original response
                 let ttl = extract_min_ttl(&response);
                 {
-                    let mut cache_guard = cache.write().unwrap();
+                    let mut cache_guard = cache.write().await;
                     cache_guard.insert(&group_name, cache_key, response.clone(), ttl);
                 }
                 // Keep the cache write lock out of the eBPF lock path (see the
@@ -1098,7 +1154,7 @@ fn spawn_background_refresh(
     key: InflightKey,
     config: Arc<DnsConfig>,
     upstream_pools: &HashMap<String, Arc<DnsUpstreamPool>>,
-    cache: &Arc<std::sync::RwLock<DnsCache>>,
+    cache: &Arc<tokio::sync::RwLock<DnsCache>>,
     router: &Arc<DnsRouter>,
     on_resolve: &Option<DnsResolveCallback>,
     rule_set_cache: &RuleSetCache,
@@ -1123,6 +1179,12 @@ fn spawn_background_refresh(
     let inflight = inflight.clone();
 
     tokio::spawn(async move {
+        debug!(
+            group = %key.0,
+            qname = %key.1,
+            qtype = key.2,
+            "DNS background refresh spawned"
+        );
         let result = handle_dns_internal(
             &request,
             &config,

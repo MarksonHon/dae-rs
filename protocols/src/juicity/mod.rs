@@ -147,19 +147,31 @@ impl JuicityDialer {
         self
     }
 
-    /// Get an available connection: prefer reusing existing connections that aren't full, otherwise create new
+    /// Get an available connection: prefer reusing existing connections that aren't full, otherwise create new.
+    ///
+    /// The Mutex guard is held only for the quick check-and-push operations;
+    /// all blocking I/O (socket creation, endpoint setup) and the async QUIC
+    /// handshake run *outside* the guard so we never stall a tokio worker
+    /// thread while the lock is held. This prevents cascading stalls where
+    /// one slow connection setup blocks every concurrent DNS query that also
+    /// needs a connection.
     async fn get_connection(&self) -> Result<quinn::Connection, JuicityError> {
-        let mut guard = self.state.lock().await;
-        // Reuse: connection alive and stream count not full
-        for state in guard.iter() {
-            if state.conn.close_reason().is_none()
-                && state.stream_count.load(Ordering::Relaxed) < MAX_STREAMS_PER_CONN
-            {
-                return Ok(state.conn.clone());
+        // ── 1. Quick check: reuse an existing connection if possible ──
+        {
+            let guard = self.state.lock().await;
+            for state in guard.iter() {
+                if state.conn.close_reason().is_none()
+                    && state.stream_count.load(Ordering::Relaxed) < MAX_STREAMS_PER_CONN
+                {
+                    return Ok(state.conn.clone());
+                }
             }
-        }
+        } // guard dropped – no lock held during connection setup
 
-        // Create new connection
+        // ── 2. Create new QUIC connection (blocking I/O + async handshake) ──
+        //    Done *without* holding the state Mutex so that other tasks can
+        //    proceed (or at least not be blocked by a held guard) while this
+        //    potentially slow operation runs.
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut crypto = ClientConfig::builder()
@@ -221,12 +233,26 @@ impl JuicityDialer {
             })?
             .map_err(|e| JuicityError::Quic(format!("QUIC handshake failed: {}", e)))?;
 
-        guard.push(JuicityConnState {
-            endpoint,
-            conn: conn.clone(),
-            authenticated: false,
-            stream_count: AtomicU32::new(0),
-        });
+        // ── 3. Re-acquire lock and store the new connection ──
+        {
+            let mut guard = self.state.lock().await;
+            // Double-check: another task may have created a usable connection
+            // while we were connecting. If so, prefer reusing it and let ours
+            // be garbage-collected when `endpoint` is dropped.
+            for state in guard.iter() {
+                if state.conn.close_reason().is_none()
+                    && state.stream_count.load(Ordering::Relaxed) < MAX_STREAMS_PER_CONN
+                {
+                    return Ok(state.conn.clone());
+                }
+            }
+            guard.push(JuicityConnState {
+                endpoint,
+                conn: conn.clone(),
+                authenticated: false,
+                stream_count: AtomicU32::new(0),
+            });
+        }
         Ok(conn)
     }
 
@@ -366,8 +392,13 @@ impl AsyncWrite for QuicStreamDuplex {
 #[async_trait]
 impl OutboundDialer for JuicityDialer {
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
-        // 1. Get (or create) QUIC connection
-        let conn = self.get_connection().await?;
+        // 1. Get (or create) QUIC connection (bounded by dial_timeout)
+        let conn = timeout(self.dial_timeout, self.get_connection())
+            .await
+            .map_err(|_| anyhow::anyhow!(
+                "juicity connection establishment to {} timed out",
+                self.proxy_addr
+            ))??;
 
         // 2. Send Authenticate when first using the connection
         {
@@ -412,7 +443,13 @@ impl OutboundDialer for JuicityDialer {
     ///
     /// Session occupies one bidirectional stream: each datagram = `[network=3][addr][port][len(2)][payload]`.
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
-        let conn = self.get_connection().await?;
+        // Get (or create) QUIC connection (bounded by dial_timeout)
+        let conn = timeout(self.dial_timeout, self.get_connection())
+            .await
+            .map_err(|_| anyhow::anyhow!(
+                "juicity connection establishment to {} timed out",
+                self.proxy_addr
+            ))??;
 
         // Send Authenticate when first using the connection
         {

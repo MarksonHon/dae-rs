@@ -197,8 +197,8 @@ echo $! > "$PID_FILE"
 echo "dae-rs started with PID $(cat $PID_FILE)"
 
 # Wait for startup
-echo "Waiting 5 seconds for dae-rs to start..."
-sleep 5
+echo "Waiting 30 seconds for dae-rs to start..."
+sleep 30
 
 # Check if internal DNS handler is listening on 169.254.0.1
 echo "" >> "$LOG"

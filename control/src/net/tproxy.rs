@@ -2007,7 +2007,14 @@ impl UdpTproxyListener {
                                         )
                                         .await
                                         {
-                                            Ok(Ok(_)) => {}
+                                            Ok(Ok(bytes)) => {
+                                                debug!(
+                                                    client = %peer,
+                                                    dest = %dest,
+                                                    bytes = bytes,
+                                                    "DNS hijack response sent"
+                                                );
+                                            }
                                             Ok(Err(e)) => debug!(
                                                 "DNS hijack: response send_to client {} failed: {}",
                                                 peer, e
@@ -2136,12 +2143,24 @@ impl UdpFlowPool {
         {
             let map = self.inner.lock().await;
             if let Some(flow) = map.get(&key) {
+                debug!(
+                    dest = %dest,
+                    peer = ?peer,
+                    "UDP relay flow reused"
+                );
                 return Ok(flow.session.clone());
             }
         }
 
         // Create the protocol-specific UDP relay session via the dialer (in the host NS).
         let session: Arc<dyn UdpSession> = Arc::from(dialer.udp_dial().await?);
+        debug!(
+            dest = %dest,
+            peer = ?peer,
+            protocol = %dialer.protocol_name(),
+            proxy = %dialer.proxy_addr(),
+            "UDP relay flow created"
+        );
         info!(
             "UDP  {} -> {} [PROXY] outbound via {} -> proxy {}",
             peer.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
@@ -2200,6 +2219,13 @@ impl UdpFlowPool {
                         break;
                     }
                 };
+
+                debug!(
+                    resp_dest = %resp_dest,
+                    peer = ?peer,
+                    bytes = payload.len(),
+                    "UDP relay response received"
+                );
 
                 // Full-cone relay: the response may come from any destination, so the
                 // response socket is taken by the response's destination address.
@@ -2262,12 +2288,18 @@ impl RespSocketPool {
             if let Some(i) = m.iter().position(|(d, _)| d == dest) {
                 let (_, sock) = m.remove(i).unwrap();
                 m.push_back((*dest, sock.clone()));
+                debug!(dest = %dest, "Response socket cache hit");
                 return Some(sock);
             }
         }
 
         // Slow path: create (may setns into the host NS, so the lock cannot be held)
         let sock = Arc::new(create_marked_udp_socket(dest, host_ns_fd).await?);
+        debug!(
+            dest = %dest,
+            host_ns_fd = ?host_ns_fd,
+            "Created transparent response socket"
+        );
         let mut m = self.inner.lock().unwrap();
         if let Some(i) = m.iter().position(|(d, _)| d == dest) {
             // Concurrent creation race: someone else already inserted, just use theirs
@@ -2375,7 +2407,14 @@ async fn create_marked_udp_socket(
     let sock = protocols::hostns::DirectSocket::control_plane(host_ns_fd);
     match protocols::hostns::create_transparent_udp(target, &sock) {
         Ok(s) => match tokio::net::UdpSocket::from_std(s) {
-            Ok(s) => Some(s),
+            Ok(s) => {
+                debug!(
+                    target = %target,
+                    host_ns_fd = ?host_ns_fd,
+                    "create_marked_udp_socket succeeded"
+                );
+                Some(s)
+            }
             Err(e) => {
                 warn!("create_marked_udp_socket: from_std failed: {}", e);
                 None

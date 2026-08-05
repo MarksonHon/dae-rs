@@ -177,10 +177,12 @@ async fn handle_client(
     //    so copy_bidirectional works directly with &mut TcpStream and &mut Boxed.
     match outbound.stream {
         ProxyStream::Tcp(mut outbound_stream) => {
-            tokio::io::copy_bidirectional(&mut stream, &mut outbound_stream).await?;
+            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut outbound_stream).await?;
+            debug!(target = %target, up_bytes = up, down_bytes = down, "SOCKS5 client connection closed");
         }
         ProxyStream::Boxed(mut outbound_stream) => {
-            tokio::io::copy_bidirectional(&mut stream, &mut outbound_stream).await?;
+            let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut outbound_stream).await?;
+            debug!(target = %target, up_bytes = up, down_bytes = down, "SOCKS5 client connection closed");
         }
     }
     Ok(())

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use tracing::debug;
 
 use crate::{OutboundDialer, ProxyConn};
 
@@ -126,8 +127,15 @@ impl Socks5Dialer {
     /// source address is the host's real WAN address instead of the daens
     /// internal address `169.254.0.11`. This matches kdae's behavior.
     async fn connect_with_mark(&self) -> Result<TcpStream, Socks5Error> {
-        // Unified host NS-aware TCP connection (SO_MARK + IP_TRANSPARENT + host NS).
-        crate::hostns::connect_tcp(
+        debug!(
+            proxy = %self.proxy_addr,
+            self_mark = %format!("{:#x}", self.self_mark),
+            host_ns_fd = ?self.host_ns_fd,
+            timeout_ms = %self.dial_timeout.as_millis(),
+            "SOCKS5 proxy TCP connect started"
+        );
+
+        let result = crate::hostns::connect_tcp(
             self.proxy_addr,
             &crate::hostns::DirectSocket {
                 self_mark: self.self_mark,
@@ -136,14 +144,29 @@ impl Socks5Dialer {
             true,
             self.dial_timeout,
         )
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr))
-            } else {
-                Socks5Error::Io(e)
+        .await;
+
+        match result {
+            Ok(stream) => {
+                debug!(
+                    proxy = %self.proxy_addr,
+                    "SOCKS5 proxy TCP connect succeeded"
+                );
+                Ok(stream)
             }
-        })
+            Err(e) => {
+                debug!(
+                    proxy = %self.proxy_addr,
+                    error = ?e,
+                    "SOCKS5 proxy TCP connect failed"
+                );
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    Err(Socks5Error::Timeout(format!("connect to proxy {}", self.proxy_addr)))
+                } else {
+                    Err(Socks5Error::Io(e))
+                }
+            }
+        }
     }
 
     /// Execute SOCKS5 handshake
@@ -163,6 +186,11 @@ impl Socks5Dialer {
             vec![0x05, 0x02, 0x00, 0x02]
         };
         stream.write_all(&methods).await?;
+        debug!(
+            proxy = %self.proxy_addr,
+            methods = ?methods,
+            "SOCKS5 auth methods sent"
+        );
 
         // Read the authentication method selected by the server
         let mut response = [0u8; 2];
@@ -171,6 +199,12 @@ impl Socks5Dialer {
         if response[0] != 0x05 {
             return Err(Socks5Error::ProtocolError("invalid SOCKS5 version".into()));
         }
+
+        debug!(
+            proxy = %self.proxy_addr,
+            auth_method = response[1],
+            "SOCKS5 auth method selected"
+        );
 
         match response[1] {
             0x00 => {
@@ -241,6 +275,12 @@ impl Socks5Dialer {
         request.extend_from_slice(&port.to_be_bytes());
 
         stream.write_all(&request).await?;
+        debug!(
+            proxy = %self.proxy_addr,
+            target = %target,
+            request_len = request.len(),
+            "SOCKS5 CONNECT request sent"
+        );
 
         // Read connection response
         let mut reply = [0u8; 4];
@@ -431,10 +471,12 @@ impl UdpEndpointPool {
         if let Some(session) = map.get(&key) {
             let mut sess = session.lock().await;
             sess.last_used = Instant::now();
+            debug!(target = %target, "SOCKS5 UDP session reused");
             return Ok(session.clone());
         }
 
         // Create new session
+        debug!(target = %target, "SOCKS5 UDP session creating");
         let session = Arc::new(Mutex::new(dialer.udp_associate().await?));
         map.insert(key, session.clone());
         Ok(session)
@@ -475,9 +517,18 @@ impl Socks5Dialer {
     /// 6. Return session with control TCP + data UDP
     pub async fn udp_associate(&self) -> Result<UdpAssociateSession, Socks5Error> {
         let mut control = self.connect_with_mark().await?;
+        debug!(
+            proxy = %self.proxy_addr,
+            "SOCKS5 UDP ASSOCIATE connect established"
+        );
 
         // Perform auth handshake
         self.handshake_inner(&mut control, false).await?;
+
+        debug!(
+            proxy = %self.proxy_addr,
+            "SOCKS5 UDP ASSOCIATE handshake completed"
+        );
 
         // Send UDP ASSOCIATE command (CMD=0x03) with BND.ADDR=0/BND.PORT=0
         let request: Vec<u8> = vec![
@@ -522,7 +573,13 @@ impl Socks5Dialer {
                 let ip =
                     std::net::Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
                 let port = u16::from_be_bytes([addr_buf[4], addr_buf[5]]);
-                SocketAddr::new(std::net::IpAddr::V4(ip), port)
+                let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+                debug!(
+                    proxy = %self.proxy_addr,
+                    relay_addr = %addr,
+                    "SOCKS5 UDP ASSOCIATE relay address parsed"
+                );
+                addr
             }
             0x04 => {
                 // IPv6
@@ -590,6 +647,17 @@ impl Socks5Dialer {
             tokio::net::UdpSocket::from_std(std_udp).map_err(Socks5Error::Io)?
         };
 
+        debug!(
+            proxy = %self.proxy_addr,
+            relay_addr = %relay_addr,
+            host_ns_fd = ?self.host_ns_fd,
+            "SOCKS5 UDP ASSOCIATE session created"
+        );
+        debug!(
+            proxy = %self.proxy_addr,
+            relay_addr = %relay_addr,
+            "SOCKS5 UDP ASSOCIATE local UDP socket bound"
+        );
         Ok(UdpAssociateSession {
             control,
             udp: local_udp,
@@ -612,6 +680,13 @@ impl Socks5Dialer {
         };
         stream.write_all(&methods).await?;
 
+        debug!(
+            proxy = %self.proxy_addr,
+            methods = ?methods,
+            do_connect = %do_connect,
+            "SOCKS5 auth methods sent (handshake_inner)"
+        );
+
         let mut response = [0u8; 2];
         stream.read_exact(&mut response).await?;
 
@@ -620,6 +695,12 @@ impl Socks5Dialer {
                 "invalid SOCKS5 version during auth".into(),
             ));
         }
+
+        debug!(
+            proxy = %self.proxy_addr,
+            auth_method = response[1],
+            "SOCKS5 auth method selected (handshake_inner)"
+        );
 
         match response[1] {
             0x00 => {}
@@ -673,6 +754,12 @@ impl Socks5Dialer {
 
         let mut auth_reply = [0u8; 2];
         stream.read_exact(&mut auth_reply).await?;
+
+        debug!(
+            proxy = %self.proxy_addr,
+            status = auth_reply[1],
+            "SOCKS5 username/password auth reply received"
+        );
 
         if auth_reply[0] != 0x01 {
             return Err(Socks5Error::AuthFailed(format!(
@@ -739,13 +826,29 @@ fn parse_host_from_target(target: &str) -> &str {
 impl OutboundDialer for Socks5Dialer {
     /// Dial to target address through SOCKS5 proxy
     async fn dial(&self, target: &str) -> anyhow::Result<ProxyConn> {
+        debug!(
+            proxy = %self.proxy_addr,
+            target = %target,
+            "SOCKS5 dial starting"
+        );
         let mut stream = self.connect_with_mark().await?;
+
+        debug!(
+            proxy = %self.proxy_addr,
+            target = %target,
+            "SOCKS5 handshake starting"
+        );
 
         // Execute SOCKS5 handshake
         self.handshake(&mut stream, target)
             .await
             .map_err(|e| anyhow::anyhow!("SOCKS5 handshake failed: {}", e))?;
 
+        debug!(
+            proxy = %self.proxy_addr,
+            target = %target,
+            "SOCKS5 dial completed"
+        );
         ProxyConn::new_tcp(stream).map_err(Into::into)
     }
 
@@ -781,6 +884,12 @@ impl crate::UdpSession for SocksUdpSession {
     async fn send(&self, dest: &std::net::SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
         let mut send_buf = UdpAssociateSession::build_udp_request_header(dest, payload.len());
         send_buf.extend_from_slice(payload);
+        debug!(
+            dest = %dest,
+            payload_len = payload.len(),
+            relay = %self.session.relay_addr,
+            "SOCKS5 UDP relay send"
+        );
         self.session.udp.send(&send_buf).await?;
         Ok(())
     }
@@ -792,6 +901,12 @@ impl crate::UdpSession for SocksUdpSession {
             if let Some((dest, offset)) =
                 UdpAssociateSession::parse_udp_response_header(&buf[..len])
             {
+                debug!(
+                    dest = %dest,
+                    relay = %self.session.relay_addr,
+                    response_len = len - offset,
+                    "SOCKS5 UDP relay response received"
+                );
                 return Ok((dest, buf[offset..len].to_vec()));
             }
             // Non-SOCKS5 UDP packets (like fragments), ignore and retry

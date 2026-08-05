@@ -34,13 +34,13 @@ pub struct DnsUpstreamPool {
     /// Instead of creating a fresh marked socket per query, the pool keeps one
     /// socket per upstream and multiplexes concurrent queries by rewriting the
     /// DNS transaction ID (RFC-style, same technique as kixdns).
-    udp_pool: Mutex<Option<Arc<UdpPool>>>,
+    udp_pool: tokio::sync::Mutex<Option<Arc<UdpPool>>>,
     /// Reusable TCP multiplexer (lazily created on first TCP query).
     ///
     /// One persistent marked connection per upstream carries all concurrent
     /// DNS-over-TCP queries (pipelined, TXID-rewritten) instead of opening a
     /// fresh connection per query.
-    tcp_mux: Mutex<Option<Arc<TcpMux>>>,
+    tcp_mux: tokio::sync::Mutex<Option<Arc<TcpMux>>>,
 }
 
 /// DNS transport protocol
@@ -91,8 +91,8 @@ impl DnsUpstreamPool {
             address,
             transport,
             timeout: Duration::from_secs(5),
-            udp_pool: Mutex::new(None),
-            tcp_mux: Mutex::new(None),
+            udp_pool: tokio::sync::Mutex::new(None),
+            tcp_mux: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -123,7 +123,7 @@ impl DnsUpstreamPool {
     }
 
     async fn query_udp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let pool = self.ensure_udp_pool()?;
+        let pool = self.ensure_udp_pool().await?;
         pool.query(request, self.timeout).await
     }
 
@@ -132,8 +132,8 @@ impl DnsUpstreamPool {
     /// The pool owns a single marked socket (SO_MARK=0x100 so the eBPF program
     /// lets dae-rs's own queries pass — critical to avoid a DNS hijack loop)
     /// and multiplexes concurrent queries via TXID rewriting.
-    fn ensure_udp_pool(&self) -> anyhow::Result<Arc<UdpPool>> {
-        let mut guard = self.udp_pool.lock().unwrap();
+    async fn ensure_udp_pool(&self) -> anyhow::Result<Arc<UdpPool>> {
+        let mut guard = self.udp_pool.lock().await;
         if let Some(pool) = guard.as_ref() {
             return Ok(pool.clone());
         }
@@ -146,13 +146,13 @@ impl DnsUpstreamPool {
     }
 
     async fn query_tcp(&self, request: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mux = self.ensure_tcp_mux()?;
+        let mux = self.ensure_tcp_mux().await?;
         mux.query(request, self.timeout).await
     }
 
     /// Lazily create the shared TCP multiplexer for this upstream.
-    fn ensure_tcp_mux(&self) -> anyhow::Result<Arc<TcpMux>> {
-        let mut guard = self.tcp_mux.lock().unwrap();
+    async fn ensure_tcp_mux(&self) -> anyhow::Result<Arc<TcpMux>> {
+        let mut guard = self.tcp_mux.lock().await;
         if let Some(mux) = guard.as_ref() {
             return Ok(mux.clone());
         }
@@ -743,12 +743,25 @@ async fn query_dns_tcp_via_proxy(
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
     let target = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    debug!(
+        target = %target,
+        timeout_ms = %timeout.as_millis(),
+        "DNS proxy TCP query started"
+    );
     let mut conn = dialer.dial(&target).await.map_err(|e| {
         anyhow::anyhow!("failed to dial upstream DNS {} via proxy: {}", target, e)
     })?;
 
     // Send DNS query over TCP through the proxy
-    DnsUpstreamPool::send_tcp_dns_query(&mut conn.stream, request, timeout).await
+    let resp = DnsUpstreamPool::send_tcp_dns_query(&mut conn.stream, request, timeout).await;
+    if let Ok(ref response) = resp {
+        debug!(
+            target = %target,
+            resp_len = response.len(),
+            "DNS proxy TCP query completed"
+        );
+    }
+    resp
 }
 
 /// Send a DNS query as a UDP datagram through a proxy's UDP relay session.
@@ -758,8 +771,19 @@ async fn query_dns_udp_via_proxy(
     request: &[u8],
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
+    debug!(
+        upstream = %upstream_addr,
+        request_len = request.len(),
+        timeout_ms = %timeout.as_millis(),
+        "DNS proxy UDP query started"
+    );
     session.send(&upstream_addr, request).await?;
     let (_, resp) = tokio::time::timeout(timeout, session.recv()).await??;
+    debug!(
+        upstream = %upstream_addr,
+        response_len = resp.len(),
+        "DNS proxy UDP response received"
+    );
     Ok(resp)
 }
 

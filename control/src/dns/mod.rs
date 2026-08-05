@@ -23,7 +23,7 @@ pub struct DnsManager {
     /// Upstream connection pool (label -> pool)
     upstream_pools: HashMap<String, Arc<DnsUpstreamPool>>,
     /// DNS response cache
-    cache: Arc<std::sync::RwLock<DnsCache>>,
+    cache: Arc<tokio::sync::RwLock<DnsCache>>,
     /// DNS router (request matching)
     router: DnsRouter,
     /// DNS listener (UDP + TCP)
@@ -56,7 +56,7 @@ impl DnsManager {
         dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     ) -> anyhow::Result<Self> {
         let router = DnsRouter::new(&config, rule_set_cache.clone())?;
-        let cache = Arc::new(std::sync::RwLock::new(DnsCache::new(&config.cache)));
+        let cache = Arc::new(tokio::sync::RwLock::new(DnsCache::new(&config.cache)));
 
         Ok(Self {
             config,

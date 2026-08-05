@@ -60,10 +60,12 @@ pub fn parse_import_url(
 /// `socks5://[user:pass@]host:port`
 fn parse_socks5_import(rest: &str, node: &mut OutboundNodeConfig) -> Result<()> {
     node.protocol = "socks5".into();
-    node.address = rest.to_string();
+    // Strip fragment if present (e.g. `host:port#name`)
+    let rest = rest.split_once('#').map_or(rest, |(r, _)| r);
+    node.address = strip_trailing_slash(rest).to_string();
     if let Some(at_pos) = node.address.rfind('@') {
         let cred = node.address[..at_pos].to_string();
-        node.address = node.address[at_pos + 1..].to_string();
+        node.address = strip_trailing_slash(&node.address[at_pos + 1..]).to_string();
         if let Some(colon_pos) = cred.find(':') {
             node.username = Some(cred[..colon_pos].to_string());
             node.password = Some(cred[colon_pos + 1..].to_string());
@@ -87,14 +89,14 @@ fn parse_ss_import(rest: &str, node: &mut OutboundNodeConfig) -> Result<()> {
     let rest = rest.split('#').next().unwrap_or(rest);
     let mut assigned = false;
     if let Some(at_pos) = rest.rfind('@') {
-        node.address = rest[at_pos + 1..].to_string();
+        node.address = strip_trailing_slash(&rest[at_pos + 1..]).to_string();
         assigned = assign_ss_userinfo(&rest[..at_pos], node);
     }
     if !assigned {
         // Full-URI base64 form: base64(method:password@host:port)
         if let Some(decoded) = base64_decode(rest) {
             if let Some(at_pos) = decoded.rfind('@') {
-                node.address = decoded[at_pos + 1..].to_string();
+                node.address = strip_trailing_slash(&decoded[at_pos + 1..]).to_string();
                 assigned = assign_ss_userinfo(&decoded[..at_pos], node);
             }
         }
@@ -133,7 +135,7 @@ fn parse_trojan_import(rest: &str, node: &mut OutboundNodeConfig) -> Result<()> 
     let (main, query) = split_url(rest);
     if let Some(at_pos) = main.rfind('@') {
         node.password = Some(main[..at_pos].to_string());
-        node.address = main[at_pos + 1..].to_string();
+        node.address = strip_trailing_slash(&main[at_pos + 1..]).to_string();
     }
     for (key, value) in query {
         match key.as_str() {
@@ -209,10 +211,13 @@ fn parse_juicity_import(rest: &str, node: &mut OutboundNodeConfig) -> Result<()>
 }
 
 /// Fill `uuid`/`password`/`address` from a `uuid:password@host:port` userinfo.
+///
+/// Also strips any trailing `/` from the extracted address to tolerate
+/// share URLs like `juicity://uuid:pass@host:port/?...`.
 fn assign_uuid_password(main: &str, node: &mut OutboundNodeConfig) {
     if let Some(at_pos) = main.rfind('@') {
         let cred = &main[..at_pos];
-        node.address = main[at_pos + 1..].to_string();
+        node.address = strip_trailing_slash(&main[at_pos + 1..]).to_string();
         if let Some(colon_pos) = cred.find(':') {
             node.uuid = Some(cred[..colon_pos].to_string());
             node.password = Some(cred[colon_pos + 1..].to_string());
@@ -239,7 +244,7 @@ fn parse_vmess_import(rest: &str, node: &mut OutboundNodeConfig) -> Result<()> {
     let (main, query) = split_url(rest);
     if let Some(at_pos) = main.rfind('@') {
         node.uuid = Some(main[..at_pos].to_string());
-        node.address = main[at_pos + 1..].to_string();
+        node.address = strip_trailing_slash(&main[at_pos + 1..]).to_string();
     }
     for (key, value) in query {
         match key.as_str() {
@@ -315,6 +320,17 @@ fn parse_vmess_json(json: &serde_json::Value, node: &mut OutboundNodeConfig) -> 
 }
 
 // ── Shared helpers ──
+
+/// Strip a trailing `/` from a host:port address string.
+///
+/// When a share URL has a trailing slash before the query string
+/// (e.g. `host:port/?key=val`), the slash can end up as part of
+/// the address, causing `SocketAddr::parse()` to fail.  This helper
+/// removes exactly one trailing slash so that both `host:port` and
+/// `host:port/` produce a clean `host:port`.
+fn strip_trailing_slash(addr: &str) -> &str {
+    addr.strip_suffix('/').unwrap_or(addr)
+}
 
 /// Split `main?key=value&key2=value2` into its main part and query pairs.
 fn split_url(rest: &str) -> (&str, Vec<(String, String)>) {
@@ -464,9 +480,75 @@ mod tests {
         assert_eq!(node.protocol, "juicity");
         assert_eq!(node.uuid.as_deref(), Some("a8eb0027-f7ac-da79-12b4-5433da6fdfce"));
         assert_eq!(node.password.as_deref(), Some("33440f5a7608"));
-        assert_eq!(node.address, "103.238.129.103:23182/");
+        // Trailing '/' before '?' must be stripped to produce a valid host:port
+        assert_eq!(node.address, "103.238.129.103:23182");
         assert_eq!(node.sni.as_deref(), Some("jp02.2333ma.top"));
         assert_eq!(node.congestion_control.as_deref(), Some("bbr"));
+    }
+
+    #[test]
+    fn test_tuic_import_trailing_slash() {
+        // Trailing slash before query string must be stripped
+        let node = parse_ok(
+            "tuic://d0529668-8835-11ec-a8a3-0242ac120002:pw@server.example.com:443/?congestion_control=bbr&sni=example.com",
+        );
+        assert_eq!(node.protocol, "tuic");
+        assert_eq!(node.address, "server.example.com:443");
+        assert_eq!(node.uuid.as_deref(), Some("d0529668-8835-11ec-a8a3-0242ac120002"));
+        assert_eq!(node.password.as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn test_trojan_import_trailing_slash() {
+        let node = parse_ok(
+            "trojan://pass123@server.example.com:443/?sni=example.com",
+        );
+        assert_eq!(node.protocol, "trojan");
+        assert_eq!(node.address, "server.example.com:443");
+        assert_eq!(node.password.as_deref(), Some("pass123"));
+    }
+
+    #[test]
+    fn test_socks5_import_trailing_slash() {
+        let node = parse_ok("socks5://user:pass@127.0.0.1:1080/");
+        assert_eq!(node.protocol, "socks5");
+        assert_eq!(node.address, "127.0.0.1:1080");
+        assert_eq!(node.username.as_deref(), Some("user"));
+        assert_eq!(node.password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn test_socks5_import_no_auth_trailing_slash() {
+        let node = parse_ok("socks5://127.0.0.1:1080/");
+        assert_eq!(node.protocol, "socks5");
+        assert_eq!(node.address, "127.0.0.1:1080");
+        assert!(node.username.is_none());
+    }
+
+    #[test]
+    fn test_vmess_import_trailing_slash() {
+        let node = parse_ok(
+            "vmess://d0529668-8835-11ec-a8a3-0242ac120002@server.example.com:443/?security=auto",
+        );
+        assert_eq!(node.protocol, "vmess");
+        assert_eq!(node.address, "server.example.com:443");
+        assert_eq!(node.uuid.as_deref(), Some("d0529668-8835-11ec-a8a3-0242ac120002"));
+    }
+
+    #[test]
+    fn test_ss_import_trailing_slash() {
+        let node = parse_ok("ss://aes-256-gcm:password@server.example.com:8388/");
+        assert_eq!(node.protocol, "shadowsocks");
+        assert_eq!(node.address, "server.example.com:8388");
+        assert_eq!(node.cipher.as_deref(), Some("aes-256-gcm"));
+    }
+
+    #[test]
+    fn test_strip_trailing_slash_helper() {
+        use super::strip_trailing_slash;
+        assert_eq!(strip_trailing_slash("host:443/"), "host:443");
+        assert_eq!(strip_trailing_slash("host:443"), "host:443");
+        assert_eq!(strip_trailing_slash("host:443//"), "host:443/");
     }
 
     #[test]

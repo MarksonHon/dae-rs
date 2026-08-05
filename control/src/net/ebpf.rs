@@ -804,6 +804,7 @@ impl EbpfManager {
         let mut open_obj = builder
             .open_file(path)
             .with_context(|| format!("Failed to open eBPF object from {}", self.bpf_path))?;
+        debug!(bpf_path = %self.bpf_path, "Opened eBPF object file for load");
 
         // Adjust map parameters before loading
         self.adjust_maps_pre_load(&mut open_obj);
@@ -813,6 +814,7 @@ impl EbpfManager {
 
         // Fix program types for non-standard TC section names before loading
         set_tc_prog_types(&mut open_obj);
+        debug!("Fixed TC program types for loaded object");
 
         let obj = open_obj
             .load()
@@ -841,20 +843,25 @@ impl EbpfManager {
             len = bytes.len(),
             "Loading eBPF from byte slice via libbpf-rs"
         );
+        debug!(bpf_path = %self.bpf_path, "load_from_bytes starting");
 
         // Clean old pins in pin directory: avoid libbpf trying to reuse residual
         // internal map pin (e.g. <hash>.rodata) causing -EPERM / "error reusing pinned map".
         if let Some(ref bpffs_path) = self.pin_path.clone() {
             let dir = std::path::Path::new(bpffs_path);
+            debug!(bpffs_path = %bpffs_path, "Cleaning pin directory before loading from bytes");
             if dir.exists() {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_file() {
+                            debug!(path = ?path, "Removing stale pin file");
                             let _ = std::fs::remove_file(&path);
                         }
                     }
                 }
+            } else {
+                debug!(bpffs_path = %bpffs_path, "Pin directory does not exist yet");
             }
         }
 
@@ -862,6 +869,7 @@ impl EbpfManager {
         let mut open_obj = builder
             .open_memory(bytes)
             .context("Failed to open eBPF object from memory")?;
+        debug!(len = bytes.len(), "Opened eBPF object from memory");
 
         // Adjust map parameters before loading
         self.adjust_maps_pre_load(&mut open_obj);
@@ -884,6 +892,8 @@ impl EbpfManager {
                 let pin_path = dir.join(&name);
                 if let Err(e) = map.set_pin_path(&pin_path) {
                     warn!("Failed to set pin path for map '{}' to {:?}: {}", name, pin_path, e);
+                } else {
+                    debug!(map = %name, pin_path = ?pin_path, "Set pin path for map before load");
                 }
             }
         }
@@ -928,6 +938,12 @@ impl EbpfManager {
             name == ".rodata" || name == "rodata" || name.ends_with(".rodata")
         });
         if let Some(mut map) = rodata_map {
+            let initial_value_exists = map.initial_value_mut().is_some();
+            debug!(
+                name = %map.name().to_string_lossy(),
+                initial_value_exists = initial_value_exists,
+                "Found .rodata map for PARAM injection"
+            );
             // Use initial_value_mut to read/write the pre-load .rodata buffer
             if let Some(initial) = map.initial_value_mut() {
                 if param_bytes.len() <= initial.len() {
@@ -936,6 +952,11 @@ impl EbpfManager {
                         "PARAM written to .rodata pre-load ({} bytes, initial_value size: {} bytes)",
                         param_bytes.len(),
                         initial.len()
+                    );
+                    debug!(
+                        param_bytes_len = param_bytes.len(),
+                        initial_len = initial.len(),
+                        "PARAM data copied into .rodata initial buffer"
                     );
                 } else {
                     warn!(
@@ -952,6 +973,12 @@ impl EbpfManager {
                 let mut full_value = vec![0u8; value_size];
                 let copy_len = std::cmp::min(param_bytes.len(), value_size);
                 full_value[..copy_len].copy_from_slice(&param_bytes[..copy_len]);
+                debug!(
+                    param_bytes_len = param_bytes.len(),
+                    value_size = value_size,
+                    copy_len = copy_len,
+                    "Prepared fallback .rodata initial value buffer"
+                );
                 map.set_initial_value(&full_value)?;
                 info!(
                     "PARAM written to .rodata via set_initial_value ({} bytes in {}-byte buffer)",
@@ -1038,6 +1065,7 @@ impl EbpfManager {
     ///
     /// Automatically skip internal maps (e.g. .rodata, .bss, .data, etc.).
     pub fn pin_maps(&mut self, bpffs_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        debug!(bpffs_path = %bpffs_path, "pin_maps starting");
         // Ensure bpffs is mounted
         ensure_bpffs_mounted()?;
 
@@ -1045,6 +1073,7 @@ impl EbpfManager {
         let dir = std::path::Path::new(bpffs_path);
         if !dir.exists() {
             std::fs::create_dir_all(dir)?;
+            debug!(bpffs_path = %bpffs_path, "Created bpffs directory");
         }
 
         // Get eBPF object (mutable reference, because Map::pin() requires &mut self)
@@ -1064,6 +1093,7 @@ impl EbpfManager {
                 }
             })
             .collect();
+        debug!(count = map_names.len(), "Collected maps for pinning");
 
         // Clean old pins: remove old dae map files under /sys/fs/bpf/ root
         // A previous dae-rs run may have left old pins at /sys/fs/bpf/<map_name>,
@@ -1073,7 +1103,7 @@ impl EbpfManager {
             for name in &map_names {
                 let old_pin = bpffs_root.join(name);
                 if old_pin.exists() && old_pin != dir.join(name) {
-                    debug!("Removing stale pin at {:?}", old_pin);
+                    debug!(old_pin = ?old_pin, "Removing stale pin file");
                     let _ = std::fs::remove_file(&old_pin);
                 }
             }
@@ -1084,15 +1114,17 @@ impl EbpfManager {
             let map_name = map.name().to_string_lossy().to_string();
             // Skip internal maps (<hash>.rodata/.bss/.data etc., all contain '.')
             if map_name.is_empty() || map_name.contains('.') {
+                debug!(map_name = %map_name, "Skipping internal or unnamed map during pinning");
                 continue;
             }
             let pin_path = dir.join(&map_name);
             // If exists, remove first then re-pin
             if pin_path.exists() {
+                debug!(path = ?pin_path, "Removing existing pin file before repinning");
                 std::fs::remove_file(&pin_path)?;
             }
             map.pin(&pin_path)?;
-            debug!("Pinned map '{}' to {:?}", map_name, pin_path);
+            debug!(map_name = %map_name, pin_path = ?pin_path, "Pinned map");
         }
 
         Ok(())
@@ -1175,6 +1207,13 @@ impl EbpfManager {
             };
 
             let attach_point = Self::prog_attach_point(prog_name);
+            debug!(
+                prog_name = %prog_name,
+                attach_point = attach_point,
+                priority = priority,
+                handle = ?handle,
+                "Preparing TC hook"
+            );
             let mut hook = TcHook::new(prog.as_fd());
             hook.ifindex(ifindex);
             hook.attach_point(attach_point);
@@ -1215,6 +1254,7 @@ impl EbpfManager {
                     {
                         debug!(
                             iface = %ifname,
+                            stderr = %stderr,
                             "clsact qdisc did not exist on {}, OK",
                             ifname,
                         );
@@ -1456,8 +1496,10 @@ impl EbpfManager {
 
         let mut attached: Vec<(String, libbpf_rs::Link)> = Vec::new();
 
+        info!(count = cgroup_progs.len(), "Attaching cgroup programs");
         let result = (|| -> Result<()> {
             for name in &cgroup_progs {
+                debug!(prog = %name, "Attempting to attach cgroup program");
                 let prog = match find_prog(obj, name) {
                     Ok(p) => p,
                     Err(_) => {
@@ -1518,6 +1560,7 @@ impl EbpfManager {
     /// Detach all TC programs and cgroup programs
     pub fn detach_all(&mut self) -> Result<()> {
         let start = std::time::Instant::now();
+        debug!(count = self.tc_hooks.len(), cgroup_links = self.cgroup_links.len(), "detach_all starting");
         // Detach TC hooks
         if !self.tc_hooks.is_empty() {
             info!(count = self.tc_hooks.len(), "Detaching TC programs");
@@ -1623,6 +1666,7 @@ impl EbpfManager {
         let val = ifindex.to_ne_bytes();
         map.update(&key, &val, MapFlags::empty())
             .context("Failed to update dae_ifindex_map")?;
+        debug!(key = 0, ifindex = ifindex, "Wrote dae_ifindex_map entry");
         info!("Updated dae_ifindex_map: ifindex={}", ifindex);
         Ok(())
     }
@@ -1959,7 +2003,7 @@ impl EbpfManager {
     pub fn log_debug_counters(&mut self, label: &str) {
         match self.read_debug_counters() {
             Ok(counters) => {
-                info!("[{}] Debug counters: egress_entered={} skipped={} tcp_entered={} tcp_direct={} tcp_proxy={} udp_entered={} udp_direct={} udp_proxy={} dae0peer_entered={} listen_null={} assign_fail={} redirect_fail={} route_fail={} outbound_dead={} parse_fail={}",
+                debug!("[{}] Debug counters: egress_entered={} skipped={} tcp_entered={} tcp_direct={} tcp_proxy={} udp_entered={} udp_direct={} udp_proxy={} dae0peer_entered={} listen_null={} assign_fail={} redirect_fail={} route_fail={} outbound_dead={} parse_fail={}",
                     label,
                     counters[6],  // DBG_WAN_EGRESS_ENTERED
                     counters[7],  // DBG_WAN_EGRESS_SKIPPED
@@ -1977,27 +2021,27 @@ impl EbpfManager {
                     counters[4],  // DBG_WAN_OUTBOUND_DEAD
                     counters[5],  // DBG_WAN_PARSE_FAIL
                 );
-                info!(
+                debug!(
                     "[{}] Assign counters: assign_called={} bpf_sk_assign_ok={}",
                     label,
                     counters[15], // DBG_ASSIGN_CALLED
                     counters[16], // DBG_BPF_SK_ASSIGN_OK
                 );
-                info!(
+                debug!(
                     "[{}] Assign listener selection: tcp4={} udp={} tcp6={}",
                     label,
                     counters[33], // DBG_ASSIGN_SELECT_TCP4
                     counters[34], // DBG_ASSIGN_SELECT_UDP
                     counters[35], // DBG_ASSIGN_SELECT_TCP6
                 );
-                info!(
+                debug!(
                     sk_match = counters[17],
                     sk_null = counters[18],
                     sk_mismatch = counters[19],
                     "[{}] skb->sk verification",
                     label,
                 );
-                info!(
+                debug!(
                     dae0_ingress_entered = counters[20],
                     dae0_redirect_tuple_ok = counters[21],
                     dae0_redirect_track_hit = counters[22],
@@ -2006,7 +2050,7 @@ impl EbpfManager {
                     "[{}] dae0_ingress return path",
                     label,
                 );
-                info!(
+                debug!(
                     redirect_track_publish = counters[25],
                     redirect_tuple_load_fail = counters[26],
                     redirect_track_miss = counters[27],
@@ -2029,14 +2073,14 @@ impl EbpfManager {
                 ];
                 for (i, &val) in counters[..6].iter().enumerate() {
                     if val > 0 {
-                        info!(
+                        debug!(
                             "[{}]  ! {} = {} (check tproxy.c for details)",
                             label, failure_names[i], val
                         );
                     }
                 }
                 if counters.iter().all(|&v| v == 0) {
-                    info!(
+                    debug!(
                         "[{}] All debug counters are zero — no failures detected in eBPF data path",
                         label
                     );
@@ -2410,6 +2454,7 @@ impl EbpfManager {
         let map = self.get_map_mut("outbound_connectivity_map")?;
         let value = if alive { 1u32 } else { 0u32 };
         map.update(&key.to_ne_bytes(), &value.to_ne_bytes(), MapFlags::empty())?;
+        debug!(outbound_id = outbound_id, domain_idx = domain_idx, ip_idx = ip_idx, alive = alive, key = key, "Updated outbound_connectivity_map");
         Ok(())
     }
 
@@ -2501,7 +2546,9 @@ impl EbpfManager {
     /// Uses the stored `conn_state_map_max_entries` as denominator.
     pub fn conn_state_map_usage(&self) -> Result<f64> {
         let count = self.count_map_entries("conn_state_map")?;
-        Ok(count as f64 / self.conn_state_map_max_entries as f64)
+        let usage = count as f64 / self.conn_state_map_max_entries as f64;
+        debug!(count = count, max = self.conn_state_map_max_entries, usage = usage, "conn_state_map usage computed");
+        Ok(usage)
     }
 
     /// Scan and delete expired entries from conn_state_map.
@@ -2614,19 +2661,29 @@ impl EbpfManager {
 
         // Delete expired entries
         let count = expired_keys.len();
-        for key in &expired_keys {
-            unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    5i64, // BPF_MAP_DELETE_ELEM
-                    &(map_fd as u32),
-                    key.as_ptr(),
-                    std::ptr::null::<u8>(),
-                );
+        if count > 0 {
+            debug!(expired = count, "Deleting expired conn_state_map entries");
+            for key in &expired_keys {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        5i64, // BPF_MAP_DELETE_ELEM
+                        &(map_fd as u32),
+                        key.as_ptr(),
+                        std::ptr::null::<u8>(),
+                    );
+                }
             }
         }
 
         let remaining = total_count.saturating_sub(count as u32);
+        debug!(
+            total_count = total_count,
+            deleted = count,
+            remaining = remaining,
+            in_pressure = in_pressure,
+            "Completed janitor conn_state scan"
+        );
         if count > 0 {
             info!(
                 "Janitor conn_state scan: deleted {} expired, {} remaining",
@@ -2707,18 +2764,22 @@ impl EbpfManager {
         }
 
         let count = expired_keys.len() as u32;
-        for key in &expired_keys {
-            unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    5i64, // BPF_MAP_DELETE_ELEM
-                    &(map_fd as u32),
-                    key.as_ptr(),
-                    std::ptr::null::<u8>(),
-                );
+        if count > 0 {
+            debug!(deleted = count, "Deleting expired redirect_track entries");
+            for key in &expired_keys {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        5i64, // BPF_MAP_DELETE_ELEM
+                        &(map_fd as u32),
+                        key.as_ptr(),
+                        std::ptr::null::<u8>(),
+                    );
+                }
             }
         }
 
+        debug!(deleted = count, "Completed janitor redirect_track scan");
         if count > 0 {
             info!("Janitor redirect_track: deleted {} expired entries", count);
         }
@@ -2794,18 +2855,22 @@ impl EbpfManager {
         }
 
         let count = expired_keys.len() as u32;
-        for key in &expired_keys {
-            unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    5i64, // BPF_MAP_DELETE_ELEM
-                    &(map_fd as u32),
-                    key.as_ptr(),
-                    std::ptr::null::<u8>(),
-                );
+        if count > 0 {
+            debug!(deleted = count, "Deleting expired cookie_pid_map entries");
+            for key in &expired_keys {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_bpf,
+                        5i64, // BPF_MAP_DELETE_ELEM
+                        &(map_fd as u32),
+                        key.as_ptr(),
+                        std::ptr::null::<u8>(),
+                    );
+                }
             }
         }
 
+        debug!(deleted = count, "Completed janitor cookie_pid_map scan");
         if count > 0 {
             info!("Janitor cookie_pid_map: deleted {} expired entries", count);
         }
@@ -2869,7 +2934,10 @@ impl EbpfManager {
         }
 
         if count > 0 {
+            debug!(deleted = count, "Deleted routing_handoff_map entries");
             info!("Janitor routing_handoff_map: deleted {} entries", count);
+        } else {
+            debug!("No routing_handoff_map entries to delete");
         }
 
         Ok(count)
@@ -2889,6 +2957,7 @@ impl EbpfManager {
         let map = self.get_map_mut("routing_handoff_map")?;
         let map_fd = map.as_fd().as_raw_fd();
 
+        debug!("Reading all routing_handoff_map entries");
         let mut entries: Vec<(TuplesKey, RoutingHandoffEntry)> = Vec::new();
         let mut prev_key: Vec<u8> = Vec::new();
 
@@ -2942,12 +3011,14 @@ impl EbpfManager {
             prev_key = next_key;
         }
 
+        debug!(count = entries.len(), "Completed reading routing_handoff_map entries");
         Ok(entries)
     }
 
     /// Delete a single entry from routing_handoff_map by key.
     pub fn delete_routing_handoff_entry(&mut self, key: &TuplesKey) -> Result<()> {
         use std::os::fd::AsRawFd;
+        debug!(key = ?key, "Deleting routing_handoff_map entry");
 
         let map = self.get_map_mut("routing_handoff_map")?;
         let map_fd = map.as_fd().as_raw_fd();
@@ -2972,6 +3043,7 @@ impl EbpfManager {
     /// packets of the same flow are properly handled by the eBPF program.
     pub fn set_conn_state(&mut self, key: &TuplesKey, value: &ConnState) -> Result<()> {
         let map = self.get_map_mut("conn_state_map")?;
+        debug!(key = ?key, value = ?value, "Writing conn_state_map entry");
         map.update(
             bytemuck::bytes_of(key),
             bytemuck::bytes_of(value),

@@ -3,6 +3,8 @@
 //! This module only defines data and configuration types; it does not take part in any
 //! matcher / parser wiring (handled by later sub-tasks).
 
+use std::sync::Arc;
+
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
@@ -213,10 +215,13 @@ impl RuleSetConfig {
 ///
 /// Serialize/Deserialize are used by the binary cache in `/run/dae-rs/` so a
 /// restart can load already-parsed lists without re-parsing the source text.
+///
+/// The lists are stored behind [`Arc`] so cache lookups can share a single
+/// allocation (one atomic refcount bump) instead of deep-cloning the whole list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuleSetData {
     /// Text domain list.
-    DomainList(Vec<DomainPattern>),
+    DomainList(Arc<Vec<DomainPattern>>),
     /// Text IP list.
-    IpList(Vec<IpNet>),
+    IpList(Arc<Vec<IpNet>>),
 }

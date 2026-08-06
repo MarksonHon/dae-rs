@@ -709,7 +709,7 @@ async fn handle_connection(
         ProxyStream::Tcp(s) => s.local_addr().ok(),
         ProxyStream::Boxed(_) => None,
     };
-    info!(
+    debug!(
         "TCP  {}:{} -> {} [PROXY] outbound via {} -> proxy {} (local {}) dial={:.1}ms",
         peer_addr
             .map(|a| a.ip())
@@ -746,7 +746,7 @@ async fn handle_connection(
                 total_ms = elapsed_ms,
                 "Connection completed"
             );
-            info!(
+            debug!(
                 "TCP  {}:{} -> {} [PROXY] up={} down={} {:.1}ms",
                 peer_addr
                     .map(|a| a.ip())
@@ -1182,12 +1182,16 @@ pub fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
         return None;
     }
 
-    let mut labels = Vec::new();
-    let mut jumped = false;
-    let mut visited = std::collections::HashSet::new();
-    let max_jumps = 10;
-    let mut jumps = 0usize;
+    // Maximum number of compression-pointer jumps before giving up.
+    const MAX_JUMPS: usize = 10;
 
+    // Fixed-size visited-pointer array replaces the HashSet: at most MAX_JUMPS
+    // pointers can be followed, so a bounded linear scan is cheaper and avoids
+    // per-packet hashing/allocation.
+    let mut visited = [0usize; MAX_JUMPS];
+    let mut visited_len = 0usize;
+
+    let mut name = String::with_capacity(128);
     let mut pos = 12usize;
 
     loop {
@@ -1206,18 +1210,11 @@ pub fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
             let ptr = ((len & 0x3F) << 8) | packet[pos + 1] as usize;
 
             // Loop detection: if we've seen this pointer before, it's a loop
-            if !visited.insert(ptr) || jumps >= max_jumps {
+            if visited_len >= MAX_JUMPS || visited[..visited_len].contains(&ptr) {
                 return None;
             }
-            jumps += 1;
-
-            // On the first jump, record where the caller should continue after
-            // this name (i.e., right after the pointer bytes), so the caller
-            // can locate the question type/class fields.
-            if !jumped {
-                // Not updating a caller offset here; we're self-contained.
-                jumped = true;
-            }
+            visited[visited_len] = ptr;
+            visited_len += 1;
             pos = ptr;
             continue;
         }
@@ -1227,23 +1224,24 @@ pub fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
             break;
         }
 
-        // Normal label: read `len` bytes of label data
+        // Normal label: read `len` bytes of label data, writing directly into
+        // the output string (no intermediate `Vec<String>` + `join`).
         pos += 1;
         if pos + len > packet.len() {
             return None;
         }
-        if let Ok(label) = std::str::from_utf8(&packet[pos..pos + len]) {
-            labels.push(label.to_string());
-        } else {
-            return None;
+        let label = std::str::from_utf8(&packet[pos..pos + len]).ok()?;
+        if !name.is_empty() {
+            name.push('.');
         }
+        name.push_str(label);
         pos += len;
     }
 
-    if labels.is_empty() {
+    if name.is_empty() {
         None
     } else {
-        Some(labels.join("."))
+        Some(name)
     }
 }
 
@@ -2265,14 +2263,29 @@ impl UdpFlowPool {
 /// One socket per dest, lazily created (in the host NS when host_ns_fd is configured),
 /// with an LRU capacity limit to prevent unbounded growth. DNS hijack responses and
 /// SOCKS5 responses share this pool.
+///
+/// Lookup is O(1) via a `HashMap`; eviction is LRU (least-recently-used first) instead
+/// of FIFO. The `lru` deque may briefly hold stale (already-evicted) keys, which are
+/// skipped during eviction and compacted once it grows too large.
 struct RespSocketPool {
-    inner: Mutex<VecDeque<(SocketAddr, Arc<UdpSocket>)>>,
+    inner: Mutex<RespSocketPoolInner>,
+}
+
+/// Pool state: `HashMap` for O(1) lookup plus a separate LRU ordering deque.
+struct RespSocketPoolInner {
+    /// dest → socket
+    map: HashMap<SocketAddr, Arc<UdpSocket>>,
+    /// LRU order: front = least recently used, back = most recently used.
+    lru: VecDeque<SocketAddr>,
 }
 
 impl RespSocketPool {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(RespSocketPoolInner {
+                map: HashMap::new(),
+                lru: VecDeque::new(),
+            }),
         }
     }
 
@@ -2285,9 +2298,9 @@ impl RespSocketPool {
         // Fast path: already in the pool (no lock held across await)
         {
             let mut m = self.inner.lock().unwrap();
-            if let Some(i) = m.iter().position(|(d, _)| d == dest) {
-                let (_, sock) = m.remove(i).unwrap();
-                m.push_back((*dest, sock.clone()));
+            if let Some(sock) = m.map.get(dest).cloned() {
+                // Mark most-recently-used (O(1): duplicates are filtered on eviction).
+                m.lru.push_back(*dest);
                 debug!(dest = %dest, "Response socket cache hit");
                 return Some(sock);
             }
@@ -2301,13 +2314,33 @@ impl RespSocketPool {
             "Created transparent response socket"
         );
         let mut m = self.inner.lock().unwrap();
-        if let Some(i) = m.iter().position(|(d, _)| d == dest) {
+        if let Some(existing) = m.map.get(dest) {
             // Concurrent creation race: someone else already inserted, just use theirs
-            return Some(m[i].1.clone());
+            return Some(existing.clone());
         }
-        m.push_back((*dest, sock.clone()));
-        while m.len() > RESP_SOCKET_POOL_CAP {
-            m.pop_front();
+        m.map.insert(*dest, sock.clone());
+        m.lru.push_back(*dest);
+        // Evict least-recently-used entries beyond the cap. Pop from the front and
+        // skip stale (already-evicted) keys until a live one is removed.
+        while m.map.len() > RESP_SOCKET_POOL_CAP {
+            match m.lru.pop_front() {
+                Some(lru_key) => {
+                    if m.map.remove(&lru_key).is_some() {
+                        break;
+                    }
+                }
+                None => break, // safety: no LRU entries left to evict
+            }
+        }
+        // Compact stale LRU entries so the deque cannot grow unboundedly.
+        if m.lru.len() > RESP_SOCKET_POOL_CAP * 4 {
+            let live: VecDeque<SocketAddr> = m
+                .lru
+                .iter()
+                .filter(|k| m.map.contains_key(k))
+                .copied()
+                .collect();
+            m.lru = live;
         }
         Some(sock)
     }

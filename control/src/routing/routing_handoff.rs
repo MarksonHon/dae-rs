@@ -133,6 +133,18 @@ impl RoutingHandoffConsumer {
             );
 
             // ── Step 2: Process each entry ──
+            // Acquire the eBPF manager lock ONCE for the whole batch so all
+            // conn_state writes + handoff deletes happen under a single lock
+            // hold (previously each entry locked/unlocked the manager, paying
+            // the mutex cost once per handoff entry).
+            let mut mgr = match self.ebpf_mgr.lock() {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("RoutingHandoffConsumer: failed to lock ebpf_mgr: {}", e);
+                    continue;
+                }
+            };
+
             for (key, entry) in &entries {
                 // Skip stale entries (e.g., from a previous lifecycle)
                 if now_ns.saturating_sub(entry.last_seen_ns) > ENTRY_TIMEOUT_NS {
@@ -141,7 +153,12 @@ impl RoutingHandoffConsumer {
                         now_ns.saturating_sub(entry.last_seen_ns)
                     );
                     // Delete stale entries to prevent map bloat
-                    let _ = self.delete_handoff_entry(key);
+                    if let Err(e) = mgr.delete_routing_handoff_entry(key) {
+                        warn!(
+                            "RoutingHandoffConsumer: failed to delete stale entry {:?}: {}",
+                            key, e
+                        );
+                    }
                     continue;
                 }
 
@@ -154,8 +171,13 @@ impl RoutingHandoffConsumer {
                 // Build conn_state entry with the routing decision
                 let conn_state = build_conn_state(entry, &decision);
 
-                // Write to conn_state_map and delete from routing_handoff_map
-                if let Err(e) = self.commit_routing_decision(key, &conn_state) {
+                // Write to conn_state_map, then delete from routing_handoff_map.
+                // Both operations run under the batch lock held above, keeping
+                // the commit atomic per entry within the single lock hold.
+                if let Err(e) = mgr
+                    .set_conn_state(key, &conn_state)
+                    .and_then(|_| mgr.delete_routing_handoff_entry(key))
+                {
                     warn!(
                         "RoutingHandoffConsumer: failed to commit decision for flow \
                          {:?}: {}",
@@ -184,38 +206,6 @@ impl RoutingHandoffConsumer {
         mgr.get_routing_handoff_entries()
     }
 
-    /// Delete a single entry from `routing_handoff_map` (holds lock briefly).
-    fn delete_handoff_entry(&self, key: &TuplesKey) -> Result<()> {
-        let mut mgr = self
-            .ebpf_mgr
-            .lock()
-            .map_err(|e| anyhow::anyhow!("ebpf_mgr lock: {}", e))?;
-        mgr.delete_routing_handoff_entry(key)
-    }
-
-    /// Atomically write to `conn_state_map` and delete from `routing_handoff_map`.
-    ///
-    /// Both operations are performed while holding the same lock to ensure
-    /// consistency: the entry is removed from the handoff map only after the
-    /// conn_state has been written, preventing duplicate processing.
-    fn commit_routing_decision(
-        &self,
-        key: &TuplesKey,
-        conn_state: &ConnState,
-    ) -> Result<()> {
-        let mut mgr = self
-            .ebpf_mgr
-            .lock()
-            .map_err(|e| anyhow::anyhow!("ebpf_mgr lock: {}", e))?;
-
-        // Write to conn_state_map first
-        mgr.set_conn_state(key, conn_state)?;
-
-        // Then delete from routing_handoff_map
-        mgr.delete_routing_handoff_entry(key)?;
-
-        Ok(())
-    }
 }
 
 // ============================================================================

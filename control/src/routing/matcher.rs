@@ -20,7 +20,9 @@ use crate::config::ConfigError;
 use crate::net::ebpf::{match_type, outbound};
 use crate::net::ebpf::{CidrEntry, LpmKey, MatchSet, MatchSetValue, PortRange};
 use crate::ruleset::cache::RuleSetCache;
+use crate::ruleset::compiled::{CompiledDomainSet, CompiledIpSet};
 use crate::ruleset::refparse::{domain_pattern_to_string, parse_ref, RuleSetRef};
+use crate::ruleset::types::{DomainPattern, DomainPatternType};
 
 // ============================================================================
 // Constants (must match tproxy.c and common/consts/ebpf_generated.go)
@@ -985,7 +987,7 @@ fn parse_cidr_values(values: &[String], cache: Option<&RuleSetCache>) -> Result<
                         "ip_list rule set not found or rule set type mismatch",
                     )
                 })?;
-                cidrs.extend(list);
+                cidrs.extend(list.iter().copied());
             }
             RuleSetRef::Plain(v) => {
                 // Try parsing as CIDR
@@ -1398,10 +1400,10 @@ pub struct RoutingResult {
 pub struct RoutingMatcher {
     /// MatchSet entries (same order as written to routing_map).
     match_sets: Vec<MatchSet>,
-    /// LPM trie data: index -> list of CIDR prefixes.
-    lpm_tries: Vec<Vec<ipnet::IpNet>>,
-    /// Domain set data: rule_index -> list of domain patterns.
-    domain_sets: Vec<Vec<String>>,
+    /// Compiled LPM trie data: index -> compiled IP set (O(log N) lookups).
+    compiled_lpm: Vec<CompiledIpSet>,
+    /// Compiled domain set data: rule_index -> compiled domain matcher.
+    compiled_domains: Vec<CompiledDomainSet>,
     /// Fallback outbound.
     fallback_outbound: u8,
     fallback_mark: u32,
@@ -1410,11 +1412,23 @@ pub struct RoutingMatcher {
 
 impl RoutingMatcher {
     /// Build a matcher from compiled routing data.
+    ///
+    /// The raw LPM tries / domain pattern strings are pre-compiled once into
+    /// [`CompiledIpSet`] / [`CompiledDomainSet`] so runtime matching is O(log N)
+    /// instead of a linear scan over every CIDR / pattern on each evaluation.
     pub fn from_compiled(compiled: &CompiledRouting) -> Self {
         Self {
             match_sets: compiled.match_sets.clone(),
-            lpm_tries: compiled.lpm_tries.clone(),
-            domain_sets: compiled.domain_sets.clone(),
+            compiled_lpm: compiled
+                .lpm_tries
+                .iter()
+                .map(|nets| CompiledIpSet::compile(nets))
+                .collect(),
+            compiled_domains: compiled
+                .domain_sets
+                .iter()
+                .map(|pats| CompiledDomainSet::compile(&domain_strings_to_patterns(pats)))
+                .collect(),
             fallback_outbound: compiled.fallback_outbound,
             fallback_mark: compiled.fallback_mark,
             fallback_must: compiled.fallback_must != 0,
@@ -1512,26 +1526,9 @@ impl RoutingMatcher {
         match ms.r#type {
             t if t == match_type::DOMAIN_SET => {
                 let idx = unsafe { ms.value.index } as usize;
-                if let Some(ref domain) = params.domain {
-                    let domain_lower = domain.to_lowercase();
-                    if idx < self.domain_sets.len() {
-                        self.domain_sets[idx].iter().any(|pattern| {
-                            if let Some((key, pat)) = pattern.split_once(':') {
-                                match key {
-                                    "suffix" | "domain" => {
-                                        domain_lower.ends_with(pat) || domain_lower == pat
-                                    }
-                                    "keyword" | "contains" => domain_lower.contains(pat),
-                                    "full" => domain_lower == pat,
-                                    _ => domain_lower.ends_with(pat) || domain_lower == pat,
-                                }
-                            } else {
-                                domain_lower.ends_with(pattern) || domain_lower == *pattern
-                            }
-                        })
-                    } else {
-                        false
-                    }
+                if let Some(domain) = params.domain.as_deref() {
+                    idx < self.compiled_domains.len()
+                        && self.compiled_domains[idx].matches(domain)
                 } else {
                     // No domain info — check if the destination IP matches domain_routing_map
                     // which would have been populated by DNS response processing.
@@ -1541,13 +1538,11 @@ impl RoutingMatcher {
             }
             t if t == match_type::IP_SET => params.dst_ip.is_some_and(|ip| {
                 let idx = unsafe { ms.value.index } as usize;
-                idx < self.lpm_tries.len()
-                    && self.lpm_tries[idx].iter().any(|cidr| cidr.contains(&ip))
+                idx < self.compiled_lpm.len() && self.compiled_lpm[idx].contains(ip)
             }),
             t if t == match_type::SOURCE_IP_SET => params.src_ip.is_some_and(|ip| {
                 let idx = unsafe { ms.value.index } as usize;
-                idx < self.lpm_tries.len()
-                    && self.lpm_tries[idx].iter().any(|cidr| cidr.contains(&ip))
+                idx < self.compiled_lpm.len() && self.compiled_lpm[idx].contains(ip)
             }),
             t if t == match_type::MAC => {
                 // MAC matching is not available in userspace context
@@ -1597,6 +1592,39 @@ impl RoutingMatcher {
             _ => false,
         }
     }
+}
+
+/// Convert `domain_sets` pattern strings (with a `key:` prefix or bare) into
+/// [`DomainPattern`]s so they can be compiled into a [`CompiledDomainSet`].
+///
+/// Prefix semantics mirror the linear-scan evaluation this compiled set replaces:
+/// `suffix:` / bare → Suffix, `full:` → Full, `keyword:`/`contains:` → Keyword,
+/// `regex:` → Regex, `domain:` → Domain.
+fn domain_strings_to_patterns(patterns: &[String]) -> Vec<DomainPattern> {
+    patterns
+        .iter()
+        .map(|s| {
+            if let Some((key, val)) = s.split_once(':') {
+                let pattern_type = match key {
+                    "full" => DomainPatternType::Full,
+                    "keyword" | "contains" => DomainPatternType::Keyword,
+                    "regex" => DomainPatternType::Regex,
+                    "domain" => DomainPatternType::Domain,
+                    _ => DomainPatternType::Suffix, // "suffix:" and unknown keys
+                };
+                DomainPattern {
+                    pattern_type,
+                    value: val.to_string(),
+                }
+            } else {
+                // Bare value uses suffix semantics (including itself)
+                DomainPattern {
+                    pattern_type: DomainPatternType::Suffix,
+                    value: s.clone(),
+                }
+            }
+        })
+        .collect()
 }
 
 /// Build MatchSet entries for a single function invocation, assigning correct LPM/domain indices.
@@ -2478,22 +2506,23 @@ mod tests {
     /// Build an in-memory cache containing ip_list/domain_list.
     fn make_rule_set_cache() -> RuleSetCache {
         use crate::ruleset::types::{DomainPattern, DomainPatternType, RuleSetData};
+        use std::sync::Arc;
 
         let cache = RuleSetCache::new();
         cache.insert(
             "chinaip".into(),
-            RuleSetData::IpList(vec![
+            RuleSetData::IpList(Arc::new(vec![
                 "1.0.0.0/8".parse().unwrap(),
                 "192.168.0.0/16".parse().unwrap(),
-            ]),
+            ])),
         );
         cache.insert(
             "chinadom".into(),
-            RuleSetData::DomainList(vec![
+            RuleSetData::DomainList(Arc::new(vec![
                 DomainPattern { pattern_type: DomainPatternType::Suffix, value: "baidu.com".into() },
                 DomainPattern { pattern_type: DomainPatternType::Full, value: "google.cn".into() },
                 DomainPattern { pattern_type: DomainPatternType::Suffix, value: "example.cn".into() },
-            ]),
+            ])),
         );
         cache
     }

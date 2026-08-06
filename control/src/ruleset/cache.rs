@@ -97,17 +97,25 @@ impl RuleSetCache {
     }
 
     /// Read the CIDR list for `set:<name>` (type must be `IpList`).
-    pub fn get_set_ips(&self, name: &str) -> Option<Vec<IpNet>> {
-        match self.get(name)? {
-            RuleSetData::IpList(nets) => Some(nets),
+    ///
+    /// Returns a shared [`Arc`] reference so callers avoid deep-cloning the whole
+    /// list on every lookup.
+    pub fn get_set_ips(&self, name: &str) -> Option<Arc<Vec<IpNet>>> {
+        let g = self.inner.read().ok()?;
+        match g.data.get(name)? {
+            RuleSetData::IpList(nets) => Some(Arc::clone(nets)),
             _ => None,
         }
     }
 
     /// Read the domain name pattern list for `set:<name>` (type must be `DomainList`).
-    pub fn get_set_domains(&self, name: &str) -> Option<Vec<DomainPattern>> {
-        match self.get(name)? {
-            RuleSetData::DomainList(pats) => Some(pats),
+    ///
+    /// Returns a shared [`Arc`] reference so callers avoid deep-cloning the whole
+    /// list on every lookup.
+    pub fn get_set_domains(&self, name: &str) -> Option<Arc<Vec<DomainPattern>>> {
+        let g = self.inner.read().ok()?;
+        match g.data.get(name)? {
+            RuleSetData::DomainList(pats) => Some(Arc::clone(pats)),
             _ => None,
         }
     }
@@ -159,7 +167,10 @@ mod tests {
     fn test_cache_insert_get_replace() {
         let cache = RuleSetCache::new();
         assert!(cache.is_empty());
-        cache.insert("chinaip".into(), RuleSetData::IpList(vec!["1.1.1.0/24".parse().unwrap()]));
+        cache.insert(
+            "chinaip".into(),
+            RuleSetData::IpList(Arc::new(vec!["1.1.1.0/24".parse().unwrap()])),
+        );
         assert!(cache.contains("chinaip"));
         assert_eq!(cache.len(), 1);
         assert!(matches!(cache.get("chinaip"), Some(RuleSetData::IpList(_))));
@@ -173,14 +184,14 @@ mod tests {
         let cache = RuleSetCache::new();
         cache.insert(
             "chinaip".into(),
-            RuleSetData::IpList(vec!["10.0.0.0/8".parse().unwrap()]),
+            RuleSetData::IpList(Arc::new(vec!["10.0.0.0/8".parse().unwrap()])),
         );
         cache.insert(
             "chinadom".into(),
-            RuleSetData::DomainList(vec![DomainPattern {
+            RuleSetData::DomainList(Arc::new(vec![DomainPattern {
                 pattern_type: DomainPatternType::Full,
                 value: "google.com".into(),
-            }]),
+            }])),
         );
 
         // Typed set queries
@@ -223,6 +234,10 @@ mod tests {
         let map = load_cache_from_dir(&dir, &entries).await;
         assert!(map.contains_key("chinaip"));
         assert!(!map.contains_key("missing"));
-        assert!(map.get("chinaip").unwrap().clone() == RuleSetData::IpList(vec!["1.1.1.0/24".parse().unwrap(), "2.2.2.2/32".parse().unwrap()]));
+        assert!(map.get("chinaip").unwrap().clone()
+            == RuleSetData::IpList(Arc::new(vec![
+                "1.1.1.0/24".parse().unwrap(),
+                "2.2.2.2/32".parse().unwrap()
+            ])));
     }
 }

@@ -9,14 +9,18 @@
 //! Reference: https://www.v2fly.org/en_US/developer/protocols/vmess.html
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use aes_gcm::aead::generic_array::{GenericArray, typenum::U16};
+use aes_gcm::aead::AeadInPlace as _;
 
 use md5::{Digest as Md5Digest, Md5};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -450,6 +454,7 @@ impl OutboundDialer for VMessDialer {
         let body = VmessBodyStream::new_packet_mode(stream, session, security);
         Ok(Box::new(VMessUdpSession {
             stream: tokio::sync::Mutex::new(body),
+            recv_buf: tokio::sync::Mutex::new(BytesMut::zeroed(65535)),
         }))
     }
 
@@ -545,17 +550,11 @@ fn fnv1a32(data: &[u8]) -> u32 {
 }
 
 fn get_random(buf: &mut [u8]) {
-    // Best effort to fill from system random source; falls back to time+address entropy on failure (only affects encryption strength, does not panic)
+    // Best effort to fill from the OS CSPRNG (getrandom(2)); falls back to
+    // time+address entropy on failure (only affects encryption strength, never panics).
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut ok = false;
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        if f.read_exact(buf).is_ok() {
-            ok = true;
-        }
-    }
-    if !ok {
+    if getrandom::getrandom(buf).is_err() {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -629,22 +628,21 @@ fn encode_address_port(target: &str) -> Result<(Vec<u8>, u16), VMessError> {
     Ok((addr, port))
 }
 
-/// Encode the VMess UDP datagram address: ATYP + ADDR + PORT (1=IPv4, 2=Domain name, 3=IPv6)
-fn encode_packet_addr(host: &str, port: u16) -> Vec<u8> {
+/// Encode the VMess UDP datagram address: ATYP + ADDR + PORT (1=IPv4, 3=IPv6).
+/// Writes the address octets directly, avoiding an intermediate string allocation.
+fn encode_packet_addr(dest: &SocketAddr) -> Vec<u8> {
     let mut addr = Vec::with_capacity(1 + 16 + 2);
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        addr.push(0x01);
-        addr.extend_from_slice(&ip.octets());
-    } else if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
-        addr.push(0x03);
-        addr.extend_from_slice(&ip.octets());
-    } else {
-        let b = host.as_bytes();
-        addr.push(0x02);
-        addr.push(b.len() as u8);
-        addr.extend_from_slice(b);
+    match dest {
+        SocketAddr::V4(v4) => {
+            addr.push(0x01);
+            addr.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            addr.push(0x03);
+            addr.extend_from_slice(&v6.ip().octets());
+        }
     }
-    addr.extend_from_slice(&port.to_be_bytes());
+    addr.extend_from_slice(&dest.port().to_be_bytes());
     addr
 }
 
@@ -895,21 +893,23 @@ pub struct VmessBodyStream {
     packet_mode: bool,
     /// Write direction
     enc_security: u8,
-    enc_key: [u8; 16],
     enc_shake: ShakeSize,
     enc_nonce: ChunkNonce,
-    enc_chacha: bool,
-    write_out: Vec<u8>,
+    /// Cached AEAD cipher (built once at stream creation).
+    enc_cipher: VmessCipher,
+    write_out: BytesMut,
     write_pos: usize,
     write_eof_sent: bool,
     /// Read direction
     dec_security: u8,
-    dec_key: [u8; 16],
     dec_shake: ShakeSize,
     dec_nonce: ChunkNonce,
-    dec_chacha: bool,
-    read_frame: Vec<u8>,
-    read_decoded: Vec<u8>,
+    /// Cached AEAD cipher (built once at stream creation).
+    dec_cipher: VmessCipher,
+    /// Read path: accumulated frame bytes (consumed with `split_to`, no memmove).
+    read_buf: BytesMut,
+    /// Decrypted but unconsumed bytes.
+    read_decoded: BytesMut,
     read_decoded_pos: usize,
     eof: bool,
 }
@@ -942,26 +942,27 @@ impl VmessBodyStream {
             inner,
             packet_mode,
             enc_security: security,
-            enc_key: session.request_body_key,
             enc_shake: ShakeSize::new(&session.request_body_iv),
             enc_nonce: ChunkNonce::new(session.request_body_iv),
-            enc_chacha: security == SEC_CHACHA20_POLY1305,
-            write_out: Vec::new(),
+            enc_cipher: build_vmess_cipher(security, &session.request_body_key),
+            write_out: BytesMut::new(),
             write_pos: 0,
             write_eof_sent: false,
             dec_security: security,
-            dec_key: session.response_body_key,
             dec_shake: ShakeSize::new(&session.response_body_iv),
             dec_nonce: ChunkNonce::new(session.response_body_iv),
-            dec_chacha: security == SEC_CHACHA20_POLY1305,
-            read_frame: Vec::new(),
-            read_decoded: Vec::new(),
+            dec_cipher: build_vmess_cipher(security, &session.response_body_key),
+            read_buf: BytesMut::with_capacity(0x4000),
+            read_decoded: BytesMut::new(),
             read_decoded_pos: 0,
             eof: false,
         }
     }
 
-    fn seal_chunk(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+    /// Seal one chunk into the reusable `write_out` buffer (no per-chunk Vec).
+    fn seal_chunk(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.write_out.clear();
+        self.write_out.reserve(2 + payload.len() + AEAD_TAG + 16);
         let padding = if self.enc_security == SEC_NONE {
             0
         } else {
@@ -969,98 +970,140 @@ impl VmessBodyStream {
         };
         let size = (payload.len() + AEAD_TAG + padding) as u16;
         let mask = self.enc_shake.next_mask();
-        let mut out = Vec::with_capacity(2 + payload.len() + AEAD_TAG + padding);
-        out.extend_from_slice(&(mask ^ size).to_be_bytes());
+        self.write_out.extend_from_slice(&(mask ^ size).to_be_bytes());
 
         if self.enc_security == SEC_NONE {
-            out.extend_from_slice(payload);
+            self.write_out.extend_from_slice(payload);
             // NONE security type still has 0-length tag? v2ray NoOpAuthenticator Overhead=0
         } else {
-            let key = chacha_or_aes_key(&self.enc_key, self.enc_chacha);
             let nonce = self.enc_nonce.next();
-            let ciphertext = aead_seal(&key, &nonce, payload, self.enc_chacha)?;
-            out.extend_from_slice(&ciphertext);
+            aead_seal_into(&self.enc_cipher, &nonce, &mut self.write_out, payload)?;
         }
         // Plaintext padding
         if padding > 0 {
-            let mut pad = vec![0u8; padding];
-            get_random(&mut pad);
-            out.extend_from_slice(&pad);
+            let start = self.write_out.len();
+            self.write_out.resize(start + padding, 0);
+            get_random(&mut self.write_out[start..]);
         }
-        Ok(out)
+        Ok(())
     }
 
-    fn open_chunk(&mut self, ciphertext: &[u8]) -> io::Result<Vec<u8>> {
+    /// Decrypt one chunk in place (`buf` = ciphertext+tag on input, plaintext on output).
+    fn open_chunk(&mut self, buf: &mut BytesMut) -> io::Result<()> {
         if self.dec_security == SEC_NONE {
-            return Ok(ciphertext.to_vec());
+            return Ok(());
         }
-        let key = chacha_or_aes_key(&self.dec_key, self.dec_chacha);
         let nonce = self.dec_nonce.next();
-        aead_open(&key, &nonce, ciphertext, self.dec_chacha)
+        aead_open_in_place(&self.dec_cipher, &nonce, buf)
     }
 
-    /// Try to read need bytes from inner into read_frame
+    /// Try to read need bytes from inner into read_buf (returns Ok(0) if full).
     fn poll_fill_frame(&mut self, cx: &mut Context<'_>, need: usize) -> Poll<io::Result<()>> {
-        while self.read_frame.len() < need {
-            let mut buf = vec![0u8; need - self.read_frame.len()];
-            let mut read_buf = ReadBuf::new(&mut buf);
-            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Ok(())); // EOF; caller checks len
-                    }
-                    self.read_frame.extend_from_slice(&buf[..n]);
+        while self.read_buf.len() < need {
+            self.read_buf.reserve(need - self.read_buf.len());
+            let filled = {
+                let mut rb = ReadBuf::uninit(self.read_buf.spare_capacity_mut());
+                match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => rb.filled().len(),
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            };
+            if filled == 0 {
+                return Poll::Ready(Ok(())); // EOF; caller checks len
             }
+            // SAFETY: `rb` was created over `read_buf`'s spare capacity and
+            // `poll_read` initialized exactly `filled` bytes.
+            unsafe { self.read_buf.set_len(self.read_buf.len() + filled) };
         }
         Poll::Ready(Ok(()))
     }
 }
 
-fn chacha_or_aes_key(key: &[u8; 16], chacha: bool) -> Vec<u8> {
-    if chacha {
-        // GenerateChacha20Poly1305Key = SHA-256(key)
-        sha2::Sha256::digest(key).to_vec()
-    } else {
-        key.to_vec()
+/// Cached AEAD cipher for chunk sealing/opening (built once per stream).
+enum VmessCipher {
+    Aes(aes_gcm::Aes128Gcm),
+    Chacha(chacha20poly1305::ChaCha20Poly1305),
+}
+
+impl VmessCipher {
+    /// Encrypt `buffer` in place (detached tag returned), reusing the allocation.
+    fn seal(
+        &self,
+        nonce: &[u8; 12],
+        buffer: &mut [u8],
+    ) -> io::Result<GenericArray<u8, U16>> {
+        match self {
+            VmessCipher::Aes(c) => c
+                .encrypt_in_place_detached(nonce.into(), b"", buffer)
+                .map_err(|_| io::Error::other("vmess: aes seal failed")),
+            VmessCipher::Chacha(c) => c
+                .encrypt_in_place_detached(nonce.into(), b"", buffer)
+                .map_err(|_| io::Error::other("vmess: chacha seal failed")),
+        }
+    }
+
+    /// Decrypt `buffer` in place using the trailing AEAD `tag`.
+    fn open(
+        &self,
+        nonce: &[u8; 12],
+        buffer: &mut [u8],
+        tag: &GenericArray<u8, U16>,
+    ) -> io::Result<()> {
+        match self {
+            VmessCipher::Aes(c) => c
+                .decrypt_in_place_detached(nonce.into(), b"", buffer, tag)
+                .map_err(|_| io::Error::other("vmess: aes open failed")),
+            VmessCipher::Chacha(c) => c
+                .decrypt_in_place_detached(nonce.into(), b"", buffer, tag)
+                .map_err(|_| io::Error::other("vmess: chacha open failed")),
+        }
     }
 }
 
-fn aead_seal(key: &[u8], nonce: &[u8; 12], plain: &[u8], chacha: bool) -> io::Result<Vec<u8>> {
-    if chacha {
-        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
-        let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|e| io::Error::other(e.to_string()))?;
-        cipher
-            .encrypt(nonce.into(), plain)
-            .map_err(|_| io::Error::other("chacha seal failed"))
+/// Build the AEAD cipher for a security type. ChaCha20-Poly1305 derives its
+/// 32-byte key as SHA-256(body key); AES-128-GCM uses the 16-byte key directly.
+fn build_vmess_cipher(security: u8, key: &[u8; 16]) -> VmessCipher {
+    use aes_gcm::{Aes128Gcm, KeyInit as _};
+    use chacha20poly1305::ChaCha20Poly1305;
+    if security == SEC_CHACHA20_POLY1305 {
+        let cipher = ChaCha20Poly1305::new_from_slice(&sha2::Sha256::digest(key))
+            .expect("32-byte chacha key");
+        VmessCipher::Chacha(cipher)
     } else {
-        use aes_gcm::{Aes128Gcm, KeyInit, Nonce as GcmNonce};
-        use aes_gcm::aead::Aead;
-        let cipher = Aes128Gcm::new_from_slice(key).map_err(|e| io::Error::other(e.to_string()))?;
-        cipher
-            .encrypt(GcmNonce::from_slice(nonce), plain)
-            .map_err(|_| io::Error::other("aes-gcm seal failed"))
+        let cipher = Aes128Gcm::new_from_slice(key).expect("16-byte aes key");
+        VmessCipher::Aes(cipher)
     }
 }
 
-fn aead_open(key: &[u8], nonce: &[u8; 12], ciphertext: &[u8], chacha: bool) -> io::Result<Vec<u8>> {
-    if chacha {
-        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
-        let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|e| io::Error::other(e.to_string()))?;
-        cipher
-            .decrypt(nonce.into(), ciphertext)
-            .map_err(|_| io::Error::other("chacha open failed"))
-    } else {
-        use aes_gcm::{Aes128Gcm, KeyInit, Nonce as GcmNonce};
-        use aes_gcm::aead::Aead;
-        let cipher = Aes128Gcm::new_from_slice(key).map_err(|e| io::Error::other(e.to_string()))?;
-        cipher
-            .decrypt(GcmNonce::from_slice(nonce), ciphertext)
-            .map_err(|_| io::Error::other("aes-gcm open failed"))
+/// In-place AEAD seal: appends `ciphertext + tag` to `out` (no intermediate Vec).
+fn aead_seal_into(
+    cipher: &VmessCipher,
+    nonce: &[u8; 12],
+    out: &mut BytesMut,
+    plain: &[u8],
+) -> io::Result<()> {
+    out.extend_from_slice(plain);
+    let tag = cipher.seal(nonce, &mut out[..])?;
+    out.extend_from_slice(&tag);
+    Ok(())
+}
+
+/// In-place AEAD open: decrypts `buf` (ciphertext + tag) and truncates the tag.
+fn aead_open_in_place(
+    cipher: &VmessCipher,
+    nonce: &[u8; 12],
+    buf: &mut BytesMut,
+) -> io::Result<()> {
+    if buf.len() < AEAD_TAG {
+        return Err(io::Error::other("vmess: ciphertext too short"));
     }
+    let tag_pos = buf.len() - AEAD_TAG;
+    let (data, tag_bytes) = buf.split_at_mut(tag_pos);
+    let tag = GenericArray::clone_from_slice(&tag_bytes[..AEAD_TAG]);
+    cipher.open(nonce, data, &tag)?;
+    buf.truncate(tag_pos);
+    Ok(())
 }
 
 impl AsyncRead for VmessBodyStream {
@@ -1092,13 +1135,13 @@ impl AsyncRead for VmessBodyStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {}
             }
-            if self.read_frame.len() < 2 {
+            if self.read_buf.len() < 2 {
                 self.eof = true;
                 return Poll::Ready(Ok(()));
             }
             let mask = self.dec_shake.next_mask();
-            let size = u16::from_be_bytes([self.read_frame[0], self.read_frame[1]]) ^ mask;
-            self.read_frame.drain(..2);
+            let size = u16::from_be_bytes([self.read_buf[0], self.read_buf[1]]) ^ mask;
+            let _ = self.read_buf.split_to(2);
             if size == 0 {
                 self.eof = true;
                 return Poll::Ready(Ok(()));
@@ -1121,19 +1164,20 @@ impl AsyncRead for VmessBodyStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {}
             }
-            if self.read_frame.len() < size as usize {
+            if self.read_buf.len() < size as usize {
                 self.eof = true;
                 return Poll::Ready(Ok(()));
             }
-            let chunk: Vec<u8> = self.read_frame.drain(..size as usize).collect();
-            let payload = self.open_chunk(&chunk[..encrypted_len])?;
-            // Discard padding (chunk[encrypted_len..])
+            // Zero-copy chunk view; drop the plaintext padding, then decrypt in place.
+            let mut chunk = self.read_buf.split_to(size as usize);
+            chunk.truncate(encrypted_len);
+            self.open_chunk(&mut chunk)?;
 
-            if buf.remaining() >= payload.len() {
-                buf.put_slice(&payload);
+            if buf.remaining() >= chunk.len() {
+                buf.put_slice(&chunk);
                 return Poll::Ready(Ok(()));
             }
-            self.read_decoded = payload;
+            self.read_decoded = chunk;
             self.read_decoded_pos = 0;
             let n = buf.remaining();
             buf.put_slice(&self.read_decoded[..n]);
@@ -1170,11 +1214,9 @@ impl AsyncWrite for VmessBodyStream {
         } else {
             buf.len().min(BODY_CHUNK_SIZE)
         };
-        let framed = match self.seal_chunk(&buf[..chunk_len]) {
-            Ok(f) => f,
-            Err(e) => return Poll::Ready(Err(e)),
-        };
-        self.write_out = framed;
+        if let Err(e) = self.seal_chunk(&buf[..chunk_len]) {
+            return Poll::Ready(Err(e));
+        }
         self.write_pos = 0;
         match self.poll_flush(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(chunk_len)),
@@ -1218,7 +1260,7 @@ impl AsyncWrite for VmessBodyStream {
             match Pin::new(&mut self.inner).poll_write(cx, &eof) {
                 Poll::Pending => {
                     // Save bytes to send, continue on next poll_shutdown
-                    self.write_out = eof.to_vec();
+                    self.write_out = BytesMut::from(&eof[..]);
                     self.write_pos = 0;
                     return Poll::Pending;
                 }
@@ -1235,15 +1277,22 @@ impl AsyncWrite for VmessBodyStream {
 // TLS support (WSS)
 // ============================================================================
 
-/// Create TLS connector (same root certificate store as Trojan)
+/// Cached TLS client config (avoids re-cloning the webpki root store per dial).
+static TLS_CLIENT_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+
+/// Create TLS connector (config is cached and shared across dials).
 #[allow(dead_code)]
 fn tls_connector(_sni: &str) -> Result<TlsConnector, VMessError> {
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    Ok(TlsConnector::from(Arc::new(config)))
+    let config = TLS_CLIENT_CONFIG.get_or_init(|| {
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
+    });
+    Ok(TlsConnector::from(config.clone()))
 }
 
 #[allow(dead_code)]
@@ -1266,6 +1315,8 @@ async fn tls_upgrade(
 /// `[mask length][AEAD(ATYP + ADDR + PORT + LEN(2) + PAYLOAD)]`.
 pub struct VMessUdpSession {
     stream: tokio::sync::Mutex<VmessBodyStream>,
+    /// Reused receive buffer (avoids a per-datagram 64 KiB allocation).
+    recv_buf: tokio::sync::Mutex<BytesMut>,
 }
 
 #[async_trait]
@@ -1273,7 +1324,7 @@ impl crate::UdpSession for VMessUdpSession {
     async fn send(&self, dest: &std::net::SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
         // [atyp][addr][port(2)][len(2)][payload] written as one chunk
         let mut pkt = Vec::with_capacity(1 + 16 + 2 + 2 + payload.len());
-        pkt.extend_from_slice(&encode_packet_addr(&dest.ip().to_string(), dest.port()));
+        pkt.extend_from_slice(&encode_packet_addr(dest));
         pkt.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         pkt.extend_from_slice(payload);
         use tokio::io::AsyncWriteExt;
@@ -1282,9 +1333,10 @@ impl crate::UdpSession for VMessUdpSession {
         Ok(())
     }
 
-    async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Vec<u8>)> {
+    async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Bytes)> {
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 65535];
+        let mut buf = self.recv_buf.lock().await;
+        buf.resize(65535, 0);
         let mut stream = self.stream.lock().await;
         let n = stream.read(&mut buf).await?;
         let (dest, consumed) = decode_packet_addr(&buf[..n])?;
@@ -1295,7 +1347,10 @@ impl crate::UdpSession for VMessUdpSession {
         if n < consumed + 2 + pkt_len {
             return Err(anyhow::anyhow!("vmess udp: truncated payload"));
         }
-        Ok((dest, buf[consumed + 2..consumed + 2 + pkt_len].to_vec()))
+        Ok((
+            dest,
+            Bytes::copy_from_slice(&buf[consumed + 2..consumed + 2 + pkt_len]),
+        ))
     }
 }
 
@@ -1618,13 +1673,14 @@ mod tests {
         let mask = shake.next_mask();
         let padding = shake.next_padding() as usize;
         let size = (plain.len() + AEAD_TAG + padding) as u16;
-        let key = chacha_or_aes_key(&session.response_body_key, false);
+        let cipher = build_vmess_cipher(SEC_AES128_GCM, &session.response_body_key);
         let nonce = ChunkNonce::new(session.response_body_iv).next();
-        let ciphertext = aead_seal(&key, &nonce, plain, false).unwrap();
+        let mut ct = BytesMut::new();
+        aead_seal_into(&cipher, &nonce, &mut ct, plain).unwrap();
 
         let mut chunk = Vec::new();
         chunk.extend_from_slice(&(size ^ mask).to_be_bytes());
-        chunk.extend_from_slice(&ciphertext);
+        chunk.extend_from_slice(&ct);
         chunk.resize(chunk.len() + padding, 0);
 
         let inner = Box::new(ChunkedReader {

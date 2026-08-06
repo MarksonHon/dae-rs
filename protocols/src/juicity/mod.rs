@@ -10,11 +10,12 @@
 //! (address types per daeuniverse/outbound implementation: IPv4=1, Domain=3, IPv6=4)
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -26,6 +27,23 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::{OutboundDialer, ProxyConn};
+
+/// Cached base TLS client config (avoids re-cloning the webpki root store per dial).
+static TLS_CLIENT_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+
+/// Return the cached base TLS config; per-dialer fields (ALPN, early data) are
+/// cloned and customized by the caller.
+fn base_tls_config() -> &'static Arc<ClientConfig> {
+    TLS_CLIENT_CONFIG.get_or_init(|| {
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
+    })
+}
 
 /// Juicity protocol version
 const JUICITY_VERSION: u8 = 0x00;
@@ -158,7 +176,9 @@ impl JuicityDialer {
     async fn get_connection(&self) -> Result<quinn::Connection, JuicityError> {
         // ── 1. Quick check: reuse an existing connection if possible ──
         {
-            let guard = self.state.lock().await;
+            let mut guard = self.state.lock().await;
+            // Prune closed connections so the pool cannot grow without bound.
+            guard.retain(|s| s.conn.close_reason().is_none());
             for state in guard.iter() {
                 if state.conn.close_reason().is_none()
                     && state.stream_count.load(Ordering::Relaxed) < MAX_STREAMS_PER_CONN
@@ -172,11 +192,7 @@ impl JuicityDialer {
         //    Done *without* holding the state Mutex so that other tasks can
         //    proceed (or at least not be blocked by a held guard) while this
         //    potentially slow operation runs.
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut crypto = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let mut crypto = base_tls_config().as_ref().clone();
         crypto.alpn_protocols = vec![JUICITY_ALPN.to_vec()];
         crypto.enable_early_data = true;
 
@@ -236,6 +252,8 @@ impl JuicityDialer {
         // ── 3. Re-acquire lock and store the new connection ──
         {
             let mut guard = self.state.lock().await;
+            // Prune closed connections so the pool cannot grow without bound.
+            guard.retain(|s| s.conn.close_reason().is_none());
             // Double-check: another task may have created a usable connection
             // while we were connecting. If so, prefer reusing it and let ours
             // be garbage-collected when `endpoint` is dropped.
@@ -289,9 +307,22 @@ fn encode_proxy_header(target: &str) -> Result<Vec<u8>, JuicityError> {
     encode_header(NETWORK_TCP, host, port)
 }
 
-/// Encode Juicity datagram header: [network][addr_type][address][port][len(2)]
-fn encode_packet_header(network: u8, host: &str, port: u16, payload_len: usize) -> Vec<u8> {
-    let mut header = encode_header(network, host, port).expect("valid addr");
+/// Encode Juicity datagram header: [network][addr_type][address][port][len(2)].
+/// Writes the address octets directly, avoiding an intermediate string allocation.
+fn encode_packet_header(network: u8, dest: &SocketAddr, payload_len: usize) -> Vec<u8> {
+    let mut header = Vec::with_capacity(2 + 16 + 2 + 2);
+    header.push(network);
+    match dest {
+        SocketAddr::V4(v4) => {
+            header.push(ADDR_IPV4);
+            header.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            header.push(ADDR_IPV6);
+            header.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    header.extend_from_slice(&dest.port().to_be_bytes());
     header.extend_from_slice(&(payload_len as u16).to_be_bytes());
     header
 }
@@ -507,8 +538,7 @@ pub struct JuicityUdpSession {
 impl crate::UdpSession for JuicityUdpSession {
     async fn send(&self, dest: &SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
         // [network=3][addr_type][address][port(2)][len(2)][payload]
-        let mut datagram =
-            encode_packet_header(NETWORK_UDP, &dest.ip().to_string(), dest.port(), payload.len());
+        let mut datagram = encode_packet_header(NETWORK_UDP, dest, payload.len());
         datagram.extend_from_slice(payload);
         let mut send = self.send.lock().await;
         send.write_all(&datagram)
@@ -517,7 +547,7 @@ impl crate::UdpSession for JuicityUdpSession {
         Ok(())
     }
 
-    async fn recv(&self) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
+    async fn recv(&self) -> anyhow::Result<(SocketAddr, Bytes)> {
         let mut recv = self.recv.lock().await;
 
         // network(1)
@@ -571,7 +601,7 @@ impl crate::UdpSession for JuicityUdpSession {
         let pkt_len = u16::from_be_bytes(lenb) as usize;
         let mut payload = vec![0u8; pkt_len];
         recv.read_exact(&mut payload).await?;
-        Ok((dest, payload))
+        Ok((dest, Bytes::from(payload)))
     }
 }
 

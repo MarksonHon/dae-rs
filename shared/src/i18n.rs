@@ -5,6 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::OnceLock;
+
+/// Process-wide language cache.
+///
+/// The `DAE_RS_LANG` environment variable is read exactly once on first
+/// access (process startup) and cached, avoiding repeated env lookups.
+static LANG: OnceLock<Lang> = OnceLock::new();
 
 /// Supported languages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,13 +22,25 @@ pub enum Lang {
     Zh,
 }
 
+impl Lang {
+    /// Return the cached, process-wide language.
+    ///
+    /// The language is resolved once from the `DAE_RS_LANG` environment
+    /// variable on the first call and reused for the lifetime of the process.
+    pub fn current() -> Self {
+        *LANG.get_or_init(|| {
+            // Check DAE_RS_LANG env var, default to English
+            match std::env::var("DAE_RS_LANG").as_deref() {
+                Ok("zh" | "zh-CN" | "zh_SG" | "zh_CN") => Lang::Zh,
+                _ => Lang::En,
+            }
+        })
+    }
+}
+
 impl Default for Lang {
     fn default() -> Self {
-        // Check DAE_RS_LANG env var, default to English
-        match std::env::var("DAE_RS_LANG").as_deref() {
-            Ok("zh" | "zh-CN" | "zh_SG" | "zh_CN") => Lang::Zh,
-            _ => Lang::En,
-        }
+        Lang::current()
     }
 }
 
@@ -49,7 +68,8 @@ impl Msg {
 
 impl fmt::Display for Msg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let lang = Lang::default();
+        // Use the cached, process-wide language (resolved once at startup).
+        let lang = Lang::current();
         write!(f, "{}", self.render(lang))
     }
 }

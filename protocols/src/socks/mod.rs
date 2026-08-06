@@ -7,6 +7,7 @@
 //! - UDP ASSOCIATE (UDP relay)
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -855,7 +856,10 @@ impl OutboundDialer for Socks5Dialer {
     /// Establish SOCKS5 UDP ASSOCIATE session
     async fn udp_dial(&self) -> anyhow::Result<Box<dyn crate::UdpSession>> {
         let session = self.udp_associate().await?;
-        Ok(Box::new(SocksUdpSession { session }))
+        Ok(Box::new(SocksUdpSession {
+            session,
+            recv_buf: Mutex::new(BytesMut::zeroed(MAX_UDP_PACKET_SIZE)),
+        }))
     }
 
     /// Return protocol name
@@ -877,6 +881,8 @@ impl OutboundDialer for Socks5Dialer {
 /// Receive: parse SOCKS5 UDP response header, return original target address + payload.
 pub struct SocksUdpSession {
     session: UdpAssociateSession,
+    /// Reused receive buffer (avoids a per-datagram 64 KiB allocation).
+    recv_buf: Mutex<BytesMut>,
 }
 
 #[async_trait]
@@ -894,8 +900,9 @@ impl crate::UdpSession for SocksUdpSession {
         Ok(())
     }
 
-    async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Vec<u8>)> {
-        let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
+    async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Bytes)> {
+        let mut buf = self.recv_buf.lock().await;
+        buf.resize(MAX_UDP_PACKET_SIZE, 0);
         loop {
             let len = self.session.udp.recv(&mut buf).await?;
             if let Some((dest, offset)) =
@@ -907,7 +914,7 @@ impl crate::UdpSession for SocksUdpSession {
                     response_len = len - offset,
                     "SOCKS5 UDP relay response received"
                 );
-                return Ok((dest, buf[offset..len].to_vec()));
+                return Ok((dest, Bytes::copy_from_slice(&buf[offset..len])));
             }
             // Non-SOCKS5 UDP packets (like fragments), ignore and retry
         }

@@ -28,6 +28,12 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
+/// Reusable "any address, port 0" bind addresses (avoid per-call string parsing).
+const BIND_ANY_V4: SocketAddr =
+    SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+const BIND_ANY_V6: SocketAddr =
+    SocketAddr::V6(std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0));
+
 // ── dae-rs self-traffic dedicated socket (the "must direct connect" convention) ──
 
 /// dae-rs self-traffic dedicated socket configuration.
@@ -295,9 +301,9 @@ pub fn create_udp(
         }
 
         let bind_addr: SocketAddr = if addr.is_ipv4() {
-            "0.0.0.0:0".parse().expect("valid bind addr")
+            BIND_ANY_V4
         } else {
-            "[::]:0".parse().expect("valid bind addr")
+            BIND_ANY_V6
         };
         let sock_addr = socket2::SockAddr::from(bind_addr);
         if unsafe {

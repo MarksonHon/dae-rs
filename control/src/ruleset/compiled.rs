@@ -362,9 +362,11 @@ pub enum CompiledRuleSet {
 /// Build the compiled matching view for a parsed rule set.
 pub fn compile_rule_set(data: &RuleSetData) -> CompiledRuleSet {
     match data {
-        RuleSetData::IpList(nets) => CompiledRuleSet::IpList(CompiledIpSet::compile(nets)),
+        RuleSetData::IpList(nets) => {
+            CompiledRuleSet::IpList(CompiledIpSet::compile(nets.as_slice()))
+        }
         RuleSetData::DomainList(pats) => {
-            CompiledRuleSet::DomainList(CompiledDomainSet::compile(pats))
+            CompiledRuleSet::DomainList(CompiledDomainSet::compile(pats.as_slice()))
         }
     }
 }
@@ -441,6 +443,7 @@ pub fn load_rule_set_data_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::ruleset::refparse::{match_domain_pattern, match_domain_patterns};
     use std::collections::HashMap;
 
@@ -534,14 +537,16 @@ mod tests {
     #[test]
     fn test_compile_rule_set_variants() {
         assert!(matches!(
-            compile_rule_set(&RuleSetData::IpList(vec!["1.0.1.0/24".parse().unwrap()])),
+            compile_rule_set(&RuleSetData::IpList(Arc::new(vec![
+                "1.0.1.0/24".parse().unwrap()
+            ]))),
             CompiledRuleSet::IpList(_)
         ));
         assert!(matches!(
-            compile_rule_set(&RuleSetData::DomainList(vec![pat(
+            compile_rule_set(&RuleSetData::DomainList(Arc::new(vec![pat(
                 DomainPatternType::Suffix,
                 "baidu.com"
-            )])),
+            )]))),
             CompiledRuleSet::DomainList(_)
         ));
     }
@@ -552,7 +557,7 @@ mod tests {
     fn test_binary_cache_roundtrip_and_sha_guard() {
         // Serialize+deserialize the cache file through bincode, and verify the
         // sha256 guard rejects a mismatched source.
-        let data = RuleSetData::IpList(vec!["1.0.1.0/24".parse().unwrap()]);
+        let data = RuleSetData::IpList(Arc::new(vec!["1.0.1.0/24".parse().unwrap()]));
         let file = RuleSetCacheFile {
             source_sha: "abc".to_string(),
             data: data.clone(),
@@ -562,9 +567,10 @@ mod tests {
         assert_eq!(back.data, data);
         assert_eq!(back.source_sha, "abc");
         // The cache file struct round-trips arbitrary parsed rule set data.
-        let domain_list = RuleSetData::DomainList(vec![
-            pat(DomainPatternType::Suffix, "baidu.com"),
-        ]);
+        let domain_list = RuleSetData::DomainList(Arc::new(vec![pat(
+            DomainPatternType::Suffix,
+            "baidu.com",
+        )]));
         let f2 = RuleSetCacheFile {
             source_sha: "def".to_string(),
             data: domain_list,

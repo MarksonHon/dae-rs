@@ -11,6 +11,7 @@
 //! Reference: https://shadowsocks.org/doc/sip022.html
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -234,6 +235,24 @@ fn encode_addr(host: &str, port: u16) -> Result<Vec<u8>, ShadowsocksError> {
     Ok(addr)
 }
 
+/// Encode Shadowsocks address from a `SocketAddr`: ATYP + ADDR + PORT (1=IPv4, 4=IPv6).
+/// Writes the address octets directly, avoiding an intermediate string allocation.
+fn encode_socket_addr(dest: &SocketAddr) -> Result<Vec<u8>, ShadowsocksError> {
+    let mut addr = Vec::with_capacity(1 + 16 + 2);
+    match dest {
+        SocketAddr::V4(v4) => {
+            addr.push(0x01);
+            addr.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            addr.push(0x04);
+            addr.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    addr.extend_from_slice(&dest.port().to_be_bytes());
+    Ok(addr)
+}
+
 /// Decode Shadowsocks address, return `(SocketAddr, bytes consumed)`.
 /// Domain names resolve to 0.0.0.0:port (the port is preserved when the address
 /// cannot be resolved in a DNS-free scenario).
@@ -292,9 +311,9 @@ impl OutboundDialer for ShadowsocksDialer {
         let framed = cipher.frame_packet(&target_addr)?;
         // [DEBUG] Temporary debug log: to locate "length tag verification failed", prints the
         // target, the address header hex and the first-frame prefix hex (for comparison against
-        // sslocal packet captures)
+        // sslocal packet captures). Kept at trace level so it is off by default.
         let first_frame_prefix32 = framed.iter().take(32).copied().collect::<Vec<_>>();
-        tracing::debug!(
+        tracing::trace!(
             "shadowsocks debug dial: target={} encode_address={} salt={} first_frame_prefix32={}",
             target,
             hex::encode(&target_addr),
@@ -333,6 +352,7 @@ impl OutboundDialer for ShadowsocksDialer {
             is_2022: kind.is_aead_2022(),
             client_session_id: random_session_id(),
             packet_id: std::sync::atomic::AtomicU64::new(0),
+            recv_buf: tokio::sync::Mutex::new(BytesMut::zeroed(65535)),
         }))
     }
 
@@ -375,6 +395,8 @@ struct SsUdpSession {
     client_session_id: u64,
     /// Per-packet monotonically increasing ID (2022).
     packet_id: std::sync::atomic::AtomicU64,
+    /// Reused receive buffer (avoids a per-datagram 64 KiB allocation).
+    recv_buf: tokio::sync::Mutex<BytesMut>,
 }
 
 const SS_UDP_TAG_LEN: usize = 16;
@@ -391,7 +413,7 @@ impl SsUdpSession {
         let mut salt = vec![0u8; self.kind.salt_len()];
         random_iv_or_salt(&mut salt);
 
-        let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
+        let addr = encode_socket_addr(dest)?;
         let mut pkt = vec![0u8; addr.len() + payload.len() + SS_UDP_TAG_LEN];
         pkt[..addr.len()].copy_from_slice(&addr);
         pkt[addr.len()..addr.len() + payload.len()].copy_from_slice(payload);
@@ -410,7 +432,7 @@ impl SsUdpSession {
         dest: &std::net::SocketAddr,
         payload: &[u8],
     ) -> Result<Vec<u8>, ShadowsocksError> {
-        let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
+        let addr = encode_socket_addr(dest)?;
         let packet_id = self.packet_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -626,13 +648,15 @@ impl crate::UdpSession for SsUdpSession {
         Ok(())
     }
 
-    async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Vec<u8>)> {
-        let mut buf = vec![0u8; 65535];
+    async fn recv(&self) -> anyhow::Result<(std::net::SocketAddr, Bytes)> {
+        let mut buf = self.recv_buf.lock().await;
+        buf.resize(65535, 0);
         let len = self.socket.recv(&mut buf).await?;
         if self.is_2022 {
-            return self
+            let (dest, payload) = self
                 .recv_2022(&buf[..len])
-                .map_err(|e| anyhow::anyhow!("ss udp 2022: recv failed: {}", e));
+                .map_err(|e| anyhow::anyhow!("ss udp 2022: recv failed: {}", e))?;
+            return Ok((dest, Bytes::from(payload)));
         }
 
         // Legacy AEAD: [salt][AEAD(addr + payload + tag)]
@@ -651,8 +675,7 @@ impl crate::UdpSession for SsUdpSession {
         }
         let data = &data[..data.len() - tag_len];
         let (dest, consumed) = decode_addr(data)?;
-        let payload = data[consumed..].to_vec();
-        Ok((dest, payload))
+        Ok((dest, Bytes::copy_from_slice(&data[consumed..])))
     }
 }
 
@@ -744,12 +767,12 @@ pub struct SsStream {
     /// Write path output buffer (framed ciphertext)
     write_out: Vec<u8>,
     write_pos: usize,
-    /// Read path: accumulated frame bytes
-    read_frame: Vec<u8>,
+    /// Read path: accumulated frame bytes (consumed with `split_to`, no memmove)
+    read_buf: BytesMut,
     /// Payload length to read (None = currently reading length frame)
     read_payload_len: Option<usize>,
     /// Decrypted but unconsumed bytes
-    read_decoded: Vec<u8>,
+    read_decoded: BytesMut,
     read_decoded_pos: usize,
     eof: bool,
 }
@@ -771,30 +794,35 @@ impl SsStream {
             debug_server_salt: Vec::new(),
             write_out: Vec::new(),
             write_pos: 0,
-            read_frame: Vec::new(),
+            read_buf: BytesMut::with_capacity(0x4000),
             read_payload_len: None,
-            read_decoded: Vec::new(),
+            read_decoded: BytesMut::new(),
             read_decoded_pos: 0,
             eof: false,
         }
     }
 
-    /// Try to read n bytes from inner into read_frame (returns Ok(0) if full)
+    /// Try to read n bytes from inner into read_buf (returns Ok(0) if full).
+    ///
+    /// Reads directly into the uninitialized spare capacity of `read_buf`,
+    /// avoiding a temporary Vec allocation on every poll.
     fn poll_fill_frame(&mut self, cx: &mut Context<'_>, need: usize) -> Poll<io::Result<()>> {
-        while self.read_frame.len() < need {
-            let mut buf = vec![0u8; need - self.read_frame.len()];
-            let mut read_buf = ReadBuf::new(&mut buf);
-            match Pin::new(&mut self.inner).poll_read(cx, &mut read_buf) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(())) => {
-                    let n = read_buf.filled().len();
-                    if n == 0 {
-                        return Poll::Ready(Ok(())); // EOF; caller checks len
-                    }
-                    self.read_frame.extend_from_slice(&buf[..n]);
+        while self.read_buf.len() < need {
+            self.read_buf.reserve(need - self.read_buf.len());
+            let filled = {
+                let mut rb = ReadBuf::uninit(self.read_buf.spare_capacity_mut());
+                match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => rb.filled().len(),
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            };
+            if filled == 0 {
+                return Poll::Ready(Ok(())); // EOF; caller checks len
             }
+            // SAFETY: `rb` was created over `read_buf`'s spare capacity and
+            // `poll_read` initialized exactly `filled` bytes.
+            unsafe { self.read_buf.set_len(self.read_buf.len() + filled) };
         }
         Poll::Ready(Ok(()))
     }
@@ -831,12 +859,12 @@ impl AsyncRead for SsStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {}
             }
-            if self.read_frame.len() < salt_len {
+            if self.read_buf.len() < salt_len {
                 self.eof = true;
                 return Poll::Ready(Ok(()));
             }
-            let server_salt: Vec<u8> = self.read_frame.drain(..salt_len).collect();
-            self.debug_server_salt = server_salt.clone();
+            let server_salt = self.read_buf.split_to(salt_len);
+            self.debug_server_salt = server_salt.to_vec();
             self.dec = Some(match self.kind.category() {
                 CipherCategory::Aead => SsCipher::Legacy(V1Cipher::new(
                     self.kind,
@@ -850,8 +878,9 @@ impl AsyncRead for SsStream {
                 )),
                 _ => unreachable!(),
             });
-            // [DEBUG] Temporary debug log: prints the server salt hex and peer addr
-            tracing::info!(
+            // [DEBUG] Temporary debug log: prints the server salt hex and peer addr.
+            // Kept at trace level so it is off by default.
+            tracing::trace!(
                 "shadowsocks debug server_salt: salt={} peer={:?}",
                 hex::encode(&self.debug_server_salt),
                 self.inner.peer_addr(),
@@ -875,15 +904,14 @@ impl AsyncRead for SsStream {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Ready(Ok(())) => {}
                 }
-                if self.read_frame.len() < need_payload {
+                if self.read_buf.len() < need_payload {
                     // EOF: incomplete payload frame
                     self.eof = true;
                     return Poll::Ready(Ok(()));
                 }
 
-                let mut payload = vec![0u8; payload_len + self.tag];
-                payload.copy_from_slice(&self.read_frame[..need_payload]);
-                self.read_frame.drain(..need_payload);
+                // Zero-copy view of the payload ciphertext (no Vec allocation).
+                let mut payload = self.read_buf.split_to(need_payload);
                 if !self
                     .dec
                     .as_mut()
@@ -913,15 +941,16 @@ impl AsyncRead for SsStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {}
             }
-            if self.read_frame.len() < need_len_frame {
+            if self.read_buf.len() < need_len_frame {
                 // EOF: incomplete length frame
                 self.eof = true;
                 return Poll::Ready(Ok(()));
             }
 
-            // Decrypt length frame: complete ciphertext = 2-byte length + tag (in-place decryption requires full frame input)
-            let mut len_buf = vec![0u8; need_len_frame];
-            len_buf.copy_from_slice(&self.read_frame[..need_len_frame]);
+            // Decrypt length frame: complete ciphertext = 2-byte length + tag.
+            // Snapshot the ciphertext for the debug log before consuming it.
+            let debug_len_frame_hex = hex::encode(&self.read_buf[..need_len_frame]);
+            let mut len_buf = self.read_buf.split_to(need_len_frame);
             if !self
                 .dec
                 .as_mut()
@@ -929,8 +958,7 @@ impl AsyncRead for SsStream {
                 .decrypt_packet(&mut len_buf)
             {
                 // [DEBUG] Temporary debug log: on failure `len_buf` has already been overwritten
-                // in place by decrypt, so print the original bytes from self.read_frame
-                let debug_len_frame_hex = hex::encode(&self.read_frame[..need_len_frame]);
+                // in place by decrypt, so print the original bytes from the snapshot
                 tracing::info!(
                     "shadowsocks debug length_tag_verify_failed: len_frame={} server_salt={} peer={:?} tag={} salt_len={}",
                     debug_len_frame_hex,
@@ -941,7 +969,6 @@ impl AsyncRead for SsStream {
                 );
                 return Poll::Ready(Err(io::Error::other("shadowsocks: length tag verification failed")));
             }
-            self.read_frame.drain(..need_len_frame);
             let payload_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
             if payload_len == 0 {
                 self.eof = true;
@@ -958,14 +985,12 @@ impl AsyncRead for SsStream {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Ready(Ok(())) => {}
             }
-            if self.read_frame.len() < need_payload {
+            if self.read_buf.len() < need_payload {
                 self.eof = true;
                 return Poll::Ready(Ok(()));
             }
 
-            let mut payload = vec![0u8; payload_len + self.tag];
-            payload.copy_from_slice(&self.read_frame[..need_payload]);
-            self.read_frame.drain(..need_payload);
+            let mut payload = self.read_buf.split_to(need_payload);
             if !self
                 .dec
                 .as_mut()
@@ -1337,6 +1362,7 @@ mod tests {
             is_2022: true,
             client_session_id: 0xdead_beef_cafe_babe,
             packet_id: std::sync::atomic::AtomicU64::new(0),
+            recv_buf: tokio::sync::Mutex::new(BytesMut::zeroed(65535)),
         }
     }
 
@@ -1407,7 +1433,7 @@ mod tests {
         dest: &SocketAddr,
         payload: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        let addr = encode_addr(&dest.ip().to_string(), dest.port())?;
+        let addr = encode_socket_addr(dest)?;
         let server_session_id = 0x1111_2222_3333_4444u64;
         let packet_id = 1u64;
         let now = std::time::SystemTime::now()
@@ -1516,6 +1542,7 @@ mod tests {
                 is_2022: false,
                 client_session_id: 0,
                 packet_id: std::sync::atomic::AtomicU64::new(0),
+                recv_buf: tokio::sync::Mutex::new(BytesMut::zeroed(65535)),
             };
             let dest: SocketAddr = "8.8.8.8:53".parse().unwrap();
             let payload = b"legacy dns payload";

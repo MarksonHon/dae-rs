@@ -9,10 +9,11 @@
 //! Reference: https://github.com/tuic-protocol/tuic/blob/master/SPEC.md
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -24,6 +25,23 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use crate::{OutboundDialer, ProxyConn};
+
+/// Cached base TLS client config (avoids re-cloning the webpki root store per dial).
+static TLS_CLIENT_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+
+/// Return the cached base TLS config; per-dialer fields (ALPN, early data) are
+/// cloned and customized by the caller.
+fn base_tls_config() -> &'static Arc<ClientConfig> {
+    TLS_CLIENT_CONFIG.get_or_init(|| {
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        )
+    })
+}
 
 /// TUIC protocol version
 const TUIC_VERSION: u8 = 0x05;
@@ -148,19 +166,18 @@ impl TuicDialer {
 
     /// Establish QUIC connection (0-RTT; reuse if already exists)
     async fn ensure_connection(&self) -> Result<quinn::Connection, TuicError> {
-        let mut guard = self.state.lock().await;
-        if let Some(state) = guard.as_ref() {
-            if state.conn.close_reason().is_none() {
-                return Ok(state.conn.clone());
+        // ── 1. Fast path: reuse the existing connection if still alive ──
+        {
+            let guard = self.state.lock().await;
+            if let Some(state) = guard.as_ref() {
+                if state.conn.close_reason().is_none() {
+                    return Ok(state.conn.clone());
+                }
             }
-        }
+        } // guard dropped – the QUIC handshake runs without holding the lock
 
-        // ---- Construct rustls ClientConfig ----
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut crypto = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        // ---- Construct rustls ClientConfig (root store cached) ----
+        let mut crypto = base_tls_config().as_ref().clone();
         // TUIC must use TLS 1.3
         crypto.alpn_protocols = if self.alpn.is_empty() {
             vec![TUIC_ALPN.to_vec()]
@@ -233,6 +250,16 @@ impl TuicDialer {
             conn: conn.clone(),
             authenticated: false,
         };
+
+        // ── 2. Re-acquire lock and double-check before inserting ──
+        let mut guard = self.state.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            if existing.conn.close_reason().is_none() {
+                // Another task established a connection while we were connecting;
+                // prefer reusing it and let ours be dropped.
+                return Ok(existing.conn.clone());
+            }
+        }
         *guard = Some(state);
         Ok(conn)
     }
@@ -570,11 +597,13 @@ impl crate::UdpSession for TuicUdpSession {
         Ok(())
     }
 
-    async fn recv(&self) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
+    async fn recv(&self) -> anyhow::Result<(SocketAddr, Bytes)> {
         let mut rx = self.rx.lock().await;
-        rx.recv()
+        let (dest, payload) = rx
+            .recv()
             .await
-            .ok_or_else(|| anyhow::anyhow!("tuic udp: channel closed"))
+            .ok_or_else(|| anyhow::anyhow!("tuic udp: channel closed"))?;
+        Ok((dest, Bytes::from(payload)))
     }
 }
 

@@ -37,6 +37,11 @@ fn main() {
     let max_match_set_len =
         env::var("MAX_MATCH_SET_LEN").unwrap_or_else(|_| "1024".to_string());
 
+    // Re-run the build when these environment variables change.
+    println!("cargo:rerun-if-env-changed=CLANG");
+    println!("cargo:rerun-if-env-changed=LLVM_STRIP");
+    println!("cargo:rerun-if-env-changed=MAX_MATCH_SET_LEN");
+
     // Compile tproxy.c → ebpf.o
     let cflags = [
         "-O2",

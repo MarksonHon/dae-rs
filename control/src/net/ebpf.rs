@@ -1721,45 +1721,41 @@ impl EbpfManager {
         let map = self.get_map_mut("routing_map")?;
         let fd = map.as_fd().as_raw_fd();
 
-        // Batch update active rules via libbpf-sys bpf_map_update_batch
+        // Batch update active rules + zero-fill unused entries in this slot's
+        // range via a single bpf_map_update_batch syscall. The zero entries are
+        // appended to the same update batch instead of a per-entry syscall loop.
         // Keys are offset by slot_base so each epoch slot gets its own range.
-        if !match_sets.is_empty() {
-            let num = match_sets.len() as u32;
-            let mut count = num;
-            let keys: Vec<u32> = (0..num).map(|i| i + slot_base).collect();
-            let values: Vec<MatchSet> = match_sets.to_vec();
+        let num = MAX_MATCH_SET_LEN as u32;
+        let mut count = num;
+        let keys: Vec<u32> = (0..MAX_MATCH_SET_LEN)
+            .map(|i| i as u32 + slot_base)
+            .collect();
+        let mut values: Vec<MatchSet> = match_sets.to_vec();
+        values.resize(MAX_MATCH_SET_LEN, MatchSet::zeroed());
 
-            let ret = unsafe {
-                libbpf_sys::bpf_map_update_batch(
-                    fd,
-                    keys.as_ptr() as *const c_void,
-                    values.as_ptr() as *const c_void,
-                    &mut count as *mut u32,
-                    std::ptr::null(), // opts = NULL
-                )
-            };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                warn!(
-                    "Batch update failed ({}), falling back to individual updates",
-                    err
-                );
-                // Fall back to individual updates
-                for (i, ms) in match_sets.iter().enumerate() {
-                    let key = (slot_base + i as u32).to_ne_bytes();
-                    map.update(&key, bytemuck::bytes_of(ms), MapFlags::empty())
-                        .with_context(|| format!("Failed to write match_set at index {}", i))?;
-                }
-            } else if count != num {
-                warn!("Batch update only wrote {} of {} entries", count, num);
+        let ret = unsafe {
+            libbpf_sys::bpf_map_update_batch(
+                fd,
+                keys.as_ptr() as *const c_void,
+                values.as_ptr() as *const c_void,
+                &mut count as *mut u32,
+                std::ptr::null(), // opts = NULL
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(
+                "Batch update failed ({}), falling back to individual updates",
+                err
+            );
+            // Fall back to individual updates (including the zero-fill entries)
+            for (i, ms) in values.iter().enumerate() {
+                let key = (slot_base + i as u32).to_ne_bytes();
+                map.update(&key, bytemuck::bytes_of(ms), MapFlags::empty())
+                    .with_context(|| format!("Failed to write match_set at index {}", i))?;
             }
-        }
-
-        // Zero-fill unused entries in this slot's range
-        let empty = MatchSet::zeroed();
-        for i in match_sets.len()..MAX_MATCH_SET_LEN {
-            let key = (slot_base + i as u32).to_ne_bytes();
-            map.update(&key, bytemuck::bytes_of(&empty), MapFlags::empty())?;
+        } else if count != num {
+            warn!("Batch update only wrote {} of {} entries", count, num);
         }
 
         // Update routing_meta_map[epoch_slot] with active rule count
@@ -1861,19 +1857,46 @@ impl EbpfManager {
                 )
             })?;
 
-            // Populate the inner map with LPM key → value entries
+            // Populate the inner map with LPM key → value entries via a single
+            // bpf_map_update_batch syscall (falling back to individual updates
+            // if the kernel does not support batch operations).
             let one: u32 = 1;
-            for lpm_key in lpm_keys {
-                let key_bytes = bytemuck::bytes_of(lpm_key);
-                let val_bytes = bytemuck::bytes_of(&one);
-                inner_map
-                    .update(key_bytes, val_bytes, MapFlags::empty())
-                    .with_context(|| {
-                        format!(
-                            "Failed to write LPM key at inner map index {}",
-                            array_idx
-                        )
-                    })?;
+            let inner_map_fd = inner_map.as_fd().as_raw_fd();
+            let mut count = lpm_keys.len() as u32;
+            let values: Vec<u32> = vec![one; lpm_keys.len()];
+            let ret = unsafe {
+                libbpf_sys::bpf_map_update_batch(
+                    inner_map_fd,
+                    lpm_keys.as_ptr() as *const c_void,
+                    values.as_ptr() as *const c_void,
+                    &mut count as *mut u32,
+                    std::ptr::null(), // opts = NULL
+                )
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    "LPM trie batch update failed ({}), falling back to individual updates",
+                    err
+                );
+                for lpm_key in lpm_keys {
+                    let key_bytes = bytemuck::bytes_of(lpm_key);
+                    let val_bytes = bytemuck::bytes_of(&one);
+                    inner_map
+                        .update(key_bytes, val_bytes, MapFlags::empty())
+                        .with_context(|| {
+                            format!(
+                                "Failed to write LPM key at inner map index {}",
+                                array_idx
+                            )
+                        })?;
+                }
+            } else if count != lpm_keys.len() as u32 {
+                warn!(
+                    "LPM trie batch update only wrote {} of {} entries",
+                    count,
+                    lpm_keys.len()
+                );
             }
 
             // Insert the inner map FD into the outer ARRAY_OF_MAPS.
@@ -2250,7 +2273,7 @@ impl EbpfManager {
             match event.type_ {
                 0 => {
                     // DAE_EVENT_BLOCKED
-                    info!(
+                    debug!(
                         "BLOCKED: {} {}:{} -> {}:{} (pid={}, pname={})",
                         l4proto, sip, sport, dip, dport, event.pid, pname,
                     );
@@ -2551,6 +2574,255 @@ impl EbpfManager {
         Ok(count)
     }
 
+    /// Batch-iterate all entries of a HASH / LRU_HASH map via `BPF_MAP_LOOKUP_BATCH`.
+    ///
+    /// Fetches up to `max_batch` `(key, value)` pairs per syscall and invokes `f`
+    /// for each, replacing the previous per-entry `GET_NEXT_KEY` + `LOOKUP_ELEM`
+    /// syscall loop. Returns the total number of entries visited.
+    fn batch_lookup_map(
+        fd: i32,
+        key_size: usize,
+        value_size: usize,
+        max_batch: usize,
+        mut f: impl FnMut(&[u8], &[u8]),
+    ) -> Result<u32> {
+        use std::ffi::c_void;
+
+        let mut out_batch_buf = vec![0u8; key_size];
+        let mut in_batch: *mut c_void = std::ptr::null_mut();
+        let mut total: u32 = 0;
+
+        loop {
+            let mut count: u32 = max_batch as u32;
+            let mut keys = vec![0u8; key_size * max_batch];
+            let mut values = vec![0u8; value_size * max_batch];
+            let ret = unsafe {
+                libbpf_sys::bpf_map_lookup_batch(
+                    fd,
+                    in_batch,
+                    out_batch_buf.as_mut_ptr() as *mut c_void,
+                    keys.as_mut_ptr() as *mut c_void,
+                    values.as_mut_ptr() as *mut c_void,
+                    &mut count,
+                    std::ptr::null(), // opts = NULL
+                )
+            };
+            if ret != 0 {
+                // libbpf wrappers return -errno without setting the global
+                // errno, so use from_raw_os_error(-ret) instead of
+                // last_os_error() to surface the real error code.
+                warn!(
+                    ret = ret,
+                    errno = -ret,
+                    "BPF_MAP_LOOKUP_BATCH returned error (raw errno for diagnosis)"
+                );
+                return Err(std::io::Error::from_raw_os_error(-ret))
+                    .context("BPF_MAP_LOOKUP_BATCH failed");
+            }
+            if count == 0 {
+                break;
+            }
+            total += count;
+            for i in 0..count as usize {
+                let key = &keys[i * key_size..(i + 1) * key_size];
+                let value = &values[i * value_size..(i + 1) * value_size];
+                f(key, value);
+            }
+            if in_batch.is_null() {
+                in_batch = out_batch_buf.as_mut_ptr() as *mut c_void;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Batch-delete keys from a map via `BPF_MAP_DELETE_BATCH`.
+    ///
+    /// Returns the number of keys deleted (a no-op when `keys` is empty).
+    fn batch_delete_map(fd: i32, key_size: usize, keys: &[u8]) -> Result<u32> {
+        use std::ffi::c_void;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut count: u32 = (keys.len() / key_size) as u32;
+        let ret = unsafe {
+            libbpf_sys::bpf_map_delete_batch(
+                fd,
+                keys.as_ptr() as *const c_void,
+                &mut count,
+                std::ptr::null(), // opts = NULL
+            )
+        };
+        if ret != 0 {
+            // See batch_lookup_map: libbpf returns -errno, not a global errno.
+            return Err(std::io::Error::from_raw_os_error(-ret))
+                .context("BPF_MAP_DELETE_BATCH failed");
+        }
+        Ok(count)
+    }
+
+    /// Per-key scan fallback: iterate a map via `BPF_MAP_GET_NEXT_KEY` +
+    /// `BPF_MAP_LOOKUP_ELEM`, invoking `f` for each (key, value) pair.
+    ///
+    /// Returns the number of entries visited. This is the pre-batch-optimization
+    /// janitor path, used when the kernel rejects `BPF_MAP_LOOKUP_BATCH`.
+    fn per_key_scan_map(
+        fd: i32,
+        key_size: usize,
+        value_size: usize,
+        mut f: impl FnMut(&[u8], &[u8]),
+    ) -> Result<u32> {
+        let mut visited: u32 = 0;
+        let mut prev_key: Vec<u8> = Vec::new();
+
+        loop {
+            let mut next_key = vec![0u8; key_size];
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    3i64, // BPF_MAP_GET_NEXT_KEY
+                    &(fd as u32),
+                    if prev_key.is_empty() {
+                        std::ptr::null::<u8>()
+                    } else {
+                        prev_key.as_ptr()
+                    },
+                    next_key.as_mut_ptr(),
+                )
+            };
+            if ret < 0 {
+                break;
+            }
+
+            let mut value = vec![0u8; value_size];
+            let lret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    4i64, // BPF_MAP_LOOKUP_ELEM
+                    &(fd as u32),
+                    next_key.as_ptr(),
+                    value.as_mut_ptr(),
+                )
+            };
+            if lret == 0 {
+                f(&next_key[..key_size], &value[..value_size]);
+            }
+
+            visited += 1;
+            prev_key = next_key;
+        }
+
+        Ok(visited)
+    }
+
+    /// Per-key delete fallback via `BPF_MAP_DELETE_ELEM`.
+    ///
+    /// Returns the number of keys successfully deleted.
+    fn per_key_delete_map(fd: i32, key_size: usize, keys: &[u8]) -> Result<u32> {
+        let mut deleted: u32 = 0;
+        for chunk in keys.chunks_exact(key_size) {
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_bpf,
+                    5i64, // BPF_MAP_DELETE_ELEM
+                    &(fd as u32),
+                    chunk.as_ptr(),
+                    std::ptr::null::<u8>(),
+                )
+            };
+            if ret == 0 {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Scan a map for expired entries and delete them.
+    ///
+    /// When `batch_lookup` is `true`, tries `BPF_MAP_LOOKUP_BATCH` /
+    /// `BPF_MAP_DELETE_BATCH` first; if the kernel rejects batch ops on this
+    /// map type, falls back to the per-key `GET_NEXT_KEY` + `LOOKUP_ELEM` +
+    /// `DELETE_ELEM` path. When `batch_lookup` is `false` (LRU maps — see
+    /// below), the lookup always uses the per-key path, while batch delete is
+    /// still attempted (it needs no in/out cursor and works on LRU maps).
+    ///
+    /// LRU_HASH / LRU_PERCPU_HASH maps do not support the in_batch/out_batch
+    /// cursor that `BPF_MAP_LOOKUP_BATCH` uses to iterate: the kernel's
+    /// `__htab_map_lookup_and_delete_batch()` returns `-EINVAL` for any
+    /// non-NULL in_batch/out_batch, and batch lookup cannot advance across
+    /// calls, so it can never scan the whole map. Per-key iteration is the
+    /// only correct full-map scan for LRU maps.
+    ///
+    /// `is_expired(key, value, now_ns)` decides whether an entry is deleted.
+    /// Returns `(visited, deleted)`.
+    fn janitor_scan_and_delete(
+        fd: i32,
+        key_size: usize,
+        value_size: usize,
+        max_batch: usize,
+        now_ns: u64,
+        batch_lookup: bool,
+        is_expired: impl Fn(&[u8], &[u8], u64) -> bool,
+    ) -> Result<(u32, u32)> {
+        let mut expired_keys: Vec<u8> = Vec::new();
+        let mut visited: u32 = 0;
+
+        if batch_lookup {
+            // Try the batch path first.
+            if let Err(e) =
+                Self::batch_lookup_map(fd, key_size, value_size, max_batch, |key, val| {
+                    visited += 1;
+                    if is_expired(key, val, now_ns) {
+                        expired_keys.extend_from_slice(key);
+                    }
+                })
+            {
+                warn!(
+                    "Batch lookup failed ({}), falling back to per-key scan",
+                    e
+                );
+                expired_keys.clear();
+                visited = 0;
+                Self::per_key_scan_map(fd, key_size, value_size, |key, val| {
+                    visited += 1;
+                    if is_expired(key, val, now_ns) {
+                        expired_keys.extend_from_slice(key);
+                    }
+                })?;
+            }
+        } else {
+            // LRU_HASH (and LRU_PERCPU_HASH) maps do NOT support the
+            // in_batch/out_batch cursor that BPF_MAP_LOOKUP_BATCH uses to
+            // iterate: the kernel's __htab_map_lookup_and_delete_batch()
+            // returns -EINVAL for any non-NULL in_batch/out_batch, and batch
+            // lookup cannot advance across calls, so it can never scan the
+            // whole map. Per-key GET_NEXT_KEY iteration is the only correct
+            // full-map scan for LRU maps.
+            debug!(
+                "LRU map: BPF_MAP_LOOKUP_BATCH in/out cursor unsupported, using per-key scan"
+            );
+            Self::per_key_scan_map(fd, key_size, value_size, |key, val| {
+                visited += 1;
+                if is_expired(key, val, now_ns) {
+                    expired_keys.extend_from_slice(key);
+                }
+            })?;
+        }
+
+        // Delete expired entries, batch-first with per-key fallback.
+        let mut deleted = (expired_keys.len() / key_size) as u32;
+        if deleted > 0 {
+            if let Err(e) = Self::batch_delete_map(fd, key_size, &expired_keys) {
+                warn!(
+                    "Batch delete failed ({}), falling back to per-key delete",
+                    e
+                );
+                deleted = Self::per_key_delete_map(fd, key_size, &expired_keys)?;
+            }
+        }
+
+        Ok((visited, deleted))
+    }
+
     /// Detect conn_state_map usage ratio.
     ///
     /// Iterates map keys to count entries, returns usage as f64 (0.0 – 1.0).
@@ -2595,63 +2867,49 @@ impl EbpfManager {
         const UDP_TIMEOUT_NS: u64 = 120_000_000_000; // 120s (kernel UDP backstop)
         const TCP_ACTIVE_PRESSURE_TIMEOUT_NS: u64 = 600_000_000_000; // 10min, pressure-mode backstop
 
+        const KEY_SIZE: usize = std::mem::size_of::<TuplesKey>();
+        const VALUE_SIZE: usize = std::mem::size_of::<ConnState>();
+        const MAX_BATCH: usize = 256;
+
         let map = self.get_map_mut("conn_state_map")?;
         let map_fd = map.as_fd().as_raw_fd();
 
-        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
-        let mut total_count: u32 = 0;
-        let mut prev_key: Vec<u8> = Vec::new();
+        // LRU_HASH maps reject the in_batch/out_batch cursor used by
+        // BPF_MAP_LOOKUP_BATCH (kernel returns -EINVAL), and batch lookup
+        // cannot advance across calls, so it can never scan the whole map.
+        // Only attempt batch lookup on non-LRU hash maps; batch delete is
+        // unaffected (no cursor involved).
+        let batch_lookup = map.map_type() != libbpf_rs::MapType::LruHash;
+        debug!(
+            map = "conn_state_map",
+            map_type = ?map.map_type(),
+            batch_lookup = batch_lookup,
+            "Janitor conn_state scan batch-lookup eligibility"
+        );
 
-        loop {
-            let next_key = {
-                let mut buf = vec![0u8; 45]; // tuples_key size: 16+16+2+2+1 = 37, rounded up
-                let ret = unsafe {
-                    libc::syscall(
-                        libc::SYS_bpf,
-                        3i64, // BPF_MAP_GET_NEXT_KEY
-                        &(map_fd as u32),
-                        if prev_key.is_empty() {
-                            std::ptr::null::<u8>()
-                        } else {
-                            prev_key.as_ptr()
-                        },
-                        buf.as_mut_ptr(),
-                    )
-                };
-                if ret < 0 {
-                    break;
+        // Scan + delete expired entries. Tries the batch path first and falls
+        // back to per-key GET_NEXT_KEY/LOOKUP/DELETE if the kernel rejects
+        // batch ops on this map type.
+        let (total_count, count) = Self::janitor_scan_and_delete(
+            map_fd,
+            KEY_SIZE,
+            VALUE_SIZE,
+            MAX_BATCH,
+            now_ns,
+            batch_lookup,
+            |key, val, now_ns| {
+                // conn_state layout: is_wan_ingress(1) + state(1) + padding(6) + last_seen_ns(8)
+                if val.len() < 16 {
+                    return false;
                 }
-                buf
-            };
-
-            total_count += 1;
-
-            // Lookup value
-            let mut val = vec![0u8; 64];
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    4i64, // BPF_MAP_LOOKUP_ELEM
-                    &(map_fd as u32),
-                    next_key.as_ptr(),
-                    val.as_mut_ptr(),
-                )
-            };
-            if ret < 0 {
-                prev_key = next_key;
-                continue;
-            }
-
-            // conn_state layout: is_wan_ingress(1) + state(1) + padding(6) + last_seen_ns(8)
-            if val.len() >= 16 {
                 let last_seen_ns = u64::from_ne_bytes(val[8..16].try_into().unwrap_or([0; 8]));
                 let state = val[1];
                 // tuples_key layout: sip(16) + dip(16) + sport(2) + dport(2) + l4proto(1)
                 // l4proto lives at byte offset 36.
-                let l4proto = next_key.get(36).copied().unwrap_or(0);
+                let l4proto = key.get(36).copied().unwrap_or(0);
                 let idle_ns = now_ns.saturating_sub(last_seen_ns);
 
-                let expired = match (state, l4proto) {
+                match (state, l4proto) {
                     (TCP_STATE_CLOSING, _) => idle_ns > TCP_CLOSING_TIMEOUT_NS,
                     (TCP_STATE_ACTIVE, IPPROTO_TCP) => {
                         // Kernel owns TCP ACTIVE lifecycle; only reclaim under pressure.
@@ -2660,34 +2918,11 @@ impl EbpfManager {
                     (TCP_STATE_ACTIVE, IPPROTO_UDP) => idle_ns > UDP_TIMEOUT_NS,
                     // Unknown state/proto: fall back to the 120s backstop.
                     _ => idle_ns > UDP_TIMEOUT_NS,
-                };
-
-                if expired {
-                    expired_keys.push(next_key.clone());
                 }
-            }
+            },
+        )?;
 
-            prev_key = next_key;
-        }
-
-        // Delete expired entries
-        let count = expired_keys.len();
-        if count > 0 {
-            debug!(expired = count, "Deleting expired conn_state_map entries");
-            for key in &expired_keys {
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_bpf,
-                        5i64, // BPF_MAP_DELETE_ELEM
-                        &(map_fd as u32),
-                        key.as_ptr(),
-                        std::ptr::null::<u8>(),
-                    );
-                }
-            }
-        }
-
-        let remaining = total_count.saturating_sub(count as u32);
+        let remaining = total_count.saturating_sub(count);
         debug!(
             total_count = total_count,
             deleted = count,
@@ -2702,7 +2937,7 @@ impl EbpfManager {
             );
         }
 
-        Ok((count, remaining))
+        Ok((count as usize, remaining))
     }
 
     // ============================================================================
@@ -2717,78 +2952,42 @@ impl EbpfManager {
     pub fn janitor_scan_redirect_track(&mut self, now_ns: u64) -> Result<u32> {
         use std::os::fd::AsRawFd;
 
+        const KEY_SIZE: usize = std::mem::size_of::<RedirectTuple>();
+        const VALUE_SIZE: usize = std::mem::size_of::<RedirectEntry>();
+        const MAX_BATCH: usize = 256;
+
         let map = self.get_map_mut("redirect_track")?;
         let map_fd = map.as_fd().as_raw_fd();
 
-        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
-        let mut prev_key: Vec<u8> = Vec::new();
+        // LRU_HASH maps do not support the BPF_MAP_LOOKUP_BATCH in/out cursor
+        // (-EINVAL), so only attempt batch lookup on non-LRU hash maps.
+        let batch_lookup = map.map_type() != libbpf_rs::MapType::LruHash;
+        debug!(
+            map = "redirect_track",
+            map_type = ?map.map_type(),
+            batch_lookup = batch_lookup,
+            "Janitor redirect_track scan batch-lookup eligibility"
+        );
 
-        loop {
-            let next_key = {
-                let mut buf = vec![0u8; 40]; // redirect_tuple: 16+16 = 32, rounded up
-                let ret = unsafe {
-                    libc::syscall(
-                        libc::SYS_bpf,
-                        3i64, // BPF_MAP_GET_NEXT_KEY
-                        &(map_fd as u32),
-                        if prev_key.is_empty() {
-                            std::ptr::null::<u8>()
-                        } else {
-                            prev_key.as_ptr()
-                        },
-                        buf.as_mut_ptr(),
-                    )
-                };
-                if ret < 0 {
-                    break;
+        // Scan + delete expired entries, batch-first with per-key fallback.
+        let (_visited, count) = Self::janitor_scan_and_delete(
+            map_fd,
+            KEY_SIZE,
+            VALUE_SIZE,
+            MAX_BATCH,
+            now_ns,
+            batch_lookup,
+            |_key, val, now_ns| {
+                // redirect_entry C layout (with implicit alignment padding for u64):
+                //   ifindex(4) + smac(6) + dmac(6) + from_wan(1) + _pad(7) + last_seen_ns(8)
+                // last_seen_ns is at offset 24 (20 + 4 bytes implicit C alignment padding)
+                if val.len() < 32 {
+                    return false;
                 }
-                buf
-            };
-
-            // Lookup value to check last_seen_ns
-            let mut val = vec![0u8; 40]; // redirect_entry: larger than 32
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    4i64, // BPF_MAP_LOOKUP_ELEM
-                    &(map_fd as u32),
-                    next_key.as_ptr(),
-                    val.as_mut_ptr(),
-                )
-            };
-            if ret < 0 {
-                prev_key = next_key;
-                continue;
-            }
-
-            // redirect_entry C layout (with implicit alignment padding for u64):
-            //   ifindex(4) + smac(6) + dmac(6) + from_wan(1) + _pad(7) + last_seen_ns(8)
-            // last_seen_ns is at offset 24 (20 + 4 bytes implicit C alignment padding)
-            if val.len() >= 32 {
                 let last_seen_ns = u64::from_ne_bytes(val[24..32].try_into().unwrap_or([0; 8]));
-                if now_ns.saturating_sub(last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS {
-                    expired_keys.push(next_key.clone());
-                }
-            }
-
-            prev_key = next_key;
-        }
-
-        let count = expired_keys.len() as u32;
-        if count > 0 {
-            debug!(deleted = count, "Deleting expired redirect_track entries");
-            for key in &expired_keys {
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_bpf,
-                        5i64, // BPF_MAP_DELETE_ELEM
-                        &(map_fd as u32),
-                        key.as_ptr(),
-                        std::ptr::null::<u8>(),
-                    );
-                }
-            }
-        }
+                now_ns.saturating_sub(last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS
+            },
+        )?;
 
         debug!(deleted = count, "Completed janitor redirect_track scan");
         if count > 0 {
@@ -2810,76 +3009,40 @@ impl EbpfManager {
     pub fn janitor_scan_cookie_pid_map(&mut self, now_ns: u64) -> Result<u32> {
         use std::os::fd::AsRawFd;
 
+        const KEY_SIZE: usize = std::mem::size_of::<u64>(); // cookie
+        const VALUE_SIZE: usize = std::mem::size_of::<ProcInfo>();
+        const MAX_BATCH: usize = 256;
+
         let map = self.get_map_mut("cookie_pid_map")?;
         let map_fd = map.as_fd().as_raw_fd();
 
-        let mut expired_keys: Vec<Vec<u8>> = Vec::new();
-        let mut prev_key: Vec<u8> = Vec::new();
+        // LRU_HASH maps do not support the BPF_MAP_LOOKUP_BATCH in/out cursor
+        // (-EINVAL), so only attempt batch lookup on non-LRU hash maps.
+        let batch_lookup = map.map_type() != libbpf_rs::MapType::LruHash;
+        debug!(
+            map = "cookie_pid_map",
+            map_type = ?map.map_type(),
+            batch_lookup = batch_lookup,
+            "Janitor cookie_pid_map scan batch-lookup eligibility"
+        );
 
-        loop {
-            let next_key = {
-                let mut buf = vec![0u8; 16]; // u64 key, rounded up
-                let ret = unsafe {
-                    libc::syscall(
-                        libc::SYS_bpf,
-                        3i64, // BPF_MAP_GET_NEXT_KEY
-                        &(map_fd as u32),
-                        if prev_key.is_empty() {
-                            std::ptr::null::<u8>()
-                        } else {
-                            prev_key.as_ptr()
-                        },
-                        buf.as_mut_ptr(),
-                    )
-                };
-                if ret < 0 {
-                    break;
+        // Scan + delete expired entries, batch-first with per-key fallback.
+        let (_visited, count) = Self::janitor_scan_and_delete(
+            map_fd,
+            KEY_SIZE,
+            VALUE_SIZE,
+            MAX_BATCH,
+            now_ns,
+            batch_lookup,
+            |_key, val, now_ns| {
+                // ProcInfo layout: last_seen_ns is at offset 0
+                if val.len() < 8 {
+                    return false;
                 }
-                buf
-            };
-
-            // Lookup value to check last_seen_ns
-            let mut val = vec![0u8; 32]; // ProcInfo: last_seen_ns(8) + pid(4) + pname(16) + pad(4) = 32
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_bpf,
-                    4i64, // BPF_MAP_LOOKUP_ELEM
-                    &(map_fd as u32),
-                    next_key.as_ptr(),
-                    val.as_mut_ptr(),
-                )
-            };
-            if ret < 0 {
-                prev_key = next_key;
-                continue;
-            }
-
-            // ProcInfo layout: last_seen_ns is at offset 0
-            if val.len() >= 8 {
                 let last_seen_ns = u64::from_ne_bytes(val[0..8].try_into().unwrap_or([0; 8]));
-                if now_ns.saturating_sub(last_seen_ns) > COOKIE_PID_MAP_TIMEOUT_NS {
-                    expired_keys.push(next_key.clone());
-                }
-            }
-
-            prev_key = next_key;
-        }
-
-        let count = expired_keys.len() as u32;
-        if count > 0 {
-            debug!(deleted = count, "Deleting expired cookie_pid_map entries");
-            for key in &expired_keys {
-                unsafe {
-                    libc::syscall(
-                        libc::SYS_bpf,
-                        5i64, // BPF_MAP_DELETE_ELEM
-                        &(map_fd as u32),
-                        key.as_ptr(),
-                        std::ptr::null::<u8>(),
-                    );
-                }
-            }
-        }
+                now_ns.saturating_sub(last_seen_ns) > COOKIE_PID_MAP_TIMEOUT_NS
+            },
+        )?;
 
         debug!(deleted = count, "Completed janitor cookie_pid_map scan");
         if count > 0 {

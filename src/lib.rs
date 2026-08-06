@@ -249,15 +249,34 @@ pub async fn run(
             _ = sighup.recv() => {
                 tracing::info!("Received SIGHUP, reloading configuration");
                 debug!("Signal handler: SIGHUP received, reloading");
-                let mut ctrl = control.write().await;
-                let content = ctrl.daefile_content.clone().unwrap_or_default();
+
+                // Read the stored daefile content outside the blocking reload so the
+                // control-plane lock isn't held while doing CPU-bound work.
+                let content = {
+                    let ctrl = control.read().await;
+                    ctrl.daefile_content.clone().unwrap_or_default()
+                };
                 let reload_start = std::time::Instant::now();
-                match ctrl.reload_config(&content) {
-                    Ok(()) => {
+
+                // `reload_config` is CPU-heavy (config re-parse, rule compilation and
+                // eBPF map writes). Run it on a dedicated blocking thread so the async
+                // worker isn't stalled. The write lock is acquired only inside the
+                // blocking thread, right before the map-updating operations, keeping
+                // the critical section short.
+                let ctrl = control.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let mut ctrl = ctrl.blocking_write();
+                    ctrl.reload_config(&content)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
                         debug!(elapsed_ms = reload_start.elapsed().as_millis(), "SIGHUP reload completed");
                         tracing::info!("SIGHUP reload completed");
                     }
-                    Err(e) => tracing::error!("SIGHUP reload failed: {}", e),
+                    Ok(Err(e)) => tracing::error!("SIGHUP reload failed: {}", e),
+                    Err(e) => tracing::error!("SIGHUP reload task failed: {}", e),
                 }
             }
         }

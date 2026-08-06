@@ -24,6 +24,7 @@
 //! 5. Register in [`ProtocolRegistry::builtin()`]
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -357,7 +358,10 @@ pub trait UdpSession: Send + Sync {
     async fn send(&self, dest: &SocketAddr, payload: &[u8]) -> anyhow::Result<()>;
 
     /// Receive the next relayed datagram: `(original destination, payload)`.
-    async fn recv(&self) -> anyhow::Result<(SocketAddr, Vec<u8>)>;
+    ///
+    /// The payload is returned as a zero-copy `Bytes` view, avoiding a
+    /// per-datagram heap allocation of a full-sized UDP buffer.
+    async fn recv(&self) -> anyhow::Result<(SocketAddr, Bytes)>;
 }
 
 // ── Tests ──

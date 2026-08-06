@@ -4,10 +4,11 @@
 //! Reference: https://github.com/trojan-gfw/trojan/blob/master/docs/protocol.md
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use sha2::{Sha224, Digest};
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -16,6 +17,9 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 
 use crate::{OutboundDialer, ProxyConn};
+
+/// Cached TLS client config (avoids re-cloning the webpki root store per dial).
+static TLS_CLIENT_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
 /// Trojan Dialer error
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +46,8 @@ pub struct TrojanDialer {
     pub dial_timeout: Duration,
     /// Authentication password
     pub password: String,
+    /// Cached SHA224(password) hex digest (computed once at construction).
+    auth_hash: String,
     /// TLS SNI
     pub sni: String,
     /// Certificate SHA256 fingerprint (for certificate pinning)
@@ -60,10 +66,13 @@ impl TrojanDialer {
         sni: impl Into<String>,
         dial_timeout_ms: u64,
     ) -> Self {
+        let password = password.into();
+        let auth_hash = trojan_auth_hash(&password);
         Self {
             proxy_addr,
             dial_timeout: Duration::from_millis(dial_timeout_ms),
-            password: password.into(),
+            password,
+            auth_hash,
             sni: sni.into(),
             ca_sha256: None,
             self_mark: 0,
@@ -79,10 +88,13 @@ impl TrojanDialer {
         dial_timeout_ms: u64,
         self_mark: u32,
     ) -> Self {
+        let password = password.into();
+        let auth_hash = trojan_auth_hash(&password);
         Self {
             proxy_addr,
             dial_timeout: Duration::from_millis(dial_timeout_ms),
-            password: password.into(),
+            password,
+            auth_hash,
             sni: sni.into(),
             ca_sha256: None,
             self_mark,
@@ -124,16 +136,18 @@ impl TrojanDialer {
         })
     }
 
-    /// Create TLS connector
+    /// Create TLS connector (config is cached and shared across dials).
     fn create_tls_connector(&self) -> Result<TlsConnector, TrojanError> {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let mut config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        Ok(TlsConnector::from(Arc::new(config)))
+        let config = TLS_CLIENT_CONFIG.get_or_init(|| {
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth(),
+            )
+        });
+        Ok(TlsConnector::from(config.clone()))
     }
 
     /// Perform TLS handshake with timeout (reuses dial_timeout).
@@ -175,12 +189,9 @@ impl TrojanDialer {
         Ok(tls_stream)
     }
 
-    /// Calculate Trojan authentication hash (hex of SHA224(password))
-    fn auth_hash(&self) -> String {
-        let mut hasher = Sha224::new();
-        hasher.update(self.password.as_bytes());
-        let hash = hasher.finalize();
-        hex::encode(hash)
+    /// Trojan authentication hash (hex of SHA224(password)), precomputed at construction.
+    fn auth_hash(&self) -> &str {
+        &self.auth_hash
     }
 
     /// Build Trojan request header: CRLF + HASH + CRLF + CMD + CRLF + ADDR + CRLF
@@ -223,6 +234,31 @@ fn split_target(target: &str) -> Result<(&str, u16), TrojanError> {
         host = &host[1..host.len() - 1];
     }
     Ok((host, port))
+}
+
+/// Compute the Trojan authentication hash (hex of SHA224(password)).
+fn trojan_auth_hash(password: &str) -> String {
+    let mut hasher = Sha224::new();
+    hasher.update(password.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Encode the Trojan address from a `SocketAddr`: ATYP + ADDR + PORT (1=IPv4, 4=IPv6).
+/// Writes the address octets directly, avoiding an intermediate string allocation.
+fn encode_socket_addr(dest: &SocketAddr) -> Vec<u8> {
+    let mut addr = Vec::with_capacity(1 + 16 + 2);
+    match dest {
+        SocketAddr::V4(v4) => {
+            addr.push(0x01);
+            addr.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            addr.push(0x04);
+            addr.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    addr.extend_from_slice(&dest.port().to_be_bytes());
+    addr
 }
 
 /// Encode the Trojan address: ATYP + ADDR + PORT (1=IPv4, 3=Domain name, 4=IPv6)
@@ -377,7 +413,11 @@ impl OutboundDialer for TrojanDialer {
         socket.connect(self.proxy_addr).map_err(TrojanError::Io)?;
         let socket = tokio::net::UdpSocket::from_std(socket).map_err(TrojanError::Io)?;
 
-        Ok(Box::new(TrojanUdpSession { control, socket }))
+        Ok(Box::new(TrojanUdpSession {
+            control,
+            socket,
+            recv_buf: tokio::sync::Mutex::new(BytesMut::zeroed(65535)),
+        }))
     }
 
     fn protocol_name(&self) -> &'static str {
@@ -399,6 +439,8 @@ pub struct TrojanUdpSession {
     control: tokio_rustls::client::TlsStream<TcpStream>,
     /// UDP data socket (host NS, connecting to proxy server)
     socket: tokio::net::UdpSocket,
+    /// Reused receive buffer (avoids a per-datagram 64 KiB allocation).
+    recv_buf: tokio::sync::Mutex<BytesMut>,
 }
 
 #[async_trait]
@@ -406,15 +448,16 @@ impl crate::UdpSession for TrojanUdpSession {
     async fn send(&self, dest: &SocketAddr, payload: &[u8]) -> anyhow::Result<()> {
         // [ATYP][ADDR][PORT][LEN(2)][PAYLOAD]
         let mut datagram = Vec::with_capacity(1 + 16 + 2 + 2 + payload.len());
-        datagram.extend_from_slice(&encode_addr(&dest.ip().to_string(), dest.port())?);
+        datagram.extend_from_slice(&encode_socket_addr(dest));
         datagram.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         datagram.extend_from_slice(payload);
         self.socket.send(&datagram).await?;
         Ok(())
     }
 
-    async fn recv(&self) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
-        let mut buf = vec![0u8; 65535];
+    async fn recv(&self) -> anyhow::Result<(SocketAddr, Bytes)> {
+        let mut buf = self.recv_buf.lock().await;
+        buf.resize(65535, 0);
         let len = self.socket.recv(&mut buf).await?;
         let (dest, consumed) = decode_addr(&buf[..len])?;
         if len < consumed + 2 {
@@ -424,6 +467,9 @@ impl crate::UdpSession for TrojanUdpSession {
         if len < consumed + 2 + pkt_len {
             return Err(anyhow::anyhow!("trojan udp: truncated payload"));
         }
-        Ok((dest, buf[consumed + 2..consumed + 2 + pkt_len].to_vec()))
+        Ok((
+            dest,
+            Bytes::copy_from_slice(&buf[consumed + 2..consumed + 2 + pkt_len]),
+        ))
     }
 }

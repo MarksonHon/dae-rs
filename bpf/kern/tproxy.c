@@ -24,7 +24,7 @@
 #include "headers/bpf_helpers.h"
 #include "ebpf_sync_defs.h"
 
-#define __DEBUG
+// #define __DEBUG
 // #define __DEBUG_ROUTING
 #define __PRINT_ROUTING_RESULT
 // #define __PRINT_SETUP_PROCESS_CONNNECTION
@@ -121,13 +121,12 @@ struct redirect_entry {
 	__u64 last_seen_ns;
 };
 
-// redirect_track: reply traffic routing; HASH with timestamp-based cleanup.
+// redirect_track: reply traffic routing; LRU_HASH with timestamp-based cleanup.
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__type(key, struct redirect_tuple);
 	__type(value, struct redirect_entry);
 	__uint(max_entries, MAX_REDIRECT_TRACK_NUM);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
 } redirect_track SEC(".maps");
 
 struct ip_port {
@@ -350,10 +349,9 @@ struct routing_epoch_ip {
 	__be32 addr[4];
 };
 
-// domain_routing_map: epoch+address → routing bitmap cache (HASH, no LRU).
+// domain_routing_map: epoch+address → routing bitmap cache (LRU_HASH).
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__type(key, struct routing_epoch_ip);
 	__type(value, struct domain_routing);
 	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM * MAX_DOMAIN_ROUTING_NUM);
@@ -372,11 +370,10 @@ struct pid_pname {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__type(key, __u64);
 	__type(value, struct pid_pname);
 	__uint(max_entries, MAX_COOKIE_PID_PNAME_MAPPING_NUM);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
 } cookie_pid_map SEC(".maps");
 
 // conn_state: shared TCP/UDP connection state with embedded routing.
@@ -449,12 +446,11 @@ struct conn_state {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, MAX_CONN_STATE_NUM);
 	__type(key, struct tuples_key);
 	__type(value, struct conn_state);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);  // Loader may override pinning on cold start.
-	__uint(map_flags, BPF_F_NO_PREALLOC);
 } conn_state_map SEC(".maps");
 
 // key=0: UDP conn overflow count; key=1: TCP conn overflow count.
@@ -514,7 +510,7 @@ enum bpf_stats_key {
 //  34: assign_listener selected UDP listener key
 //  35: assign_listener selected TCP/IPv6 listener key
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, __u32);
 	__type(value, __u64);
 	__uint(max_entries, 36);
@@ -566,12 +562,12 @@ enum debug_counter_key {
 	DBG_ASSIGN_SELECT_TCP6 = 35,
 };
 
-// Helper to increment a debug counter atomically.
+// Helper to increment a debug counter (per-CPU, no atomic needed).
 // Usage: increment_counter(skb, DBG_COUNTER_NAME);
 #define increment_counter(skb, key) do { \
 	__u32 _dbg_key = (key); \
 	__u64 *_dbg_cnt = bpf_map_lookup_elem(&debug_counter_map, &_dbg_key); \
-	if (_dbg_cnt) __sync_fetch_and_add(_dbg_cnt, 1); \
+	if (_dbg_cnt) (*_dbg_cnt) += 1; \
 } while (0)
 
 static __always_inline void normalize_redirect_ip(union ip6 *ip)
@@ -590,6 +586,18 @@ static __always_inline void normalize_redirect_tuple(struct redirect_tuple *t)
 {
 	normalize_redirect_ip(&t->sip);
 	normalize_redirect_ip(&t->dip);
+}
+
+// Lexicographic (network-order) comparison for canonicalizing redirect_tuple.
+static __always_inline bool redirect_ip_gt(const union ip6 *a, const union ip6 *b)
+{
+	return a->u6_addr32[0] > b->u6_addr32[0] ||
+	       (a->u6_addr32[0] == b->u6_addr32[0] &&
+		(a->u6_addr32[1] > b->u6_addr32[1] ||
+		 (a->u6_addr32[1] == b->u6_addr32[1] &&
+		  (a->u6_addr32[2] > b->u6_addr32[2] ||
+		   (a->u6_addr32[2] == b->u6_addr32[2] &&
+		    a->u6_addr32[3] > b->u6_addr32[3])))));
 }
 
 static __always_inline __u32 detect_tcp_listener_key(struct __sk_buff *skb)
@@ -1946,7 +1954,6 @@ publish_redirect_track_for_packet(struct __sk_buff *skb, __u32 link_h_len,
 {
 	increment_counter(skb, DBG_REDIRECT_TRACK_PUBLISH);
 	struct redirect_tuple redirect_tuple = {};
-	struct redirect_tuple reverse_tuple = {};
 	struct redirect_entry redirect_entry = {};
 	long map_ret;
 
@@ -1955,24 +1962,22 @@ publish_redirect_track_for_packet(struct __sk_buff *skb, __u32 link_h_len,
 	fill_redirect_entry_from_forward_packet(skb->ifindex, link_h_len, ethh,
 						from_wan, &redirect_entry);
 
+	/* Publish a single symmetric key: canonicalize the tuple by ordering
+	 * sip/dip so forward and reply traffic map to the same entry. The
+	 * reverse-key fallback lookup in tproxy_dae0_ingress already handles
+	 * any direction mismatch, so no separate reversed key is inserted.
+	 */
+	if (redirect_ip_gt(&redirect_tuple.sip, &redirect_tuple.dip)) {
+		union ip6 tmp_sip = redirect_tuple.sip;
+		redirect_tuple.sip = redirect_tuple.dip;
+		redirect_tuple.dip = tmp_sip;
+	}
+
 	map_ret = bpf_map_update_elem(&redirect_track, &redirect_tuple,
 				      &redirect_entry, BPF_ANY);
 	if (map_ret) {
 		increment_counter(skb, DBG_REDIRECT_TRACK_UPDATE_FAIL);
 		bpf_printk("redirect_track update failed: %d", (int)map_ret);
-		return (int)map_ret;
-	}
-
-	/* Also publish reversed key so dae0_ingress can match regardless of
-	 * tuple direction assumptions.
-	 */
-	reverse_tuple.sip = redirect_tuple.dip;
-	reverse_tuple.dip = redirect_tuple.sip;
-	map_ret = bpf_map_update_elem(&redirect_track, &reverse_tuple,
-				      &redirect_entry, BPF_ANY);
-	if (map_ret) {
-		increment_counter(skb, DBG_REDIRECT_TRACK_UPDATE_FAIL);
-		bpf_printk("redirect_track reverse update failed: %d", (int)map_ret);
 		return (int)map_ret;
 	}
 	return 0;

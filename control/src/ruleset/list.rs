@@ -27,6 +27,7 @@
 
 use ipnet::IpNet;
 use std::net::IpAddr;
+use std::sync::LazyLock;
 use thiserror::Error;
 
 use crate::ruleset::types::{DomainPattern, DomainPatternType};
@@ -84,6 +85,29 @@ const NON_DOMAIN_RULE_PREFIXES: &[&str] = &[
     "url-regex",
 ];
 
+/// Precomputed rule-keyword prefixes for fast, allocation-free matching.
+///
+/// Stores each keyword plus its trailing-comma form (`KEYWORD,`) so that
+/// [`line_is_rule_keyword`] never re-allocates `format!("{},", k)` per line.
+struct RuleKeywordSet {
+    /// (keyword, keyword followed by a comma)
+    pairs: Vec<(&'static str, String)>,
+}
+
+impl RuleKeywordSet {
+    fn new(keywords: &'static [&'static str]) -> Self {
+        Self {
+            pairs: keywords.iter().map(|k| (*k, format!("{},", k))).collect(),
+        }
+    }
+}
+
+/// Precomputed rule-keyword sets for the two list parsers.
+static NON_IP_RULE_KEYWORDS: LazyLock<RuleKeywordSet> =
+    LazyLock::new(|| RuleKeywordSet::new(NON_IP_RULE_PREFIXES));
+static NON_DOMAIN_RULE_KEYWORDS: LazyLock<RuleKeywordSet> =
+    LazyLock::new(|| RuleKeywordSet::new(NON_DOMAIN_RULE_PREFIXES));
+
 /// Strip a case-insensitive rule keyword prefix (`KEYWORD,<rest>`) and return `<rest>`,
 /// or `None` if the line does not start with that keyword followed by a comma.
 fn strip_rule_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
@@ -100,11 +124,12 @@ fn strip_rule_keyword<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
 
 /// Whether a line is (or starts with) one of the given rule keywords, case-insensitively.
 /// Matches both `KEYWORD` (bare) and `KEYWORD,<value>` forms.
-fn line_is_rule_keyword(line: &str, keywords: &[&str]) -> bool {
+fn line_is_rule_keyword(line: &str, keywords: &RuleKeywordSet) -> bool {
     let lower = line.to_ascii_lowercase();
     keywords
+        .pairs
         .iter()
-        .any(|k| lower == *k || lower.starts_with(&format!("{},", k)))
+        .any(|(kw, prefix)| lower == *kw || lower.starts_with(prefix))
 }
 
 /// Take the first comma-separated argument (trailing rule options like `no-resolve`
@@ -143,7 +168,7 @@ pub fn parse_ip_list(text: &str) -> Result<Vec<IpNet>, ListError> {
         }
 
         // Non-IP rules (domains, GEOIP, MATCH/FINAL, ...) → skip
-        if line_is_rule_keyword(line, NON_IP_RULE_PREFIXES) {
+        if line_is_rule_keyword(line, &NON_IP_RULE_KEYWORDS) {
             continue;
         }
 
@@ -197,7 +222,7 @@ pub fn parse_domain_list(text: &str) -> Result<Vec<DomainPattern>, ListError> {
         }
 
         // Non-domain rules (IP-CIDR, GEOIP, MATCH/FINAL, ...) → skip
-        if line_is_rule_keyword(line, NON_DOMAIN_RULE_PREFIXES) {
+        if line_is_rule_keyword(line, &NON_DOMAIN_RULE_KEYWORDS) {
             continue;
         }
 

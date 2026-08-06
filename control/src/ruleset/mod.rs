@@ -10,6 +10,8 @@
 //!
 //! This layer does **not** hook into matcher / configuration parser-validator (handled by later sub-tasks).
 
+use std::sync::Arc;
+
 pub mod cache;
 pub mod compiled;
 pub mod download;
@@ -51,14 +53,14 @@ pub fn parse_rule_set_data(ty: RuleSetType, bytes: &[u8]) -> Result<RuleSetData,
             let text = std::str::from_utf8(bytes)
                 .map_err(|e| RuleSetError::InvalidUtf8(e.to_string()))?;
             list::parse_domain_list(text)
-                .map(RuleSetData::DomainList)
+                .map(|v| RuleSetData::DomainList(Arc::new(v)))
                 .map_err(RuleSetError::List)
         }
         RuleSetType::IpList => {
             let text = std::str::from_utf8(bytes)
                 .map_err(|e| RuleSetError::InvalidUtf8(e.to_string()))?;
             list::parse_ip_list(text)
-                .map(RuleSetData::IpList)
+                .map(|v| RuleSetData::IpList(Arc::new(v)))
                 .map_err(RuleSetError::List)
         }
     }

@@ -433,7 +433,7 @@ impl NetnsManager {
         let (major, minor) = kernel_version();
         let supported = major > 6 || (major == 6 && minor >= 7);
         info!(
-            kernel_version = "{}.{}",
+            kernel_version = %format!("{}.{}", major, minor),
             major,
             minor,
             netkit_supported = supported,

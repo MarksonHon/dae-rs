@@ -17,6 +17,7 @@ libc = "0.2"
 shared = { path = "../shared" }
 hex = "0.4"
 sha2 = "0.10"
+bytes = "1"
 
 # Shadowsocks (crypto layer only: AEAD framing + 2022 ciphers)
 shadowsocks-crypto = { version = "0.6", optional = true, features = ["v2"] }
@@ -30,6 +31,7 @@ aes-gcm = { version = "0.10", optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }
 sha3 = { version = "0.10", optional = true }
 crc32fast = { version = "1", optional = true }
+getrandom = { version = "0.2", optional = true }
 
 # TLS (Trojan, TUIC, Juicity, VMess)
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
@@ -63,4 +65,4 @@ shadowsocks = ["dep:shadowsocks-crypto", "dep:aes"]
 trojan = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 tuic = ["dep:rustls", "dep:quinn", "dep:base64"]
 juicity = ["dep:rustls", "dep:quinn"]
-vmess = ["dep:rustls", "dep:tokio-tungstenite", "dep:h2", "dep:http", "dep:base64", "dep:futures-util", "dep:md-5", "dep:hmac", "dep:aes", "dep:aes-gcm", "dep:chacha20poly1305", "dep:sha3", "dep:crc32fast"]
+vmess = ["dep:rustls", "dep:tokio-tungstenite", "dep:h2", "dep:http", "dep:base64", "dep:futures-util", "dep:md-5", "dep:hmac", "dep:aes", "dep:aes-gcm", "dep:chacha20poly1305", "dep:sha3", "dep:crc32fast", "dep:getrandom"]

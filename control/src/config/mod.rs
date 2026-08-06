@@ -17,6 +17,7 @@
 //! | [`validator`] | Semantic validation of parsed configs |
 //! | [`protocol`] | Per-protocol import string conversion |
 //! | [`example`] | Example daefile configurations |
+//! | [`ruleset`] | Rule set data layer (text domain/IP lists) |
 //!
 //! # Examples
 //!
@@ -170,47 +171,6 @@ pub enum ConfigError {
     #[error("[E1903] api.tls is true but cert or key not specified")]
     ApiTlsMissingCertKey,
 
-    // ── DNS Errors ──
-    /// E2001: DNS group references unknown send_by group
-    #[error("[E2001] DNS group '{dns_group}' references unknown send_by group: '{send_by}'")]
-    DnsUnknownSendByGroup {
-        dns_group: String,
-        send_by: String,
-    },
-    /// E2002: DNS routing references unknown DNS group
-    #[error("[E2002] DNS routing references unknown DNS group: '{group}'")]
-    DnsUnknownGroup {
-        group: String,
-    },
-    /// E2003: Duplicate DNS group name
-    #[error("[E2003] Duplicate DNS group name: '{name}'")]
-    DnsDuplicateGroup {
-        name: String,
-    },
-    /// E2004: DNS starting_dns ip_version_prefer must be 4 or 6
-    #[error("[E2004] starting_dns ip_version_prefer must be 4 or 6, got: {value}")]
-    DnsIpVersionPreferInvalid {
-        value: u8,
-    },
-    /// E2005: DNS group has no upstream
-    #[error("[E2005] DNS group '{group}' has no upstream servers")]
-    DnsGroupNoUpstream {
-        group: String,
-    },
-    /// E2006: Starting DNS has no upstream
-    #[error("[E2006] starting_dns has no upstream servers")]
-    DnsStartingDnsNoUpstream,
-    /// E2007: DNS routing fallback references unknown DNS group
-    #[error("[E2007] DNS routing fallback references unknown DNS group: '{group}'")]
-    DnsFallbackUnknownGroup {
-        group: String,
-    },
-    /// E2008: DNS group name conflicts with reserved keyword
-    #[error("[E2008] DNS group name '{name}' is reserved and cannot be used")]
-    DnsNameConflict {
-        name: String,
-    },
-
     // ── Rule Set Errors ──
     /// E2101: Duplicate rule set name (including default = block name)
     #[error("[E2101] Duplicate rule set name: '{name}'")]
@@ -299,220 +259,6 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 // ============================================================================
 
 // ============================================================================
-// DNS Configuration Types
-// ============================================================================
-
-/// An upstream DNS server entry (label + URL)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsUpstreamEntry {
-    /// Label (name) for this upstream, used in routing
-    pub label: String,
-    /// Upstream URL (e.g. udp://1.1.1.1:53, tcp+udp://dns.google:53, https://...)
-    pub address: String,
-}
-
-/// Starting DNS configuration (bootstrap resolver, used before proxy is available).
-///
-/// The upstream list is a flat set of IP-address DNS servers (e.g. `udp://223.5.5.5:53`).
-/// They are queried **directly** (never through a proxy) and are used to resolve
-/// hostname-based upstreams of DNS groups at initialization time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct StartingDnsConfig {
-    /// IP version preference: 4 (IPv4 only) or 6 (IPv6 only)
-    pub ip_version_prefer: u8,
-    /// Bootstrap upstream IP DNS server list (e.g. "udp://223.5.5.5:53")
-    pub upstream: Vec<String>,
-}
-
-/// DNS cache configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsCacheConfig {
-    /// Whether DNS caching is enabled
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Maximum number of cached entries
-    #[serde(default = "default_dns_cache_max_size")]
-    pub max_size: u32,
-    /// Maximum TTL for cached entries (seconds)
-    #[serde(default = "default_dns_cache_max_ttl")]
-    pub max_ttl: u32,
-    /// Minimum TTL for cached entries (seconds)
-    #[serde(default = "default_dns_cache_min_ttl")]
-    pub min_ttl: u32,
-    /// Whether optimistic caching (RFC 8767) is enabled
-    #[serde(default)]
-    pub optimistic_cache: bool,
-    /// How long expired entries are served during refresh (seconds)
-    #[serde(default = "default_dns_optimistic_cache_ttl")]
-    pub optimistic_cache_ttl: u32,
-    /// Whether to asynchronously refresh cache entries that are near expiry
-    #[serde(default)]
-    pub background_refresh: bool,
-    /// Refresh a cached entry when its remaining TTL drops below this percentage
-    /// of the original TTL (1-99)
-    #[serde(default = "default_dns_refresh_threshold_percent")]
-    pub refresh_threshold_percent: u8,
-    /// TTL served for stale (expired) entries while a refresh is in flight
-    #[serde(default = "default_dns_serve_stale_ttl")]
-    pub serve_stale_ttl: u32,
-}
-
-fn default_dns_cache_max_size() -> u32 { 4096 }
-fn default_dns_cache_max_ttl() -> u32 { 86400 }
-fn default_dns_cache_min_ttl() -> u32 { 60 }
-fn default_dns_optimistic_cache_ttl() -> u32 { 3600 }
-fn default_dns_refresh_threshold_percent() -> u8 { 20 }
-fn default_dns_serve_stale_ttl() -> u32 { 30 }
-
-impl Default for DnsCacheConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_size: 4096,
-            max_ttl: 86400,
-            min_ttl: 60,
-            optimistic_cache: false,
-            optimistic_cache_ttl: 3600,
-            background_refresh: false,
-            refresh_threshold_percent: 20,
-            serve_stale_ttl: 30,
-        }
-    }
-}
-
-/// A single DNS routing rule (request or group-level)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsRouteRule {
-    /// Match expression (e.g. `qname(geosite:cn)`, `qtype(a)`)
-    pub r#match: String,
-    /// Action: target group name or upstream label
-    pub action: String,
-}
-
-/// DNS group query mode: how to select which upstream to query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DnsQueryMode {
-    /// Query all upstreams in the group concurrently, use the first success.
-    Concurrent,
-    /// Pick a random upstream in the group and query it.
-    Random,
-    /// Try upstreams in order (top to bottom), use the first success.
-    Sequence,
-}
-
-impl Default for DnsQueryMode {
-    fn default() -> Self {
-        DnsQueryMode::Concurrent
-    }
-}
-
-/// DNS response routing rule
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsResponseRule {
-    /// Match expression (e.g. `upstream(googledns)`, `ip(geoip:private)`)
-    pub r#match: String,
-    /// Action: `accept`, `reject`, or upstream label to requery
-    pub action: String,
-}
-
-/// DNS response action configuration (module-level).
-///
-/// Applied to the DNS response after an upstream query, regardless of which
-/// group produced it. Rules match against the response and the answering
-/// upstream's label; actions are `accept`, `reject`, or an upstream label to
-/// requery within the group that answered.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsResponseActionConfig {
-    /// Ordered list of response rules
-    #[serde(default)]
-    pub rules: Vec<DnsResponseRule>,
-    /// Default action if no rule matches
-    pub fallback: String,
-}
-
-/// DNS group configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsGroupConfig {
-    /// Group name (used in routing)
-    pub name: String,
-    /// How to send this group's upstream queries: "direct" for direct connection,
-    /// or a proxy group name to route through that proxy group.
-    pub send_by: String,
-    /// Query mode: how to select which upstream in the group to query.
-    #[serde(default)]
-    pub query_mode: DnsQueryMode,
-    /// Upstream DNS servers in this group
-    #[serde(default)]
-    pub upstream: Vec<DnsUpstreamEntry>,
-}
-
-/// Top-level DNS routing: which group handles which query
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub struct DnsRoutingConfig {
-    /// Ordered list of DNS routing rules
-    #[serde(default)]
-    pub rules: Vec<DnsRouteRule>,
-    /// Default DNS group if no rule matches
-    pub fallback: String,
-}
-
-
-/// DNS configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct DnsConfig {
-    /// Starting DNS (bootstrap, IPv4/IPv6 only)
-    pub starting_dns: StartingDnsConfig,
-    /// Local DNS listener address (default: 127.0.0.1:5353)
-    #[serde(default = "default_dns_bind")]
-    pub bind: String,
-    /// DNS cache settings
-    #[serde(default)]
-    pub cache: DnsCacheConfig,
-    /// DNS groups
-    #[serde(default)]
-    pub groups: Vec<DnsGroupConfig>,
-    /// DNS routing: which group handles which query
-    #[serde(default)]
-    pub routing: DnsRoutingConfig,
-    /// Module-level response action: filters / processes DNS responses after
-    /// the upstream query, regardless of which group produced them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_action: Option<DnsResponseActionConfig>,
-}
-
-fn default_dns_bind() -> String { "127.0.0.1:5353".into() }
-
-impl Default for DnsConfig {
-    fn default() -> Self {
-        Self {
-            starting_dns: StartingDnsConfig {
-                ip_version_prefer: 4,
-                upstream: vec!["udp://1.1.1.1:53".into()],
-            },
-            bind: "127.0.0.1:5353".into(),
-            cache: DnsCacheConfig::default(),
-            groups: Vec::new(),
-            routing: DnsRoutingConfig {
-                rules: Vec::new(),
-                fallback: String::new(),
-            },
-            response_action: None,
-        }
-    }
-}
-
-// ============================================================================
 // Top-Level Config
 // ============================================================================
 
@@ -537,9 +283,6 @@ pub struct DaefileConfig {
     /// API configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
-    /// DNS configuration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns: Option<DnsConfig>,
     /// Rule set configuration (design §5).
     ///
     /// - daefile: top-level `rule_set { <name> { ... } }` block;
@@ -561,7 +304,6 @@ impl Default for DaefileConfig {
             outbounds: OutboundsConfig::default(),
             routing: RoutingConfig::default(),
             api: None,
-            dns: None,
             rule_set: Vec::new(),
         }
     }

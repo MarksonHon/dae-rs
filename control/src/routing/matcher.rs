@@ -13,7 +13,7 @@ use bytemuck::Zeroable;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config;
 use crate::config::ConfigError;
@@ -959,17 +959,6 @@ fn lookup_outbound_id_for_ms(outbound: &Outbound) -> Result<u8> {
     }
 }
 
-/// Built-in fallback networks for `geoip:private` (RFC1918 + loopback).
-///
-/// Used only when the in-memory cache lacks `private` data (design §1.1 defect 1 / §6.1);
-/// when data is present it takes priority (more complete than hardcoded values).
-const PRIVATE_NETWORKS: [&str; 4] = [
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "127.0.0.0/8",
-];
-
 /// Construct an E2103 error (compile-time data missing; default to compilation failure).
 fn ruleset_data_missing(reference: &str, reason: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ConfigError::RuleSetDataMissing {
@@ -980,39 +969,12 @@ fn ruleset_data_missing(reference: &str, reason: impl Into<String>) -> anyhow::E
 
 /// Parse CIDR values from string representations.
 ///
-/// Recognizes `geoip:<code>` (looks up the in-memory cache, case-insensitive) and `set:<name>` (ip_list);
-/// `geoip:private` prefers the cache data and falls back to the 4 built-in networks with a warning when missing.
-/// Everything else is parsed as CIDR / bare IP.
+/// Recognizes `set:<name>` (ip_list); everything else is parsed as CIDR / bare IP.
 fn parse_cidr_values(values: &[String], cache: Option<&RuleSetCache>) -> Result<Vec<ipnet::IpNet>> {
     let mut cidrs = Vec::new();
 
     for val in values {
         match parse_ref(val) {
-            RuleSetRef::GeoIp(code) => {
-                if code.eq_ignore_ascii_case("private") {
-                    if let Some(cache) = cache {
-                        if let Some(list) = cache.find_geoip_code("private") {
-                            cidrs.extend(list);
-                            continue;
-                        }
-                    }
-                    warn!(
-                        reference = %val,
-                        "geoip:private data not in memory cache; falling back to built-in private networks"
-                    );
-                    for net in PRIVATE_NETWORKS {
-                        cidrs.push(net.parse().expect("valid private network"));
-                    }
-                    continue;
-                }
-                let cache = cache.ok_or_else(|| {
-                    ruleset_data_missing(val, "rule set memory cache not available")
-                })?;
-                let list = cache.find_geoip_code(&code).ok_or_else(|| {
-                    ruleset_data_missing(val, "geoip code not found in memory cache")
-                })?;
-                cidrs.extend(list);
-            }
             RuleSetRef::Set(name) => {
                 let cache = cache.ok_or_else(|| {
                     ruleset_data_missing(val, "rule set memory cache not available")
@@ -1024,11 +986,6 @@ fn parse_cidr_values(values: &[String], cache: Option<&RuleSetCache>) -> Result<
                     )
                 })?;
                 cidrs.extend(list);
-            }
-            RuleSetRef::GeoSite(code) => {
-                return Err(anyhow!(
-                    "geosite: reference '{val}' is not valid in an IP match function (code='{code}')"
-                ));
             }
             RuleSetRef::Plain(v) => {
                 // Try parsing as CIDR
@@ -1145,78 +1102,6 @@ pub struct CompiledRouting {
     pub fallback_must: u8,
 }
 
-/// Build a domain routing bitmap for a given (domain, IP) pair.
-///
-/// Checks which domain sets contain the given domain, and sets the
-/// corresponding bits in the bitmap. The bitmap is stored in the eBPF
-/// `domain_routing_map` keyed by the IP address.
-///
-/// Each `domain_sets[N]` is a list of domain patterns (with key prefix
-/// stripped, e.g., `["baidu.com", "google.com"]`). The matching logic:
-/// - Patterns stored during compilation of `domain(suffix:...)` → suffix match
-/// - Patterns from `domain(keyword:...)` → substring match
-/// - Patterns from `domain(full:...)` → exact match
-/// - No prefix → treated as suffix (backward compat)
-///
-/// Returns a dynamically-sized bitmap where bit N is set if `domain` matches
-/// `domain_sets[N]`. The bitmap length is `(domain_sets.len() + 31) / 32` words.
-pub fn build_domain_routing_bitmap(domain: &str, domain_sets: &[Vec<String>]) -> Vec<u32> {
-    let num_words = domain_sets.len().div_ceil(32);
-    let mut bitmap = vec![0u32; num_words];
-    let domain_lower = domain.to_lowercase();
-
-    for (rule_idx, patterns) in domain_sets.iter().enumerate() {
-        for pattern in patterns {
-            // Check against the raw pattern (it may have a key: prefix)
-            if let Some((key, pat)) = pattern.split_once(':') {
-                let matched = match key {
-                    "suffix" | "domain" => domain_lower.ends_with(pat) || domain_lower == pat,
-                    "keyword" | "contains" => domain_lower.contains(pat),
-                    "full" => domain_lower == pat,
-                    _ => {
-                        // Unknown key — try as bare pattern
-                        domain_lower.ends_with(pat) || domain_lower == pat
-                    }
-                };
-                if matched {
-                    let word_idx = rule_idx / 32;
-                    let bit_idx = rule_idx % 32;
-                    if word_idx >= bitmap.len() {
-                        // Safety boundary — should not happen as bitmap is sized
-                        // from domain_sets.len(), but guard against races.
-                        debug!(
-                            rule_idx,
-                            bitmap_len = bitmap.len(),
-                            "build_domain_routing_bitmap: rule_idx exceeds bitmap length, expanding"
-                        );
-                        bitmap.resize(word_idx + 1, 0);
-                    }
-                    bitmap[word_idx] |= 1 << bit_idx;
-                    break;
-                }
-            } else {
-                // No key prefix — treat as suffix
-                if domain_lower.ends_with(pattern) || domain_lower == *pattern {
-                    let word_idx = rule_idx / 32;
-                    let bit_idx = rule_idx % 32;
-                    if word_idx >= bitmap.len() {
-                        debug!(
-                            rule_idx,
-                            bitmap_len = bitmap.len(),
-                            "build_domain_routing_bitmap: rule_idx exceeds bitmap length, expanding"
-                        );
-                        bitmap.resize(word_idx + 1, 0);
-                    }
-                    bitmap[word_idx] |= 1 << bit_idx;
-                    break;
-                }
-            }
-        }
-    }
-
-    bitmap
-}
-
 /// Compile daefile routing rules into MatchSet entries for eBPF.
 ///
 /// This function produces a linear sequence of MatchSet entries that tproxy.c's
@@ -1306,12 +1191,8 @@ pub fn compile_rules(
     // find_or_create_lpm_trie, so no separate pass is needed for that.
     //
     // Rule set integration (design §6.3 / §9.1):
-    // - `target_domain(geosite:<code>)` → look up the cached GeoSite code's Domain list and
-    //   map it to key-prefixed pattern entries (Suffix→`suffix:`, Full→`full:`, Regex→`regex:`,
-    //   `Domain`→`domain:`, Keyword→`keyword:`);
-    // - `target_domain(set:<name>)` (domain_list) likewise;
-    // - Plain `domain(...)` / `target_domain(...)` parameters keep their key prefix (no longer
-    //   degraded to a bare suffix, fixing the defect where `domain(geosite:cn)` was treated as the suffix "cn").
+    // - `target_domain(set:<name>)` (domain_list) → look up the cached domain patterns;
+    // - Plain `domain(...)` / `target_domain(...)` parameters keep their key prefix.
     //
     // **Note**: each domain/target_domain function unconditionally pushes an entry (even if empty),
     // strictly aligned with the `rule_domain_idx` increments in build_match_set_for_function.
@@ -1321,15 +1202,6 @@ pub fn compile_rules(
                 let mut patterns: Vec<String> = Vec::new();
                 for raw in &func.raw_params {
                     match parse_ref(raw) {
-                        RuleSetRef::GeoSite(code) => {
-                            let cache = rule_set_cache.ok_or_else(|| {
-                                ruleset_data_missing(raw, "rule set memory cache not available")
-                            })?;
-                            let pats = cache.find_geosite_code(&code).ok_or_else(|| {
-                                ruleset_data_missing(raw, "geosite code not found in memory cache")
-                            })?;
-                            patterns.extend(pats.iter().map(domain_pattern_to_string));
-                        }
                         RuleSetRef::Set(name) => {
                             let cache = rule_set_cache.ok_or_else(|| {
                                 ruleset_data_missing(raw, "rule set memory cache not available")
@@ -1341,11 +1213,6 @@ pub fn compile_rules(
                                 )
                             })?;
                             patterns.extend(pats.iter().map(domain_pattern_to_string));
-                        }
-                        RuleSetRef::GeoIp(code) => {
-                            return Err(anyhow!(
-                                "geoip: reference '{raw}' is not valid in a domain match function (code='{code}')"
-                            ));
                         }
                         RuleSetRef::Plain(v) => {
                             // Plain domain pattern: keep the key prefix (suffix:/keyword:/full:/regex:/domain: or bare value)
@@ -2608,87 +2475,66 @@ mod tests {
 
     // ── Rule set integration tests (design §6.3 / §9) ──
 
-    /// Build an in-memory cache containing geoip/geosite/ip_list/domain_list.
+    /// Build an in-memory cache containing ip_list/domain_list.
     fn make_rule_set_cache() -> RuleSetCache {
         use crate::ruleset::types::{DomainPattern, DomainPatternType, RuleSetData};
-        use std::collections::HashMap;
 
         let cache = RuleSetCache::new();
-        let mut geoip = HashMap::new();
-        geoip.insert(
-            "cn".to_string(),
-            vec![
-                "1.0.1.0/24".parse::<ipnet::IpNet>().unwrap(),
-                "223.5.5.0/24".parse::<ipnet::IpNet>().unwrap(),
-            ],
-        );
-        cache.insert("geoip_main".into(), RuleSetData::GeoIp { entries: geoip });
-
-        let mut geosite = HashMap::new();
-        geosite.insert(
-            "cn".to_string(),
-            vec![
-                DomainPattern { pattern_type: DomainPatternType::Suffix, value: "baidu.com".into() },
-                DomainPattern { pattern_type: DomainPatternType::Full, value: "google.cn".into() },
-            ],
-        );
-        cache.insert("geosite_main".into(), RuleSetData::GeoSite { entries: geosite });
-
         cache.insert(
             "chinaip".into(),
             RuleSetData::IpList(vec![
-                "10.0.0.0/8".parse().unwrap(),
+                "1.0.0.0/8".parse().unwrap(),
                 "192.168.0.0/16".parse().unwrap(),
             ]),
         );
         cache.insert(
             "chinadom".into(),
-            RuleSetData::DomainList(vec![DomainPattern {
-                pattern_type: DomainPatternType::Suffix,
-                value: "example.cn".into(),
-            }]),
+            RuleSetData::DomainList(vec![
+                DomainPattern { pattern_type: DomainPatternType::Suffix, value: "baidu.com".into() },
+                DomainPattern { pattern_type: DomainPatternType::Full, value: "google.cn".into() },
+                DomainPattern { pattern_type: DomainPatternType::Suffix, value: "example.cn".into() },
+            ]),
         );
         cache
     }
 
     #[test]
-    fn test_compile_ruleset_geoip_and_set_ip() {
+    fn test_compile_ruleset_set_ip() {
         let mut routing = config::RoutingConfig::default();
-        // New syntax: target_ip(geoip:cn) / source_ip(set:chinaip)
-        routing.rules.push(config::RouteRule {
-            r#match: "target_ip(geoip:cn)".to_string(),
-            action: "direct".to_string(),
-        });
         routing.rules.push(config::RouteRule {
             r#match: "source_ip(set:chinaip)".to_string(),
             action: "block".to_string(),
+        });
+        routing.rules.push(config::RouteRule {
+            r#match: "dip(10.0.0.0/8)".to_string(),
+            action: "direct".to_string(),
         });
         let outbounds = config::OutboundsConfig::default();
 
         let cache = make_rule_set_cache();
         let compiled = compile_rules(&routing, &outbounds, &[], Some(&cache)).unwrap();
 
-        assert_eq!(compiled.match_sets.len(), 3); // IP_SET + SOURCE_IP_SET + FALLBACK
-        assert_eq!(compiled.match_sets[0].r#type, match_type::IP_SET);
-        assert_eq!(compiled.match_sets[0].outbound, outbound::DIRECT);
-        assert_eq!(compiled.match_sets[1].r#type, match_type::SOURCE_IP_SET);
-        assert_eq!(compiled.match_sets[1].outbound, outbound::BLOCK);
-        // geoip:cn (2 networks) and set:chinaip (2 networks) → 2 LPM tries
+        assert_eq!(compiled.match_sets.len(), 3); // SOURCE_IP_SET + IP_SET + FALLBACK
+        assert_eq!(compiled.match_sets[0].r#type, match_type::SOURCE_IP_SET);
+        assert_eq!(compiled.match_sets[0].outbound, outbound::BLOCK);
+        assert_eq!(compiled.match_sets[1].r#type, match_type::IP_SET);
+        assert_eq!(compiled.match_sets[1].outbound, outbound::DIRECT);
+        // set:chinaip (2 networks) and dip(10.0.0.0/8) (1 network) → 2 LPM tries
         assert_eq!(compiled.lpm_tries.len(), 2);
 
         // Userspace evaluation verification
         let matcher = RoutingMatcher::from_compiled(&compiled);
         let r = matcher.match_routing(&RoutingParams {
-            dst_ip: Some("1.0.1.5".parse().unwrap()),
-            ..Default::default()
-        });
-        assert_eq!(r.outbound, outbound::DIRECT, "geoip:cn matched");
-
-        let r = matcher.match_routing(&RoutingParams {
-            src_ip: Some("10.1.1.1".parse().unwrap()),
+            src_ip: Some("192.168.1.1".parse().unwrap()),
             ..Default::default()
         });
         assert_eq!(r.outbound, outbound::BLOCK, "set:chinaip matched");
+
+        let r = matcher.match_routing(&RoutingParams {
+            dst_ip: Some("10.0.0.1".parse().unwrap()),
+            ..Default::default()
+        });
+        assert_eq!(r.outbound, outbound::DIRECT, "dip(10.0.0.0/8) matched");
 
         let r = matcher.match_routing(&RoutingParams {
             dst_ip: Some("8.8.8.8".parse().unwrap()),
@@ -2698,27 +2544,19 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_ruleset_geosite_and_domain_list() {
+    fn test_compile_ruleset_domain_list() {
         let mut routing = config::RoutingConfig::default();
-        // New syntax: target_domain(geosite:cn) / target_domain(set:chinadom)
-        routing.rules.push(config::RouteRule {
-            r#match: "target_domain(geosite:cn)".to_string(),
-            action: "direct".to_string(),
-        });
         routing.rules.push(config::RouteRule {
             r#match: "target_domain(set:chinadom)".to_string(),
-            action: "block".to_string(),
+            action: "direct".to_string(),
         });
         let outbounds = config::OutboundsConfig::default();
 
         let cache = make_rule_set_cache();
         let compiled = compile_rules(&routing, &outbounds, &[], Some(&cache)).unwrap();
 
-        assert_eq!(compiled.domain_sets.len(), 2);
-        // geosite:cn → suffix:baidu.com + full:google.cn (no longer the degraded "cn")
-        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com", "full:google.cn"]);
-        // set:chinadom → suffix:example.cn
-        assert_eq!(compiled.domain_sets[1], vec!["suffix:example.cn"]);
+        assert_eq!(compiled.domain_sets.len(), 1);
+        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com", "full:google.cn", "suffix:example.cn"]);
 
         // Userspace evaluation verification
         let matcher = RoutingMatcher::from_compiled(&compiled);
@@ -2726,19 +2564,13 @@ mod tests {
             domain: Some("www.baidu.com".to_string()),
             ..Default::default()
         });
-        assert_eq!(r.outbound, outbound::DIRECT, "geosite:cn matched subdomain");
+        assert_eq!(r.outbound, outbound::DIRECT, "set:chinadom matched subdomain");
 
         let r = matcher.match_routing(&RoutingParams {
             domain: Some("google.cn".to_string()),
             ..Default::default()
         });
-        assert_eq!(r.outbound, outbound::DIRECT, "geosite:cn full matched");
-
-        let r = matcher.match_routing(&RoutingParams {
-            domain: Some("api.example.cn".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(r.outbound, outbound::BLOCK, "set:chinadom matched");
+        assert_eq!(r.outbound, outbound::DIRECT, "set:chinadom full matched");
 
         let r = matcher.match_routing(&RoutingParams {
             domain: Some("www.google.com".to_string()),
@@ -2748,27 +2580,11 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_geosite_not_degraded_to_suffix() {
-        // Legacy syntax `domain(geosite:cn)` must expand to geosite patterns, not degrade to the suffix "cn"
-        let mut routing = config::RoutingConfig::default();
-        routing.rules.push(config::RouteRule {
-            r#match: "domain(geosite:cn)".to_string(),
-            action: "direct".to_string(),
-        });
-        let outbounds = config::OutboundsConfig::default();
-        let cache = make_rule_set_cache();
-        let compiled = compile_rules(&routing, &outbounds, &[], Some(&cache)).unwrap();
-
-        assert_eq!(compiled.domain_sets.len(), 1);
-        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com", "full:google.cn"]);
-    }
-
-    #[test]
     fn test_compile_ruleset_missing_data_fails_e2103() {
-        // Missing data defaults to a compilation failure (E2103), no longer silently dropped (defect 2 fix)
+        // Missing data defaults to a compilation failure (E2103)
         let mut routing = config::RoutingConfig::default();
         routing.rules.push(config::RouteRule {
-            r#match: "target_ip(geoip:cn)".to_string(),
+            r#match: "target_ip(set:chinaip)".to_string(),
             action: "direct".to_string(),
         });
         let outbounds = config::OutboundsConfig::default();
@@ -2779,42 +2595,6 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("E2103"), "expected E2103, got: {msg}");
-
-        // Cache provided but the code does not exist → E2103
-        let mut routing2 = config::RoutingConfig::default();
-        routing2.rules.push(config::RouteRule {
-            r#match: "target_ip(geoip:us)".to_string(),
-            action: "direct".to_string(),
-        });
-        let cache = make_rule_set_cache();
-        let err = match compile_rules(&routing2, &outbounds, &[], Some(&cache)) {
-            Ok(_) => panic!("expected E2103 error"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(msg.contains("E2103"), "expected E2103 for unknown code, got: {msg}");
-    }
-
-    #[test]
-    fn test_geoip_private_falls_back_to_builtin() {
-        // geoip:private falls back to the built-in networks (warn) when no data is present; compilation succeeds
-        let mut routing = config::RoutingConfig::default();
-        routing.rules.push(config::RouteRule {
-            r#match: "target_ip(geoip:private)".to_string(),
-            action: "direct".to_string(),
-        });
-        let outbounds = config::OutboundsConfig::default();
-        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
-        assert_eq!(compiled.lpm_tries.len(), 1);
-        // 4 built-in networks
-        assert_eq!(compiled.lpm_tries[0].len(), 4);
-
-        let matcher = RoutingMatcher::from_compiled(&compiled);
-        let r = matcher.match_routing(&RoutingParams {
-            dst_ip: Some("10.0.0.1".parse().unwrap()),
-            ..Default::default()
-        });
-        assert_eq!(r.outbound, outbound::DIRECT);
     }
 
     #[test]

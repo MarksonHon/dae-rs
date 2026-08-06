@@ -21,7 +21,7 @@ last entry is the fallback:
 
 ```
 routing {
-  dip(geoip:private) -> direct
+  dip(10.0.0.0/8) -> direct
   dport(22) -> direct
   dport(443) && l4proto(tcp) -> proxy(proxy_primary)
   fallback: proxy(proxy_primary)
@@ -32,40 +32,34 @@ routing {
 
 | Function | Match type | Example |
 |----------|-----------|---------|
-| `dip(...)` / `ip(...)` / `target_ip(...)` | Destination CIDR set (LPM trie); `geoip:<code>` / `set:<name>` reference rule sets | `target_ip(geoip:cn)`, `target_ip(set:chinaip)` |
-| `sip(...)` / `source_ip(...)` | Source CIDR set; `geoip:<code>` / `set:<name>` reference rule sets | `source_ip(set:chinaip)`, `source_ip(geoip:private)` |
+| `dip(...)` / `ip(...)` / `target_ip(...)` | Destination CIDR set (LPM trie); `set:<name>` references rule sets | `target_ip(10.0.0.0/8)`, `target_ip(set:chinaip)` |
+| `sip(...)` / `source_ip(...)` | Source CIDR set; `set:<name>` references rule sets | `source_ip(set:chinaip)`, `source_ip(192.168.0.0/16)` |
 | `mac(...)` | Source MAC set (stored as IPv6-mapped LPM trie) | `mac(00:11:22:33:44:55)` |
 | `dport(...)` / `port(...)` | Destination port / range | `dport(80,443)`, `port(8000-9000)` |
 | `sport(...)` / `source_port(...)` | Source port / range | `sport(1024-65535)` |
 | `l4proto(tcp,udp)` | L4 protocol bitmask | `l4proto(tcp)` |
 | `ipversion(4,6)` | IP version bitmask | `ipversion(4)` |
-| `domain(suffix:..., keyword:..., full:..., regex:...)` / `target_domain(...)` | Domain set (DNS-driven); `geosite:<code>` / `set:<name>` reference rule sets | `target_domain(geosite:cn)`, `target_domain(set:chinadomain)` |
+| `domain(suffix:..., keyword:..., full:..., regex:...)` / `target_domain(...)` | Domain set; `set:<name>` references rule sets | `target_domain(suffix:example.com)`, `target_domain(set:chinadomain)` |
 | `process_name(...)` / `pname(...)` | Process comm (≤16 bytes) | `process_name(qbittorrent)` |
 | `dscp(...)` | DSCP value | `dscp(10)` |
-| `qtype(...)` | DNS query type (placeholder) | `qtype(a)` |
-| `upstream(...)` | DNS upstream group (≤16 bytes) | `upstream(googledns)` |
+
 
 - Functions are ANDed together with `&&` (parenthesis-aware splitting).
 - A function may be negated with `!`: `!domain(suffix:google.com)`.
 - Multiple comma-separated values are OR'd within a function; parameters can
-  carry `key:value` prefixes (`suffix:`, `keyword:`, `full:`, `regex:`,
-  `geoip:`, `geosite:`, `set:`) and parameters sharing a key form one OR-group.
+  carry `key:value` prefixes (`suffix:`, `keyword:`, `full:`, `regex:`, `set:`)
+  and parameters sharing a key form one OR-group.
 
 ### Rule-set references (data path)
 
 `source_ip` / `target_ip` / `target_domain` can reference rule sets declared in
 the `rule_set` section (full design in [`rule_set_en.md`](./rule_set_en.md)):
 
-- `source_ip(geoip:cn)` / `target_ip(geoip:cn)` — match GeoIP dat `CN`
-  (`geoip:private` matches private networks, data-driven);
 - `source_ip(set:chinaip)` / `target_ip(set:chinaip)` — match an `ip_list` entry;
-- `target_domain(geosite:cn)` — match GeoSite dat category `cn`;
 - `target_domain(set:chinadomain)` — match a `domain_list` entry.
 
-Normalization: `sip`→`source_ip`, `dip`/`ip`→`target_ip`,
-`domain(geosite:*)`→`target_domain(geosite:*)`; the old aliases stay
-compatible. `geoip:private` falls back to the built-in 4 networks with a
-warning when data is missing; other references fail to compile with E2103.
+Normalization: `sip`→`source_ip`, `dip`/`ip`→`target_ip`; the old aliases stay
+compatible. References fail to compile with E2103 when data is missing.
 
 ### Actions
 
@@ -73,7 +67,7 @@ warning when data is missing; other references fail to compile with E2103.
 - `block` — drop (outbound ID `OUTBOUND_BLOCK`).
 - `proxy(<group>)` — proxy via a group.
 - `proxy(<group>, mark=0x..., must)` — proxy with a fwmark override and/or the
-  `must` (force, bypass DNS-based routing) flag.
+  `must` (force) flag.
 - `control_plane_routing` — yield to userspace (special outbound ID, see §6).
 
 ## 3. Compile Pipeline
@@ -135,18 +129,14 @@ the real outbound ID. The eBPF `route()` walker (and the userspace
 `find_or_create_lpm_trie()` (deduplicated by an FNV-1a hash to match the
 original dae). A MatchSet of type `IP_SET`/`SOURCE_IP_SET`/`MAC` references a
 trie by index. IPv4 addresses are stored as IPv4-mapped IPv6 (96+len prefix).
-Rule-set references `target_ip(geoip:cn)` / `source_ip(set:chinaip)` are
-resolved to `Vec<IpNet>` in `parse_cidr_values()` and fed into the same trie
-(see §8).
+Rule-set references `source_ip(set:chinaip)` are resolved to `Vec<IpNet>` in
+`parse_cidr_values()` and fed into the same trie (see §8).
 
 **Domain sets**: `domain(...)` / `target_domain(...)` values are accumulated
-into `domain_sets`; the MatchSet references a set by index. At runtime, DNS
-resolutions populate `domain_routing_map` (IP → bitmap of matching sets) — see
-`docs/design/dns_en.md` §5. Rule-set references
-`target_domain(geosite:cn)` / `target_domain(set:chinadomain)` look up the
-in-memory cache and map the Domain list via `domain_pattern_to_string()` into
-prefixed patterns (`suffix:`/`full:`/`regex:`/`domain:`/`keyword:`) in the same
-`domain_sets`.
+into `domain_sets`; the MatchSet references a set by index. Rule-set references
+`target_domain(set:chinadomain)` look up the in-memory cache and map the
+Domain list via `domain_pattern_to_string()` into prefixed patterns
+(`suffix:`/`full:`/`regex:`/`domain:`/`keyword:`) in the same `domain_sets`.
 
 **Proxy auto-direct**: all configured proxy server IPs are collected into a
 dedicated LPM trie, and a `dip(proxy_server_ip) -> direct` rule is prepended.
@@ -192,8 +182,8 @@ mark, must }`. It evaluates `dip`/`sip` against the LPM tries, `domain` against
 
 ## 6. Routing Handoff (userspace completion of eBPF decisions)
 
-Some decisions cannot be made in the kernel (e.g. domain rules before the DNS
-resolution is known). The design is:
+Some decisions cannot be made in the kernel (e.g. domain rule matching). The
+design is:
 
 1. When the eBPF route cannot decide, the MatchSet chain ends at
    `OUTBOUND_CONTROL_PLANE_ROUTING (0xFD)`.
@@ -219,10 +209,6 @@ Supporting machinery:
 
 ## 7. Current Limitations
 
-- `qtype(...)` compiles to a placeholder MatchSet (full DNS query-type matching
-  is not implemented).
-- `upstream(...)` is a placeholder for DNS upstream-group matching in the data
-  path.
 - Group/node outbound IDs currently map to `OUTBOUND_CONTROL_PLANE_ROUTING`,
   so proxying decisions for proxied groups are completed in userspace.
 - `MAC` matching is only meaningful in the kernel (no userspace equivalent);
@@ -241,12 +227,11 @@ overflow is detected at compile time and rejected with E2106:
 | MatchSet entries per epoch slot | `MAX_MATCH_SET_LEN = 1024` | Includes logical chains and fallback; rule-set functions share the pool with existing functions |
 | LPM tries (userspace compile time) | `MAX_LPM_NUM = 1032` | `matcher.rs` |
 | LPM trie outer array (eBPF double buffer) | `2 * 1024 + 8 = 2056` | `bpf/kern/tproxy.c` |
-| Entries inside one LPM trie | `MAX_LPM_SIZE = 2_048_000` | ~2M CIDRs per trie (GeoIP CN is far smaller) |
-| domain_routing_map bitmap | 32 × u32 (=1024 bit) | **Domain-set rule index limit 1024** (each geosite/set domain reference uses 1 bit) |
+| Entries inside one LPM trie | `MAX_LPM_SIZE = 2_048_000` | ~2M CIDRs per trie |
+| domain_routing_map bitmap | 32 × u32 (=1024 bit) | **Domain-set rule index limit 1024** (each set domain reference uses 1 bit) |
 
-- Typical magnitudes: GeoIP `cn` ~2k–10k CIDRs, geosite `cn` ~5k–50k domains —
-  all far below single-trie / single-bitmap capacity; **the bottleneck is the
-  MatchSet count and the domain-set index count (rule count)**.
+- **The bottleneck is the MatchSet count and the domain-set index count (rule
+  count)**.
 - On overflow, compilation is **rejected with E2106**, prompting fewer rules /
-  merged references / smaller geosite codes; sampling truncation is an optional
-  Phase-5 degradation (off by default).
+  merged references; sampling truncation is an optional Phase-5 degradation
+  (off by default).

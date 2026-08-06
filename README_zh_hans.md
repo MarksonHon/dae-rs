@@ -27,7 +27,5 @@ Linux 高性能透明代理解决方案。
 
 - 配置说明：[`docs/config/config_zh_hans.md`](./docs/config/config_zh_hans.md)
   · [`docs/config/config_en.md`](./docs/config/config_en.md)
-- DNS 子系统设计：[`docs/design/dns_zh_hans.md`](./docs/design/dns_zh_hans.md)
-  · [`docs/design/dns_en.md`](./docs/design/dns_en.md)
 - 路由子系统设计：[`docs/design/routing_zh_hans.md`](./docs/design/routing_zh_hans.md)
   · [`docs/design/routing_en.md`](./docs/design/routing_en.md)

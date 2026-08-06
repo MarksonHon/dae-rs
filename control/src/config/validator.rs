@@ -5,7 +5,6 @@
 
 use super::*;
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 
 use crate::ruleset::types::{parse_period, parse_time};
 // ============================================================================
@@ -55,10 +54,7 @@ pub fn validate_config(config: &DaefileConfig) -> std::result::Result<(), Config
     // 8. API validation
     validate_api(config)?;
 
-    // 9. DNS validation
-    validate_dns(config)?;
-
-    // 10. Rule set validation (E2101 / E2104 / E2105)
+    // 9. Rule set validation (E2101 / E2104 / E2105)
     validate_rule_set(config)?;
 
     Ok(())
@@ -398,121 +394,6 @@ fn validate_api(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
     Ok(())
 }
 
-/// DNS validation
-fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> {
-    let dns = match config.dns.as_ref() {
-        Some(d) => d,
-        None => return Ok(()),
-    };
-
-    // Validate starting_dns
-    if dns.starting_dns.ip_version_prefer != 4 && dns.starting_dns.ip_version_prefer != 6 {
-        return Err(ConfigError::DnsIpVersionPreferInvalid {
-            value: dns.starting_dns.ip_version_prefer,
-        });
-    }
-    if dns.starting_dns.upstream.is_empty() {
-        return Err(ConfigError::DnsStartingDnsNoUpstream);
-    }
-
-    // starting_dns upstreams must be IP addresses (hostnames can't bootstrap).
-    use crate::dns::upstream::parse_dns_url_parts;
-    for addr in &dns.starting_dns.upstream {
-        let parts = parse_dns_url_parts(addr).map_err(|e| ConfigError::InvalidValue {
-            line: 0,
-            field: "dns.starting_dns.upstream".into(),
-            message: format!("invalid starting_dns upstream '{}': {}", addr, e),
-        })?;
-        if parts.host.parse::<IpAddr>().is_err() {
-            return Err(ConfigError::InvalidValue {
-                line: 0,
-                field: "dns.starting_dns.upstream".into(),
-                message: format!(
-                    "starting_dns upstream '{}' must use an IP address (hostname '{}' cannot bootstrap)",
-                    addr, parts.host
-                ),
-            });
-        }
-    }
-
-    // Collect DNS group names
-    let dns_group_names: std::collections::HashSet<&str> =
-        dns.groups.iter().map(|g| g.name.as_str()).collect();
-
-    // Validate DNS group names uniqueness
-    let mut seen = std::collections::HashSet::new();
-    for group in &dns.groups {
-        if !seen.insert(&group.name) {
-            return Err(ConfigError::DnsDuplicateGroup {
-                name: group.name.clone(),
-            });
-        }
-    }
-
-    // Validate each DNS group
-    for group in &dns.groups {
-        // "direct" is a reserved send_by keyword and cannot be used as a group name
-        if group.name == "direct" {
-            return Err(ConfigError::DnsNameConflict {
-                name: group.name.clone(),
-            });
-        }
-        // send_by must be "direct" or reference a valid proxy group
-        if group.send_by != "direct" {
-            let proxy_group_names: std::collections::HashSet<&str> =
-                config.outbounds.groups.iter().map(|g| g.name.as_str()).collect();
-            if !proxy_group_names.contains(group.send_by.as_str()) {
-                return Err(ConfigError::DnsUnknownSendByGroup {
-                    dns_group: group.name.clone(),
-                    send_by: group.send_by.clone(),
-                });
-            }
-        }
-
-        // At least one upstream
-        if group.upstream.is_empty() {
-            return Err(ConfigError::DnsGroupNoUpstream {
-                group: group.name.clone(),
-            });
-        }
-    }
-
-    // Validate module-level response_action: fallback must be `accept`, `reject`,
-    // or an upstream label that exists in at least one group (requery targets an
-    // upstream within the group that answered).
-    if let Some(ref resp) = dns.response_action {
-        if resp.fallback != "accept" && resp.fallback != "reject" {
-            let all_upstream_labels: std::collections::HashSet<&str> = dns
-                .groups
-                .iter()
-                .flat_map(|g| g.upstream.iter().map(|u| u.label.as_str()))
-                .collect();
-            if !all_upstream_labels.contains(resp.fallback.as_str()) {
-                return Err(ConfigError::DnsUnknownGroup {
-                    group: resp.fallback.clone(),
-                });
-            }
-        }
-    }
-
-    // Validate top-level DNS routing references
-    if !dns.routing.fallback.is_empty()
-        && !dns_group_names.contains(dns.routing.fallback.as_str()) {
-            return Err(ConfigError::DnsFallbackUnknownGroup {
-                group: dns.routing.fallback.clone(),
-            });
-        }
-    for rule in &dns.routing.rules {
-        if !dns_group_names.contains(rule.action.as_str()) {
-            return Err(ConfigError::DnsUnknownGroup {
-                group: rule.action.clone(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
 /// Rule set validation (design §5.3 / §8.2).
 ///
 /// 1. name uniqueness (including default=block name, parser fills block name into `name`) → E2101;
@@ -568,61 +449,31 @@ fn validate_rule_set(config: &DaefileConfig) -> std::result::Result<(), ConfigEr
     Ok(())
 }
 
-/// Ruleset reference extraction regex: `(geoip|geosite|set):<value>`.
+/// Ruleset reference extraction regex: `set:<value>`.
 ///
-/// value allows `[A-Za-z0-9_!@.\-]` (covering ruleset name naming constraint and geosite category names like
-/// `geolocation-!cn`). Static phase only validates `set:` name integrity and geoip/geosite
-/// entry existence; whether specific code exists in dat data is validated at compile time (E2103).
+/// value allows `[A-Za-z0-9_!@.\-]` (covering ruleset name naming constraint).
 static RULESET_REF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 fn ruleset_ref_re() -> &'static regex::Regex {
     RULESET_REF_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)(geoip|geosite|set):([A-Za-z0-9_!@.\-]+)")
+        regex::Regex::new(r"(?i)set:([A-Za-z0-9_!@.\-]+)")
             .expect("valid ruleset ref regex")
     })
 }
 
-/// E2102: ruleset reference integrity validation in Routing / DNS routing / DNS response Routing.
+/// E2102: ruleset reference integrity validation in Routing.
 ///
-/// - `set:<name>` **must always** hit an entry in `rule_set` (name subject to naming constraint) → otherwise E2102;
-/// - `geoip:<code>` / `geosite:<code>`: **when `rule_set` is configured** at least one
-///   entry of corresponding type → otherwise E2102; when `rule_set` is not configured at all, allow (`geoip:private`
-///   has built-in fallback; whether specific `geosite:`/`geoip:` code exists is validated at compile time E2103).
+/// - `set:<name>` **must always** hit an entry in `rule_set` (name subject to naming constraint) → otherwise E2102.
 fn validate_ruleset_refs(
     config: &DaefileConfig,
     name_to_type: &HashMap<String, RuleSetType>,
 ) -> std::result::Result<(), ConfigError> {
-    let has_geoip = name_to_type.values().any(|t| *t == RuleSetType::GeoIp);
-    let has_geosite = name_to_type.values().any(|t| *t == RuleSetType::GeoSite);
-    // When rule_set is not configured at all, geoip/geosite entry existence is handled at compile time (E2103)
-    let rule_set_configured = !name_to_type.is_empty();
-
     let check_expr = |expr: &str| -> std::result::Result<(), ConfigError> {
         for cap in ruleset_ref_re().captures_iter(expr) {
-            let kind = cap[1].to_ascii_lowercase();
-            let value = cap[2].to_string();
-            match kind.as_str() {
-                "set" => {
-                    if !name_to_type.contains_key(&value) {
-                        return Err(ConfigError::UnknownRuleSetRef {
-                            reference: format!("set:{value}"),
-                        });
-                    }
-                }
-                "geoip" => {
-                    if rule_set_configured && !has_geoip {
-                        return Err(ConfigError::UnknownRuleSetRef {
-                            reference: format!("geoip:{value}"),
-                        });
-                    }
-                }
-                "geosite" => {
-                    if rule_set_configured && !has_geosite {
-                        return Err(ConfigError::UnknownRuleSetRef {
-                            reference: format!("geosite:{value}"),
-                        });
-                    }
-                }
-                _ => {}
+            let value = cap[1].to_string();
+            if !name_to_type.contains_key(&value) {
+                return Err(ConfigError::UnknownRuleSetRef {
+                    reference: format!("set:{value}"),
+                });
             }
         }
         Ok(())
@@ -631,18 +482,6 @@ fn validate_ruleset_refs(
     // data plane Routing rules
     for rule in &config.routing.rules {
         check_expr(&rule.r#match)?;
-    }
-
-    // DNS top-level Routing + module-level response_action expressions
-    if let Some(dns) = &config.dns {
-        for rule in &dns.routing.rules {
-            check_expr(&rule.r#match)?;
-        }
-        if let Some(resp) = &dns.response_action {
-            for rule in &resp.rules {
-                check_expr(&rule.r#match)?;
-            }
-        }
     }
 
     Ok(())

@@ -17,7 +17,7 @@
 
 ```
 routing {
-  dip(geoip:private) -> direct
+  dip(10.0.0.0/8) -> direct
   dport(22) -> direct
   dport(443) && l4proto(tcp) -> proxy(proxy_primary)
   fallback: proxy(proxy_primary)
@@ -28,47 +28,41 @@ routing {
 
 | 函数 | 匹配类型 | 示例 |
 |------|----------|------|
-| `dip(...)` / `ip(...)` / `target_ip(...)` | 目标 CIDR 集合（LPM 前缀树）；`geoip:<code>` / `set:<name>` 引用规则集 | `target_ip(geoip:cn)`、`target_ip(set:chinaip)` |
-| `sip(...)` / `source_ip(...)` | 源 CIDR 集合；`geoip:<code>` / `set:<name>` 引用规则集 | `source_ip(set:chinaip)`、`source_ip(geoip:private)` |
+| `dip(...)` / `ip(...)` / `target_ip(...)` | 目标 CIDR 集合（LPM 前缀树）；`set:<name>` 引用规则集 | `target_ip(10.0.0.0/8)`、`target_ip(set:chinaip)` |
+| `sip(...)` / `source_ip(...)` | 源 CIDR 集合；`set:<name>` 引用规则集 | `source_ip(set:chinaip)`、`source_ip(192.168.0.0/16)` |
 | `mac(...)` | 源 MAC 集合（以 IPv6 映射形式存进 LPM 前缀树） | `mac(00:11:22:33:44:55)` |
 | `dport(...)` / `port(...)` | 目标端口 / 端口段 | `dport(80,443)`、`port(8000-9000)` |
 | `sport(...)` / `source_port(...)` | 源端口 / 端口段 | `sport(1024-65535)` |
 | `l4proto(tcp,udp)` | 四层协议位掩码 | `l4proto(tcp)` |
 | `ipversion(4,6)` | IP 版本位掩码 | `ipversion(4)` |
-| `domain(suffix:..., keyword:..., full:..., regex:...)` / `target_domain(...)` | 域名集合（由 DNS 驱动）；`geosite:<code>` / `set:<name>` 引用规则集 | `target_domain(geosite:cn)`、`target_domain(set:chinadomain)` |
+| `domain(suffix:..., keyword:..., full:..., regex:...)` / `target_domain(...)` | 域名集合；`set:<name>` 引用规则集 | `target_domain(suffix:example.com)`、`target_domain(set:chinadomain)` |
 | `process_name(...)` / `pname(...)` | 进程 comm 名（≤16 字节） | `process_name(qbittorrent)` |
 | `dscp(...)` | DSCP 值 | `dscp(10)` |
-| `qtype(...)` | DNS 查询类型（占位） | `qtype(a)` |
-| `upstream(...)` | DNS 上游分组（≤16 字节） | `upstream(googledns)` |
+
 
 - 函数之间用 `&&` 求 AND（按括号感知拆分）。
 - 函数可用 `!` 取反：`!domain(suffix:google.com)`。
 - 函数内多个逗号分隔的值按 OR 处理；参数可带 `key:value` 前缀（`suffix:`、
-  `keyword:`、`full:`、`regex:`、`geoip:`、`geosite:`、`set:`），同 key 的参数
-  构成一个 OR 组。
+  `keyword:`、`full:`、`regex:`、`set:`），同 key 的参数构成一个 OR 组。
 
 ### 规则集引用（数据面）
 
 `source_ip` / `target_ip` / `target_domain` 支持引用 `rule_set` 区块配置的
 规则集（完整设计见 [`rule_set_zh_hans.md`](./rule_set_zh_hans.md)）：
 
-- `source_ip(geoip:cn)` / `target_ip(geoip:cn)` — 命中 GeoIP dat 的 `CN`
-  （`geoip:private` 命中私有网段，数据驱动）；
 - `source_ip(set:chinaip)` / `target_ip(set:chinaip)` — 命中 `ip_list` 条目；
-- `target_domain(geosite:cn)` — 命中 GeoSite dat 的 `cn` 分类；
 - `target_domain(set:chinadomain)` — 命中 `domain_list` 条目。
 
-归一化：`sip`→`source_ip`、`dip`/`ip`→`target_ip`、`domain(geosite:*)`→
-`target_domain(geosite:*)`，旧别名保持兼容。`geoip:private` 在数据缺失时
-回退内置 4 网段并告警；其它引用数据缺失时编译报错（E2103）。
+归一化：`sip`→`source_ip`、`dip`/`ip`→`target_ip`，旧别名保持兼容。
+引用数据缺失时编译报错（E2103）。
 
 ### 动作
 
 - `direct` — 直接出站（outbound ID `OUTBOUND_DIRECT`）。
 - `block` — 丢弃（outbound ID `OUTBOUND_BLOCK`）。
 - `proxy(<group>)` — 经分组走代理。
-- `proxy(<group>, mark=0x..., must)` — 携带 fwmark 覆盖和/或 `must`（强制、
-  绕过基于 DNS 的路由）标志的代理。
+- `proxy(<group>, mark=0x..., must)` — 携带 fwmark 覆盖和/或 `must`（强制）
+  标志的代理。
 - `control_plane_routing` — 交给用户空间（特殊 outbound ID，见 §6）。
 
 ## 3. 编译管线
@@ -126,13 +120,11 @@ CompiledRouting { match_sets, lpm_tries, domain_sets, fallback_* }
 **LPM 前缀树**：CIDR 值经 `find_or_create_lpm_trie()` 收集进前缀树
 （按 FNV-1a 哈希去重，与原始 dae 一致）。`IP_SET` / `SOURCE_IP_SET` / `MAC`
 类型的 MatchSet 按索引引用前缀树。IPv4 地址以 IPv4-mapped IPv6 形式存储
-（前缀 96+len）。规则集引用 `target_ip(geoip:cn)` / `source_ip(set:chinaip)`
-在 `parse_cidr_values()` 中解析为 `Vec<IpNet>`，经同一函数汇入前缀树（§9）。
+（前缀 96+len）。规则集引用 `source_ip(set:chinaip)` 在 `parse_cidr_values()`
+中解析为 `Vec<IpNet>`，经同一函数汇入前缀树（§9）。
 
 **域名集合**：`domain(...)` / `target_domain(...)` 值累积进 `domain_sets`，
-MatchSet 按索引引用。运行时由 DNS 解析结果填充 `domain_routing_map`
-（IP → 命中集合的位图）——见 `docs/design/dns_zh_hans.md` §5。规则集引用
-`target_domain(geosite:cn)` / `target_domain(set:chinadomain)` 查内存缓存，
+MatchSet 按索引引用。规则集引用 `target_domain(set:chinadomain)` 查内存缓存，
 把 Domain 列表经 `domain_pattern_to_string()` 映射为带 key 前缀的模式条目
 （`suffix:`/`full:`/`regex:`/`domain:`/`keyword:`）后进入同一 `domain_sets`。
 
@@ -177,7 +169,7 @@ MatchSet 链，返回 `RoutingResult { outbound, mark, must }`。它会对 LPM �
 
 ## 6. 路由交接（用户空间补全 eBPF 决策）
 
-有些决策无法在内核完成（如 DNS 解析未知时的域名规则）。设计如下：
+有些决策无法在内核完成（如域名规则匹配）。设计如下：
 
 1. eBPF 路由无法决策时，MatchSet 链以 `OUTBOUND_CONTROL_PLANE_ROUTING (0xFD)`
    收尾。
@@ -199,8 +191,6 @@ MatchSet 链，返回 `RoutingResult { outbound, mark, must }`。它会对 LPM �
 
 ## 7. 当前限制
 
-- `qtype(...)` 编译为占位 MatchSet（完整的 DNS 查询类型匹配未实现）。
-- `upstream(...)` 在数据通路中是 DNS 上游分组匹配的占位。
 - 分组/节点 outbound ID 目前映射到 `OUTBOUND_CONTROL_PLANE_ROUTING`，
   即走代理分组的决策由用户空间补全。
 - `MAC` 匹配只在内核中有意义（用户空间无对应物）；用户空间匹配器对其
@@ -216,10 +206,9 @@ MatchSet 链，返回 `RoutingResult { outbound, mark, must }`。它会对 LPM �
 | MatchSet 条目总数（每 epoch 槽） | `MAX_MATCH_SET_LEN = 1024` | 含逻辑链与 fallback；规则集函数与既有函数共用此池 |
 | LPM trie 数（用户空间编译期） | `MAX_LPM_NUM = 1032` | [`matcher.rs`](../config/../../control/src/routing/matcher.rs:30) |
 | LPM trie 外层数组（eBPF 双缓冲） | `2 * 1024 + 8 = 2056` | `bpf/kern/tproxy.c` |
-| 单个 LPM trie 内部条目 | `MAX_LPM_SIZE = 2_048_000` | 单 trie 可容纳约 200 万 CIDR（GeoIP CN 远小于此） |
-| domain_routing_map 位图 | 32 个 u32（=1024 bit） | **域名集规则索引上限 1024**（每个 geosite/set 域名引用占 1 bit） |
+| 单个 LPM trie 内部条目 | `MAX_LPM_SIZE = 2_048_000` | 单 trie 可容纳约 200 万 CIDR |
+| domain_routing_map 位图 | 32 个 u32（=1024 bit） | **域名集规则索引上限 1024**（每个 set 域名引用占 1 bit） |
 
-- 典型量级：GeoIP `cn` 约 2k–10k CIDR、geosite `cn` 约 5k–50k 域名，均远小于
-  单 trie / 位图单索引容量；**瓶颈在 MatchSet 总数与域名集索引数（规则数量）**。
-- 超限时**拒绝编译并报错**（E2106），提示精简规则 / 合并引用 / 拆分 geosite code；
-  采样截断等降级策略为阶段 5 可选（默认关闭）。
+- **瓶颈在 MatchSet 总数与域名集索引数（规则数量）**。
+- 超限时**拒绝编译并报错**（E2106），提示精简规则 / 合并引用；采样截断等
+  降级策略为阶段 5 可选（默认关闭）。

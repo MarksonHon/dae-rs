@@ -35,23 +35,6 @@ enum ParseState {
     Routing,
     /// Inside api section
     Api,
-    // ── DNS states ──
-    /// Inside dns section
-    Dns,
-    /// Inside dns > starting_dns block
-    DnsStartingDns,
-    /// Inside dns > cache block
-    DnsCache,
-    /// Inside dns > groups section
-    DnsGroups,
-    /// Inside a specific dns group block
-    DnsGroup(String),
-    /// Inside dns group > upstream block
-    DnsGroupUpstream(String), // group_name
-    /// Inside dns > routing block (DNS routing)
-    DnsRouting,
-    /// Inside dns > response_action block (module-level response filtering)
-    DnsResponseAction,
     // ── Rule set states ──
     /// Inside rule_set section
     RuleSet,
@@ -117,23 +100,10 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
 
     let mut process_match = ProcessMatchConfig::default();
 
-    // DNS section parsing temporary variables
-    let mut current_dns_config: Option<DnsConfig> = None;
-    let mut current_dns_group = DnsGroupConfig {
-        name: String::new(),
-        send_by: String::new(),
-        query_mode: DnsQueryMode::default(),
-        upstream: Vec::new(),
-    };
-    let mut current_dns_route_rules: Vec<DnsRouteRule> = Vec::new();
-    let mut current_dns_route_fallback = String::new();
-    let mut current_dns_resp_rules: Vec<DnsResponseRule> = Vec::new();
-    let mut current_dns_resp_fallback = String::new();
-
     // Rule set section parsing temporary variables
     let mut current_rule_set = RuleSetConfig {
         name: String::new(),
-        r#type: RuleSetType::GeoIp,
+        r#type: RuleSetType::IpList,
         url: String::new(),
         expected_sha256: None,
         update: None,
@@ -165,10 +135,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         "outbounds" => state = ParseState::Outbounds,
                         "routing" => state = ParseState::Routing,
                         "api" => state = ParseState::Api,
-                        "dns" => {
-                            current_dns_config = Some(DnsConfig::default());
-                            state = ParseState::Dns;
-                        }
                         "rule_set" => state = ParseState::RuleSet,
                         _ => {
                             return Err(ConfigError::UnknownSection {
@@ -719,365 +685,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 })?;
             }
 
-            // ── dns (top-level) ──
-            ParseState::Dns => {
-                if line == "}" {
-                    // Finalize DNS config
-                    if let Some(dns_cfg) = current_dns_config.take() {
-                        config.dns = Some(dns_cfg);
-                    }
-                    state = ParseState::Top;
-                    continue;
-                }
-                // Handle sub-sections inside dns
-                if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
-                    match section_name {
-                        "starting_dns" => {
-                            state = ParseState::DnsStartingDns;
-                        }
-                        "cache" => {
-                            state = ParseState::DnsCache;
-                        }
-                        "groups" => {
-                            state = ParseState::DnsGroups;
-                        }
-                        "routing" => {
-                            current_dns_route_rules.clear();
-                            current_dns_route_fallback.clear();
-                            state = ParseState::DnsRouting;
-                        }
-                        "response_action" => {
-                            current_dns_resp_rules.clear();
-                            current_dns_resp_fallback = "accept".into();
-                            state = ParseState::DnsResponseAction;
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown dns sub-section: '{}'", section_name),
-                            });
-                        }
-                    }
-                    continue;
-                }
-                // Handle key-value pairs at dns level (e.g. bind)
-                parse_kv_pair(line, line_number, |key, value| {
-                    match key {
-                        "bind" => {
-                            if let Some(ref mut dns) = current_dns_config {
-                                dns.bind = unquote(value).to_string();
-                            }
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown dns field: '{}'", key),
-                            });
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-
-            // ── dns > starting_dns ──
-            ParseState::DnsStartingDns => {
-                if line == "}" {
-                    state = ParseState::Dns;
-                    continue;
-                }
-                parse_kv_pair(line, line_number, |key, value| {
-                    match key {
-                        "ip_version_prefer" => {
-                            let v: u8 = value.parse().map_err(|_| ConfigError::FieldType {
-                                line: line_number,
-                                field: key.into(),
-                                message: format!("cannot parse as integer: '{}'", value),
-                            })?;
-                            if let Some(ref mut dns) = current_dns_config {
-                                dns.starting_dns.ip_version_prefer = v;
-                            }
-                        }
-                        // upstream is a flat list of IP DNS addresses:
-                        //   upstream: ['udp://223.5.5.5:53', 'udp://1.1.1.1:53']
-                        // or a single quoted address:
-                        //   upstream: 'udp://223.5.5.5:53'
-                        "upstream" => {
-                            let addrs = parse_string_list(value, line_number, "starting_dns upstream")
-                                .or_else(|_| {
-                                    // Fall back to a single unquoted/optionally-quoted address.
-                                    let a = unquote(value);
-                                    if a.trim().is_empty() {
-                                        Err(ConfigError::Syntax {
-                                            line: line_number,
-                                            message: format!("starting_dns upstream cannot be empty"),
-                                        })
-                                    } else {
-                                        Ok(vec![a.to_string()])
-                                    }
-                                })?;
-                            if let Some(ref mut dns) = current_dns_config {
-                                dns.starting_dns.upstream = addrs;
-                            }
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown starting_dns field: '{}'", key),
-                            });
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-
-            // ── dns > cache ──
-            ParseState::DnsCache => {
-                if line == "}" {
-                    state = ParseState::Dns;
-                    continue;
-                }
-                parse_kv_pair(line, line_number, |key, value| {
-                    if let Some(ref mut dns) = current_dns_config {
-                        match key {
-                            "enabled" => {
-                                dns.cache.enabled = parse_bool(value).map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as boolean: '{}'", value),
-                                })?;
-                            }
-                            "max_size" => {
-                                dns.cache.max_size = value.parse().map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as integer: '{}'", value),
-                                })?;
-                            }
-                            "max_ttl" => {
-                                dns.cache.max_ttl = value.parse().map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as integer: '{}'", value),
-                                })?;
-                            }
-                            "min_ttl" => {
-                                dns.cache.min_ttl = value.parse().map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as integer: '{}'", value),
-                                })?;
-                            }
-                            "optimistic_cache" => {
-                                dns.cache.optimistic_cache = parse_bool(value).map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as boolean: '{}'", value),
-                                })?;
-                            }
-                            "optimistic_cache_ttl" => {
-                                dns.cache.optimistic_cache_ttl = value.parse().map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as integer: '{}'", value),
-                                })?;
-                            }
-                            "background_refresh" => {
-                                dns.cache.background_refresh = parse_bool(value).map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as boolean: '{}'", value),
-                                })?;
-                            }
-                            "refresh_threshold_percent" => {
-                                dns.cache.refresh_threshold_percent = value.parse().map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as integer: '{}'", value),
-                                })?;
-                            }
-                            "serve_stale_ttl" => {
-                                dns.cache.serve_stale_ttl = value.parse().map_err(|_| ConfigError::FieldType {
-                                    line: line_number,
-                                    field: key.into(),
-                                    message: format!("cannot parse as integer: '{}'", value),
-                                })?;
-                            }
-                            _ => {
-                                return Err(ConfigError::Syntax {
-                                    line: line_number,
-                                    message: format!("unknown dns cache field: '{}'", key),
-                                });
-                            }
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-
-            // ── dns > groups ──
-            ParseState::DnsGroups => {
-                if line == "}" {
-                    state = ParseState::Dns;
-                    continue;
-                }
-                // Group declaration: group_name {
-                let name = line.strip_suffix('{').map(|s| s.trim()).map(String::from);
-                if let Some(ref name) = name {
-                    if !name.is_empty() && !name.contains(' ') {
-                        current_dns_group = DnsGroupConfig {
-                            name: name.clone(),
-                            send_by: String::new(),
-                            query_mode: DnsQueryMode::default(),
-                            upstream: Vec::new(),
-                        };
-                        state = ParseState::DnsGroup(name.clone());
-                        continue;
-                    }
-                }
-                return Err(ConfigError::Syntax {
-                    line: line_number,
-                    message: format!("expected DNS group declaration (e.g. `trusted_dns {{`), got: '{}'", line),
-                });
-            }
-
-            // ── dns > groups > group_name ──
-            ParseState::DnsGroup(group_name) => {
-                if line == "}" {
-                    // Finalize group and add to config
-                    let group = std::mem::replace(&mut current_dns_group, DnsGroupConfig {
-                        name: String::new(),
-                        send_by: String::new(),
-                        query_mode: DnsQueryMode::default(),
-                        upstream: Vec::new(),
-                    });
-                    if let Some(ref mut dns) = current_dns_config {
-                        dns.groups.push(group);
-                    }
-                    state = ParseState::DnsGroups;
-                    continue;
-                }
-                // Handle sub-sections inside group
-                if let Some(section_name) = line.strip_suffix('{').map(|s| s.trim()) {
-                    match section_name {
-                        "upstream" => {
-                            state = ParseState::DnsGroupUpstream(group_name.clone());
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown DNS group sub-section: '{}'", section_name),
-                            });
-                        }
-                    }
-                    continue;
-                }
-                // Handle send_by / query_mode bindings
-                parse_kv_pair(line, line_number, |key, value| {
-                    match key {
-                        "send_by" => {
-                            current_dns_group.send_by = unquote(value).to_string();
-                        }
-                        "query_mode" => {
-                            let mode = parse_query_mode(unquote(value), line_number)?;
-                            current_dns_group.query_mode = mode;
-                        }
-                        _ => {
-                            return Err(ConfigError::Syntax {
-                                line: line_number,
-                                message: format!("unknown DNS group field: '{}'", key),
-                            });
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-
-            // ── dns group > upstream ──
-            ParseState::DnsGroupUpstream(group_name) => {
-                if line == "}" {
-                    state = ParseState::DnsGroup(group_name.clone());
-                    continue;
-                }
-                // Parse label: 'url' pairs
-                parse_kv_pair(line, line_number, |key, value| {
-                    current_dns_group.upstream.push(DnsUpstreamEntry {
-                        label: key.to_string(),
-                        address: unquote(value).to_string(),
-                    });
-                    Ok(())
-                })?;
-            }
-
-            // ── dns > routing (top-level DNS routing) ──
-            ParseState::DnsRouting => {
-                if line == "}" {
-                    if let Some(ref mut dns) = current_dns_config {
-                        dns.routing = DnsRoutingConfig {
-                            rules: std::mem::take(&mut current_dns_route_rules),
-                            fallback: std::mem::take(&mut current_dns_route_fallback),
-                        };
-                    }
-                    state = ParseState::Dns;
-                    continue;
-                }
-                // Handle fallback: action
-                if let Some(action) = line.strip_prefix("fallback:").map(|s| s.trim()) {
-                    current_dns_route_fallback = action.to_string();
-                    continue;
-                }
-                // Handle rule line: expr -> action
-                if let Some(arrow_pos) = line.find("->") {
-                    let expr = line[..arrow_pos].trim();
-                    let action = line[arrow_pos + 2..].trim();
-                    if !expr.is_empty() && !action.is_empty() {
-                        current_dns_route_rules.push(DnsRouteRule {
-                            r#match: expr.to_string(),
-                            action: action.to_string(),
-                        });
-                        continue;
-                    }
-                }
-                return Err(ConfigError::Syntax {
-                    line: line_number,
-                    message: format!("expected DNS routing rule or fallback, got: '{}'", line),
-                });
-            }
-
-            // ── dns > response_action (module-level response filtering) ──
-            ParseState::DnsResponseAction => {
-                if line == "}" {
-                    if let Some(ref mut dns) = current_dns_config {
-                        dns.response_action = Some(DnsResponseActionConfig {
-                            rules: std::mem::take(&mut current_dns_resp_rules),
-                            fallback: std::mem::take(&mut current_dns_resp_fallback),
-                        });
-                    }
-                    state = ParseState::Dns;
-                    continue;
-                }
-                // Handle fallback: action
-                if let Some(action) = line.strip_prefix("fallback:").map(|s| s.trim()) {
-                    current_dns_resp_fallback = action.to_string();
-                    continue;
-                }
-                // Handle rule line: expr -> action
-                if let Some(arrow_pos) = line.find("->") {
-                    let expr = line[..arrow_pos].trim();
-                    let action = line[arrow_pos + 2..].trim();
-                    if !expr.is_empty() && !action.is_empty() {
-                        current_dns_resp_rules.push(DnsResponseRule {
-                            r#match: expr.to_string(),
-                            action: action.to_string(),
-                        });
-                        continue;
-                    }
-                }
-                return Err(ConfigError::Syntax {
-                    line: line_number,
-                    message: format!("expected response action rule or fallback, got: '{}'", line),
-                });
-            }
-
             // ── rule_set (top-level) ──
             ParseState::RuleSet => {
                 if line == "}" {
@@ -1089,7 +696,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                     if !name.is_empty() && !name.contains(' ') {
                         current_rule_set = RuleSetConfig {
                             name: name.to_string(),
-                            r#type: RuleSetType::GeoIp,
+                            r#type: RuleSetType::IpList,
                             url: String::new(),
                             expected_sha256: None,
                             update: None,
@@ -1117,7 +724,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         &mut current_rule_set,
                         RuleSetConfig {
                             name: String::new(),
-                            r#type: RuleSetType::GeoIp,
+                            r#type: RuleSetType::IpList,
                             url: String::new(),
                             expected_sha256: None,
                             update: None,
@@ -1135,8 +742,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         "type" => {
                             let v = unquote(value);
                             current_rule_set.r#type = match v {
-                                "geoip" => RuleSetType::GeoIp,
-                                "geosite" => RuleSetType::GeoSite,
                                 "domain_list" => RuleSetType::DomainList,
                                 "ip_list" => RuleSetType::IpList,
                                 _ => {
@@ -1144,7 +749,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                                         line: line_number,
                                         field: format!("rule_set.{}.type", entry_name),
                                         message: format!(
-                                            "unknown rule set type '{}', expected geoip/geosite/domain_list/ip_list",
+                                            "unknown rule set type '{}', expected domain_list/ip_list",
                                             v
                                         ),
                                     });
@@ -1286,49 +891,6 @@ fn parse_map_value(
         map.insert(key.to_string(), val.to_string());
     }
     Ok(map)
-}
-
-/// Parse a string list value of the form `['a', 'b', 'c']` into a `Vec<String>`.
-///
-/// Items may be single or double quoted, or bare (no quotes). Empty items are skipped.
-fn parse_string_list(
-    value: &str,
-    line_number: usize,
-    field: &str,
-) -> Result<Vec<String>> {
-    let value = value.trim();
-    let inner = value
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| ConfigError::Syntax {
-            line: line_number,
-            message: format!("field '{}' expected list syntax `[ ... ]`, got: '{}'", field, value),
-        })?;
-    let mut out = Vec::new();
-    for entry in inner.split(',') {
-        let entry = unquote(entry.trim());
-        if !entry.is_empty() {
-            out.push(entry.to_string());
-        }
-    }
-    Ok(out)
-}
-
-/// Parse a DNS group `query_mode` value: `concurrent` | `random` | `sequence`.
-fn parse_query_mode(value: &str, line_number: usize) -> Result<DnsQueryMode> {
-    match value.trim().to_lowercase().as_str() {
-        "concurrent" => Ok(DnsQueryMode::Concurrent),
-        "random" => Ok(DnsQueryMode::Random),
-        "sequence" => Ok(DnsQueryMode::Sequence),
-        other => Err(ConfigError::FieldType {
-            line: line_number,
-            field: "query_mode".into(),
-            message: format!(
-                "invalid query_mode '{}'; expected concurrent, random, or sequence",
-                other
-            ),
-        }),
-    }
 }
 
 /// Parse an import line: `import: 'url'` or `import: "url"`

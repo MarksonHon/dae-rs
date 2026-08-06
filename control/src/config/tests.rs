@@ -1234,7 +1234,7 @@ routing {
         assert!(json.contains("grpc_service_name"));
         // Example config includes rule_set block
         assert!(json.contains("rule_set"));
-        assert!(json.contains("geoip_main"));
+        assert!(json.contains("chinadomain"));
     }
 
     #[test]
@@ -1244,22 +1244,11 @@ routing {
         let config = parse_daefile(input).expect("config.daefile parse failed");
         validate_config(&config).expect("config.daefile validation failed");
 
-        // All four entry types present and names unique
-        assert_eq!(config.rule_set.len(), 4);
+        // Two text list types present and names unique
+        assert_eq!(config.rule_set.len(), 2);
         let types: Vec<RuleSetType> = config.rule_set.iter().map(|e| e.r#type).collect();
-        assert!(types.contains(&RuleSetType::GeoIp));
-        assert!(types.contains(&RuleSetType::GeoSite));
         assert!(types.contains(&RuleSetType::DomainList));
         assert!(types.contains(&RuleSetType::IpList));
-
-        let geoip = config.rule_set.iter().find(|e| e.name == "geoip_main").unwrap();
-        assert_eq!(geoip.r#type, RuleSetType::GeoIp);
-        assert_eq!(geoip.update, Some(RuleSetUpdate::Time("21:47".into())));
-        assert!(geoip.update_on_start);
-
-        let geosite = config.rule_set.iter().find(|e| e.name == "geosite_main").unwrap();
-        assert_eq!(geosite.r#type, RuleSetType::GeoSite);
-        assert_eq!(geosite.update, Some(RuleSetUpdate::Period("3h2m".into())));
 
         let chinadomain = config.rule_set.iter().find(|e| e.name == "chinadomain").unwrap();
         assert_eq!(chinadomain.r#type, RuleSetType::DomainList);
@@ -1270,21 +1259,10 @@ routing {
         assert_eq!(chinaip.update, Some(RuleSetUpdate::Period("1d".into())));
         assert_eq!(chinaip.proxy.as_deref(), Some("proxy_primary"));
 
-        // Data plane Routing references (Phase 3 syntax)
+        // Data plane Routing references
         let matches: Vec<&str> = config.routing.rules.iter().map(|r| r.r#match.as_str()).collect();
         assert!(matches.contains(&"source_ip(set:chinaip)"));
-        assert!(matches.contains(&"target_ip(geoip:cn)"));
-        assert!(matches.contains(&"target_domain(geosite:cn)"));
         assert!(matches.contains(&"target_domain(set:chinadomain)"));
-
-        // DNS query Routing / module-level response action references
-        let dns = config.dns.as_ref().expect("dns config");
-        assert!(
-            dns.routing.rules.iter().any(|r| r.r#match == "qname(set:chinadomain)"),
-            "DNS query routing should reference set:chinadomain"
-        );
-        let resp = dns.response_action.as_ref().expect("response_action");
-        assert!(resp.rules.iter().any(|r| r.r#match == "ip(set:chinaip)"));
     }
 
     #[test]
@@ -1295,13 +1273,8 @@ routing {
             serde_json::from_str(input).expect("config.json deserialize failed");
         validate_config(&config).expect("config.json validation failed");
 
-        // rule_set is an object (key = name) → four entry types
-        assert_eq!(config.rule_set.len(), 4);
-        let geoip = config.rule_set.iter().find(|e| e.name == "geoip_main").unwrap();
-        assert_eq!(geoip.r#type, RuleSetType::GeoIp);
-        assert!(geoip.update_on_start);
-        assert_eq!(geoip.update, Some(RuleSetUpdate::Time("21:47".into())));
-
+        // rule_set is an object (key = name) → two text list types
+        assert_eq!(config.rule_set.len(), 2);
         let chinaip = config.rule_set.iter().find(|e| e.name == "chinaip").unwrap();
         assert_eq!(chinaip.r#type, RuleSetType::IpList);
         assert_eq!(chinaip.update, Some(RuleSetUpdate::Period("1d".into())));
@@ -1310,10 +1283,7 @@ routing {
         // reference rules align with daefile
         let matches: Vec<&str> = config.routing.rules.iter().map(|r| r.r#match.as_str()).collect();
         assert!(matches.contains(&"source_ip(set:chinaip)"));
-        assert!(matches.contains(&"target_ip(geoip:cn)"));
         assert!(matches.contains(&"target_domain(set:chinadomain)"));
-        let dns = config.dns.as_ref().expect("dns config");
-        assert!(dns.routing.rules.iter().any(|r| r.r#match == "qname(set:chinadomain)"));
     }
 
     #[test]
@@ -1326,13 +1296,8 @@ routing {
         assert!(json.contains("shadowsocks"));
         assert!(json.contains("aes-128-gcm"));
         assert!(json.contains("192.168.12.1:9697"));
-        // starting_dns is a flat IP list; config-minimal uses 2 bootstrap servers
-        let dns = config.dns.as_ref().expect("dns config");
-        assert_eq!(dns.starting_dns.upstream.len(), 2);
-        assert!(dns.starting_dns.upstream.iter().all(|a| a.starts_with("udp://") || a.starts_with("udp+tcp://")));
-        // default query_mode is Concurrent when not specified
-        let g = dns.groups.iter().find(|g| g.name == "default_dns").unwrap();
-        assert_eq!(g.query_mode, DnsQueryMode::Concurrent);
+        // rule_set entries are text lists
+        assert_eq!(config.rule_set.len(), 2);
     }
 
     // ── Rule Set parse / validation tests ──
@@ -1363,16 +1328,16 @@ routing {
 }
 
 rule_set {
-  geoip_main {
-    type: geoip
-    url: 'https://example.com/geoip.dat'
-    name: geoip_main
+  chinaip {
+    type: ip_list
+    url: 'https://example.com/chinaip.txt'
+    name: chinaip
     update: time: 21:47
     update_on_start: true
   }
-  geosite_main {
-    type: geosite
-    url: 'https://example.com/geosite.dat'
+  chinadomain {
+    type: domain_list
+    url: 'https://example.com/chinadomain.txt'
     update: period: 3h2m
     proxy: g
   }
@@ -1419,23 +1384,20 @@ rule_set {{
         let config = parse_daefile(RULE_SET_CONFIG).expect("rule_set config parse failed");
         assert_eq!(config.rule_set.len(), 2);
 
-        let geo = &config.rule_set[0];
-        assert_eq!(geo.name, "geoip_main");
-        assert_eq!(geo.r#type, RuleSetType::GeoIp);
-        assert_eq!(geo.url, "https://example.com/geoip.dat");
-        assert_eq!(geo.update, Some(RuleSetUpdate::Time("21:47".into())));
-        assert!(geo.update_on_start);
-        assert_eq!(geo.proxy, None);
+        let chinaip = &config.rule_set[0];
+        assert_eq!(chinaip.name, "chinaip");
+        assert_eq!(chinaip.r#type, RuleSetType::IpList);
+        assert_eq!(chinaip.url, "https://example.com/chinaip.txt");
+        assert_eq!(chinaip.update, Some(RuleSetUpdate::Time("21:47".into())));
+        assert!(chinaip.update_on_start);
+        assert_eq!(chinaip.proxy, None);
 
-        let site = &config.rule_set[1];
-        assert_eq!(site.name, "geosite_main");
-        assert_eq!(site.r#type, RuleSetType::GeoSite);
-        assert_eq!(site.update, Some(RuleSetUpdate::Period("3h2m".into())));
-        assert!(!site.update_on_start);
-        assert_eq!(site.proxy.as_deref(), Some("g"));
-
-        // default name = block name (entries without explicit name)
-        assert_eq!(site.name, "geosite_main");
+        let chinadomain = &config.rule_set[1];
+        assert_eq!(chinadomain.name, "chinadomain");
+        assert_eq!(chinadomain.r#type, RuleSetType::DomainList);
+        assert_eq!(chinadomain.update, Some(RuleSetUpdate::Period("3h2m".into())));
+        assert!(!chinadomain.update_on_start);
+        assert_eq!(chinadomain.proxy.as_deref(), Some("g"));
 
         validate_config(&config).expect("rule_set config validation failed");
     }
@@ -1458,12 +1420,12 @@ rule_set {{
     #[test]
     fn test_rule_set_duplicate_name_e2101() {
         let block = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
   update: time: 00:00
 }
 b {
-  type: geosite
+  type: domain_list
   url: 'https://example.com/b.dat'
   name: a
   update: time: 00:00
@@ -1477,7 +1439,7 @@ b {
     #[test]
     fn test_rule_set_invalid_name() {
         let block = r#"bad name {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
   update: time: 00:00
 }
@@ -1487,7 +1449,7 @@ b {
 
         // illegal characters (including '/') enter structure via explicit name → validator error
         let block2 = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
   name: 'a/b'
   update: time: 00:00
@@ -1502,7 +1464,7 @@ b {
     fn test_rule_set_invalid_url_e2105() {
         // not http/https
         let block = r#"a {
-  type: geoip
+  type: ip_list
   url: 'ftp://example.com/a.dat'
   update: time: 00:00
 }
@@ -1513,7 +1475,7 @@ b {
 
         // #sha256= not 64 hex
         let block2 = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat#sha256=xyz'
   update: time: 00:00
 }
@@ -1526,7 +1488,7 @@ b {
     #[test]
     fn test_rule_set_missing_update_e2104() {
         let block = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
 }
 "#;
@@ -1538,7 +1500,7 @@ b {
     #[test]
     fn test_rule_set_invalid_time_e2104() {
         let block = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
   update: time: 25:99
 }
@@ -1551,7 +1513,7 @@ b {
     #[test]
     fn test_rule_set_time_with_seconds_e2104() {
         let block = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
   update: time: 21:47:30
 }
@@ -1565,7 +1527,7 @@ b {
     fn test_rule_set_invalid_period_e2104() {
         // second-level
         let block = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
   update: period: 1s
 }
@@ -1576,7 +1538,7 @@ b {
 
         // Invalid unit
         let block2 = r#"a {
-  type: geoip
+  type: ip_list
   url: 'https://example.com/a.dat'
   update: period: 3x
 }
@@ -1589,8 +1551,8 @@ b {
     #[test]
     fn test_rule_set_update_conflict_in_daefile() {
         let block = r#"a {
-  type: geoip
-  url: 'https://example.com/a.dat'
+  type: ip_list
+  url: 'https://example.com/a.txt'
   update: time: 21:47
   update: period: 3h2m
 }
@@ -1603,7 +1565,7 @@ b {
     fn test_rule_set_invalid_type() {
         let block = r#"a {
   type: bogus
-  url: 'https://example.com/a.dat'
+  url: 'https://example.com/a.txt'
   update: time: 00:00
 }
 "#;
@@ -1620,9 +1582,9 @@ b {
             "outbounds": { "nodes": [], "groups": [] },
             "routing": { "rules": [], "fallback": "direct" },
             "rule_set": {
-                "geoip_main": {
-                    "type": "geoip",
-                    "url": "https://example.com/geoip.dat#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "chinadomain": {
+                    "type": "domain_list",
+                    "url": "https://example.com/domain.txt#sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "update": { "time": "21:47" },
                     "update_on_start": true
                 },
@@ -1636,12 +1598,12 @@ b {
         let cfg: DaefileConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.rule_set.len(), 2);
 
-        let geo = cfg.rule_set.iter().find(|e| e.name == "geoip_main").unwrap();
-        assert_eq!(geo.r#type, RuleSetType::GeoIp);
-        assert_eq!(geo.update, Some(RuleSetUpdate::Time("21:47".into())));
-        assert!(geo.update_on_start);
+        let domain = cfg.rule_set.iter().find(|e| e.name == "chinadomain").unwrap();
+        assert_eq!(domain.r#type, RuleSetType::DomainList);
+        assert_eq!(domain.update, Some(RuleSetUpdate::Time("21:47".into())));
+        assert!(domain.update_on_start);
         assert_eq!(
-            geo.expected_sha256.as_deref(),
+            domain.expected_sha256.as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
 

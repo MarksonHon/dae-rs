@@ -4,16 +4,14 @@
 //! It is responsible for:
 //!
 //! - [`types`]: in-memory data structures and rule set configuration entry types
-//! - [`decode`]: hand-written protobuf decoding of v2ray `.dat` (geoip / geosite)
 //! - [`list`]: text domain name / IP list parsing
 //! - [`store`]: `/var/lib/dae-rs/` directory management (atomic replace, checksum, meta, startup scan)
 //! - [`download`]: downloader (direct + optional SOCKS5, retries, ETag, sha256 verification)
 //!
-//! This layer does **not** hook into matcher / DNS routing / configuration parser-validator (handled by later sub-tasks).
+//! This layer does **not** hook into matcher / configuration parser-validator (handled by later sub-tasks).
 
 pub mod cache;
 pub mod compiled;
-pub mod decode;
 pub mod download;
 pub mod list;
 pub mod refparse;
@@ -23,7 +21,6 @@ pub mod types;
 
 pub use cache::{load_cache_from_dir, RuleSetCache};
 pub use compiled::{compile_rule_set, CompiledDomainSet, CompiledIpSet, CompiledRuleSet};
-pub use decode::DecodeError;
 pub use download::{DownloadError, DownloadedInfo, DownloadOptions, UpdateOutcome};
 pub use list::ListError;
 pub use refparse::{
@@ -37,8 +34,6 @@ pub use types::{DomainPattern, DomainPatternType, RuleSetConfig, RuleSetData, Ru
 /// Unified rule set error type (errors from each sub-module are aggregated here via `From`).
 #[derive(Debug, thiserror::Error)]
 pub enum RuleSetError {
-    #[error("rule set decode error: {0}")]
-    Decode(#[from] DecodeError),
     #[error("rule set list parse error: {0}")]
     List(#[from] ListError),
     #[error("rule set store error: {0}")]
@@ -49,11 +44,9 @@ pub enum RuleSetError {
     InvalidUtf8(String),
 }
 
-/// Parse raw bytes into an in-memory data structure based on the type (unified entry point for dat decoding / text parsing).
+/// Parse raw bytes into an in-memory data structure based on the type (text parsing).
 pub fn parse_rule_set_data(ty: RuleSetType, bytes: &[u8]) -> Result<RuleSetData, RuleSetError> {
     match ty {
-        RuleSetType::GeoIp => decode::decode_geoip_list(bytes).map_err(RuleSetError::Decode),
-        RuleSetType::GeoSite => decode::decode_geosite_list(bytes).map_err(RuleSetError::Decode),
         RuleSetType::DomainList => {
             let text = std::str::from_utf8(bytes)
                 .map_err(|e| RuleSetError::InvalidUtf8(e.to_string()))?;

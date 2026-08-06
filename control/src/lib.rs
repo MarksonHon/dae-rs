@@ -29,10 +29,10 @@
 //! | Module | Responsibility |
 //! |--------|----------------|
 //! | [`config`] | daefile config parsing, validation & protocol conversion |
-//! | [`dns`] | DNS resolver stack |
 //! | [`net`] | Network data plane: eBPF / TProxy / netns / interfaces |
 //! | [`routing`] | Routing rule matching & proxy handoff |
 //! | [`api`] | REST API server |
+//! | [`ruleset`] | Rule set data layer (text domain/IP lists) |
 //!
 //! # Quick Start
 //!
@@ -55,7 +55,6 @@
 pub mod api;
 pub mod dialer;
 pub mod config;
-pub mod dns;
 pub mod net;
 pub mod routing;
 pub mod ruleset;
@@ -142,8 +141,6 @@ pub struct Config {
     pub wan_interface: Vec<String>,
     /// LAN interface names (TC attach targets for lan_ingress/lan_egress)
     pub lan_interface: Vec<String>,
-    /// DNS configuration
-    pub dns_config: Option<config::DnsConfig>,
 }
 
 impl Default for Config {
@@ -165,7 +162,6 @@ impl Default for Config {
             daefile_config: None,
             wan_interface: Vec::new(),
             lan_interface: Vec::new(),
-            dns_config: None,
         }
     }
 }
@@ -228,7 +224,6 @@ impl Config {
             };
 
         let api_config = daefile_config.api.clone();
-        let dns_config = daefile_config.dns.clone();
 
         Ok(Self {
             tproxy_port: runtime.tproxy_port,
@@ -248,7 +243,6 @@ impl Config {
             daefile_config: Some(daefile_config.clone()),
             wan_interface: iface.map(|i| i.wan_interface.clone()).unwrap_or_default(),
             lan_interface: iface.map(|i| i.lan_interface.clone()).unwrap_or_default(),
-            dns_config,
         })
     }
 }
@@ -326,12 +320,7 @@ pub struct ControlPlane {
     pub embedded_ebpf: Option<&'static [u8]>,
     /// Daeparam to pass to the eBPF program before loading.
     pub ebpf_param: Option<crate::net::ebpf::Daeparam>,
-    /// Domain routing tracker for DNS-driven domain_routing_map updates.
-    /// Shared handle: the DNS listener writes resolved domains into the current
-    /// tracker, and the janitor removes entries on TTL expiry.
-    pub domain_routing: Option<crate::routing::domain_routing::DomainRoutingHandle>,
-    /// DNS manager (handles DNS query routing, upstream forwarding, caching)
-    pub dns_manager: Option<crate::dns::DnsManager>,
+
     /// UDP connection state tracker (for UDP flow cleanup in janitor)
     udp_tracker: Option<Arc<Mutex<crate::net::udp_tracker::UdpConnStateTracker>>>,
     /// Userspace routing matcher (used by routing handoff consumer)
@@ -414,8 +403,6 @@ impl ControlPlane {
             cookie_pid_handle: None,
             connectivity_handle: None,
             routing_handoff_handle: None,
-            domain_routing: None,
-            dns_manager: None,
             udp_tracker: Some(Arc::new(
                 Mutex::new(net::udp_tracker::UdpConnStateTracker::new()),
             )),
@@ -1048,23 +1035,6 @@ impl ControlPlane {
             ));
             debug!("RoutingMatcher built from pre-compiled rules");
 
-            // Set up domain routing tracker
-            if !compiled.domain_sets.is_empty() {
-                let n_sets = compiled.domain_sets.len();
-                let tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::routing::domain_routing::DomainRoutingTracker::new(
-                        std::sync::Arc::new(compiled.domain_sets.clone()),
-                        init_slot,
-                    ),
-                ));
-                self.domain_routing =
-                    Some(std::sync::Arc::new(std::sync::Mutex::new(Some(tracker))));
-                info!(
-                    "Domain routing tracker initialized with {} domain sets",
-                    n_sets
-                );
-                debug!(n_sets, "Domain routing tracker created");
-            }
         }
         debug!("Step 3.5 completed: {}ms", step_start.elapsed().as_millis());
 
@@ -1158,59 +1128,13 @@ impl ControlPlane {
         self.start_tproxy().await?;
         debug!("Step 4 completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 4.5: Start DNS manager ----
-        if let Some(ref dns_cfg) = self.config.dns_config {
-            info!("Step 4.5/5: Starting DNS manager");
-            debug!(dns_bind = %dns_cfg.bind, dns_cache_max_size = dns_cfg.cache.max_size, "DNS config details");
-            let mut dns_mgr = crate::dns::DnsManager::new(
-                dns_cfg.clone(),
-                self.rule_set_cache.clone(),
-                self.outbound_group_dialers.clone(),
-            )?;
-            // Wire DNS resolutions into the domain routing tracker so the eBPF
-            // domain_routing_map is populated for domain-based routing rules.
-            let domain_routing = self.domain_routing.clone();
-            let ebpf_mgr = self.ebpf_mgr.clone();
-            let on_resolve: Option<crate::dns::handler::DnsResolveCallback> = match domain_routing {
-                Some(_) => Some(Arc::new(move |domain: &str, ip: std::net::IpAddr, ttl: u32| {
-                    let _ = Self::add_dns_result_to_tracker(&domain_routing, &ebpf_mgr, domain, ip, ttl);
-                })),
-                None => None,
-            };
-            dns_mgr.set_on_resolve(on_resolve);
-            let upstream_start = std::time::Instant::now();
-            if let Err(e) = dns_mgr.init_upstreams().await {
-                warn!("DNS upstream initialization failed (non-fatal): {}", e);
-            } else {
-                debug!(
-                    "DNS upstreams initialized: {}ms",
-                    upstream_start.elapsed().as_millis()
-                );
-            }
-            let dns_start = std::time::Instant::now();
-            if let Err(e) = dns_mgr.start().await {
-                return Err(anyhow::anyhow!(
-                    "DNS manager failed to start (bind {}): {}. \
-                     This is a critical component — DNS resolution will not work without it. \
-                     Please ensure the DNS bind port is available or change it in the config",
-                    dns_cfg.bind,
-                    e,
-                ));
-            } else {
-                info!("DNS manager started successfully ({}ms)", dns_start.elapsed().as_millis());
-                self.dns_manager = Some(dns_mgr);
-            }
-        } else {
-            debug!("No DNS config — DNS manager not started");
-        }
-
-        // ---- Step 4.6: Start routing handoff consumer ----
+        // ---- Step 4.5: Start routing handoff consumer ----
         // Consumes entries from routing_handoff_map that the eBPF program
         // produces when it cannot determine the outbound (CONTROL_PLANE_ROUTING).
         // The consumer uses the userspace RoutingMatcher to make the final
         // routing decision and writes it to conn_state_map.
         if let Some(ref matcher) = self.routing_matcher {
-            info!("Step 4.6/5: Starting routing handoff consumer");
+            info!("Step 4.5/5: Starting routing handoff consumer");
             let consumer = crate::routing::routing_handoff::RoutingHandoffConsumer::new(
                 self.ebpf_mgr.clone(),
                 matcher.clone(),
@@ -1223,11 +1147,11 @@ impl ControlPlane {
             warn!("No RoutingMatcher available — routing handoff consumer NOT started");
         }
 
-        // ---- Step 4.7: Start rule set scheduler ----
+        // ---- Step 4.6: Start rule set scheduler ----
         if let Some(ref dc) = self.daefile_config {
             if !dc.rule_set.is_empty() {
                 info!(
-                    "Step 4.7/5: Starting rule set scheduler ({} entries)",
+                    "Step 4.6/5: Starting rule set scheduler ({} entries)",
                     dc.rule_set.len()
                 );
                 let entries = dc.rule_set.clone();
@@ -1305,7 +1229,6 @@ impl ControlPlane {
         self.janitor_handle = Some(Self::spawn_conn_state_janitor(
             self.ebpf_mgr.clone(),
             self.udp_tracker.clone(),
-            self.domain_routing.clone(),
         ));
         debug!("Conn_state janitor spawned");
 
@@ -1553,19 +1476,7 @@ impl ControlPlane {
                 dialer.clone(),
                 tproxy_listener_mark,
             );
-            // TCP DNS hijack: connections whose original destination is port 53 are forwarded
-            // to the internal DNS handler (consistent with UDP hijack); the upstream connection
-            // is created in the host NS.
             tcp.set_host_ns_fd(host_ns_fd);
-            if let Some(ref dns_cfg) = self.config.dns_config {
-                if let Ok(dns_bind) = dns_cfg.bind.parse::<std::net::SocketAddr>() {
-                    let dns_forward: std::net::SocketAddr =
-                        format!("169.254.0.1:{}", dns_bind.port())
-                            .parse()
-                            .expect("invalid DNS forward address");
-                    tcp.set_dns_forward_addr(dns_forward);
-                }
-            }
             Arc::new(tcp)
         };
         let tproxy_udp = {
@@ -1574,32 +1485,8 @@ impl ControlPlane {
                 dialer,
                 tproxy_listener_mark,
             );
-            // Upstream UDP sockets (DNS hijack query socket, relay response socket)
-            // are created in the host NS when host_ns_fd is available.
+            // Upstream UDP sockets are created in the host NS when host_ns_fd is available.
             udp.set_host_ns_fd(host_ns_fd);
-            // Configure DNS hijacking: set the DNS forward address so that
-            // UDP DNS queries intercepted by eBPF are forwarded to the
-            // internal DNS handler instead of going through SOCKS5.
-            // The DNS handler listens on 169.254.0.1:port in the host NS,
-            // reachable from daens via the dae0peer→dae0 veth path.
-            if let Some(ref dns_cfg) = self.config.dns_config {
-                if let Ok(dns_bind) = dns_cfg.bind.parse::<std::net::SocketAddr>() {
-                    let dns_port = dns_bind.port();
-                    let dns_forward: std::net::SocketAddr = format!("169.254.0.1:{}", dns_port)
-                        .parse()
-                        .expect("invalid DNS forward address");
-                    udp.set_dns_forward_addr(dns_forward);
-                    info!(
-                        "DNS hijacking enabled: UDP TProxy will forward DNS queries to {}",
-                        dns_forward
-                    );
-                    debug!(
-                        dns_bind = %dns_bind,
-                        dns_forward = %dns_forward,
-                        "DNS hijack: TProxy forwards DNS queries to host NS DNS handler"
-                    );
-                }
-            }
             Arc::new(udp)
         };
 
@@ -1771,12 +1658,10 @@ impl ControlPlane {
     /// - Also cleans up expired entries from the eBPF map
     ///
     /// If `udp_tracker` is provided, expired UDP flows from the tracker are
-    /// also deleted from conn_state_map. If `domain_routing` is provided,
-    /// expired domain_routing_map entries are deleted (DNS TTL expiry).
+    /// also deleted from conn_state_map.
     pub fn spawn_conn_state_janitor(
         ebpf_mgr: Arc<Mutex<crate::net::ebpf::EbpfManager>>,
         udp_tracker: Option<Arc<Mutex<crate::net::udp_tracker::UdpConnStateTracker>>>,
-        domain_routing: Option<crate::routing::domain_routing::DomainRoutingHandle>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("ConnState janitor started with pressure detection");
@@ -1832,28 +1717,6 @@ impl ControlPlane {
                         "Janitor: deleted {} expired entries from UDP tracker",
                         expired_udp_keys.len()
                     );
-                }
-
-                // ---- Step 1c: Clean up expired domain_routing_map entries (DNS TTL) ----
-                // Lock order: the outer handle is locked briefly to clone the inner
-                // Arc, then released before locking the tracker (which is allowed to
-                // be held together with the ebpf lock).
-                if let Some(ref handle) = domain_routing {
-                    if let Ok(h) = handle.lock() {
-                        if let Some(tracker) = h.as_ref().cloned() {
-                            drop(h);
-                            if let Ok(mut t) = tracker.lock() {
-                                if let Ok(n) = t.cleanup_expired(&mut mgr) {
-                                    if n > 0 {
-                                        debug!(
-                                            "Janitor: cleaned {} expired domain routing entries",
-                                            n
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
 
                 // ---- Step 2: Scan conn_state_map for expired entries ----
@@ -2165,41 +2028,6 @@ impl ControlPlane {
     ///
     /// Even if intermediate steps fail, subsequent cleanup steps are still attempted.
     /// Ensures as many resources as possible are released. Returns the first error encountered (if any).
-    /// Emergency BPF hook detachment — called FIRST on SIGTERM to restore network.
-    ///
-    /// Only detaches TC and cgroup hooks; does NOT clean up other resources.
-    /// This is safe to call multiple times.
-    /// Add a DNS resolution result to the domain routing tracker.
-    /// The `domain_routing` and `ebpf_mgr` are separate fields, passed individually
-    /// to avoid borrow checker conflicts.
-    ///
-    /// Lock order (see [`crate::routing::domain_routing::DomainRoutingHandle`]):
-    /// the outer handle is locked briefly to clone the inner `Arc`, then released
-    /// before acquiring the ebpf lock, then the inner tracker is locked.
-    pub fn add_dns_result_to_tracker(
-        domain_routing: &Option<crate::routing::domain_routing::DomainRoutingHandle>,
-        ebpf_mgr: &Arc<Mutex<crate::net::ebpf::EbpfManager>>,
-        domain: &str,
-        ip: std::net::IpAddr,
-        ttl_secs: u32,
-    ) -> Result<()> {
-        let Some(handle) = domain_routing else {
-            return Ok(());
-        };
-        let tracker = match handle.lock() {
-            Ok(g) => g.as_ref().cloned(),
-            Err(_) => return Ok(()),
-        };
-        let Some(tracker) = tracker else {
-            return Ok(());
-        };
-        let mut ebpf_guard = ebpf_mgr.lock().expect("ebpf lock");
-        if let Ok(mut tracker_guard) = tracker.lock() {
-            tracker_guard.add_dns_result(domain, ip, ttl_secs, &mut ebpf_guard)?;
-        }
-        Ok(())
-    }
-
     pub fn detach_bpf_hooks(&mut self) {
         info!("Emergency BPF hook detachment");
         let start = std::time::Instant::now();
@@ -2276,6 +2104,7 @@ impl ControlPlane {
             handle.abort();
             debug!("Routing handoff consumer task aborted");
         }
+
         // 0h. Rule set scheduler (graceful shutdown, wait up to 3s)
         if let Some(sched) = self.rule_set_scheduler.take() {
             let sched_start = std::time::Instant::now();
@@ -2296,19 +2125,8 @@ impl ControlPlane {
             debug!("API server stopped");
         }
 
-        // ---- Step 2: Stop DNS manager ----
-        // Uses task abort internally to avoid hanging on infinite recv loops.
-        if let Some(mut dns_mgr) = self.dns_manager.take() {
-            info!("Step 2/5: Stopping DNS manager");
-            let dns_stop = std::time::Instant::now();
-            if let Err(e) = dns_mgr.stop().await {
-                warn!("DNS manager stop error: {}", e);
-            }
-            debug!("DNS manager stopped: {}ms", dns_stop.elapsed().as_millis());
-        }
-
-        // ---- Step 3: Stop TProxy listener ----
-        info!("Step 3/5: Stopping TProxy listener");
+        // ---- Step 2: Stop TProxy listener ----
+        info!("Step 2/5: Stopping TProxy listener");
         let step_start = std::time::Instant::now();
         if let Some(tproxy) = &self.tproxy {
             tproxy.stop();
@@ -2335,7 +2153,7 @@ impl ControlPlane {
         debug!("Step 3 completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 5: Detach all TC and cgroup programs ----
-        info!("Step 5/5: Detaching all TC and cgroup programs");
+        info!("Step 4/5: Detaching all TC and cgroup programs");
         let step_start = std::time::Instant::now();
         if let Err(e) = self.ebpf().detach_all() {
             error!("Failed to detach programs: {}", e);
@@ -2344,7 +2162,7 @@ impl ControlPlane {
         debug!("Detach completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 6: Unload eBPF program ----
-        info!("Step 6/5: Unloading eBPF program");
+        info!("Step 5/5: Unloading eBPF program");
         let step_start = std::time::Instant::now();
         if let Err(e) = self.ebpf().unload() {
             error!("Failed to unload eBPF program: {}", e);
@@ -2353,7 +2171,7 @@ impl ControlPlane {
         debug!("Unload completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 7: Unpin eBPF maps from bpffs ----
-        info!("Step 7/5: Unpinning eBPF maps");
+        info!("Step 6/6: Unpinning eBPF maps");
         let step_start = std::time::Instant::now();
         if let Err(e) = self.ebpf().unpin_maps(crate::net::ebpf::BPFFS_PATH) {
             warn!("Failed to unpin eBPF maps: {}", e);
@@ -2361,7 +2179,7 @@ impl ControlPlane {
         debug!("Unpin completed: {}ms", step_start.elapsed().as_millis());
 
         // ---- Step 8: Destroy network namespace ----
-        info!("Step 8/5: Destroying network namespace and veth pair");
+        info!("Step 7/7: Destroying network namespace and veth pair");
         let step_start = std::time::Instant::now();
         if let Err(e) = self.netns_mgr.destroy() {
             error!("Failed to destroy network namespace: {}", e);
@@ -2478,6 +2296,9 @@ impl ControlPlane {
         //
         // This ensures the eBPF datapath always sees a consistent routing state:
         // either the old rules (until the flip) or the new rules (after the flip).
+        //
+        // Note: domain_routing entries are cleared on reload but not re-populated
+        // (DNS-driven domain routing has been removed).
 
         // 3a. Increment datapath_generation
         self.datapath_generation = self.datapath_generation.wrapping_add(1);
@@ -2575,27 +2396,6 @@ impl ControlPlane {
 
         // 4. Flip epoch slot and update domain routing tracker
         self.current_epoch_slot = next_slot;
-
-        // 4a. Re-initialize domain routing tracker with the new epoch slot
-        if !compiled.domain_sets.is_empty() {
-            if let Some(handle) = self.domain_routing.as_ref() {
-                let new_tracker = std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::routing::domain_routing::DomainRoutingTracker::new(
-                        std::sync::Arc::new(compiled.domain_sets),
-                        next_slot,
-                    ),
-                ));
-                match handle.lock() {
-                    Ok(mut guard) => {
-                        *guard = Some(new_tracker);
-                        info!("Hot-reload: domain routing tracker updated (epoch slot {})", next_slot);
-                    }
-                    Err(e) => {
-                        warn!("Hot-reload: domain routing tracker lock poisoned: {}", e);
-                    }
-                }
-            }
-        }
 
         let elapsed_ms = start.elapsed().as_millis();
         debug!("Hot-reload completed: {}ms", elapsed_ms);

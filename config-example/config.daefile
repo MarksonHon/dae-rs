@@ -206,22 +206,6 @@ outbounds {
 }
 
 rule_set {
-  # ── v2ray .dat types (published by Loyalsoldier, reliable data sources) ──
-  geoip_main {
-    type: geoip                  # GeoIP dat: grouped by country code (CN/PRIVATE/...)
-    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
-    name: geoip_main             # unique remark (defaults to block name); referenced by geoip:<code>
-    update: time: 21:47          # update daily at 21:47 (HH:MM, no seconds)
-    update_on_start: true        # update unconditionally at startup
-  }
-
-  geosite_main {
-    type: geosite                # GeoSite dat: grouped by category name (cn/geolocation-!cn/...)
-    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
-    name: geosite_main           # referenced by geosite:<code>
-    update: period: 3h2m         # update every 3h2m (d/h/m combinations, no seconds)
-  }
-
   # ── Text list types (Surge-format sources; both mihomo and Surge formats are supported) ──
   chinadomain {
     type: domain_list            # one domain / domain pattern per line (supports mihomo & Surge DOMAIN-* rules)
@@ -241,67 +225,11 @@ rule_set {
 }
 
 routing {
-  # ── Rule set references (phase 3 new syntax) ──
   source_ip(set:chinaip) -> direct                    # source IP hits text IP list chinaip → direct
-  target_ip(geoip:cn) -> direct                       # target IP hits GeoIP CN → direct
-  target_domain(geosite:cn) -> direct                 # target domain hits GeoSite CN → direct
   target_domain(set:chinadomain) -> direct            # target domain hits text domain list → direct
-  # ── Legacy examples (old aliases dip/sip and free combinations retained) ──
-  dip(geoip:private) -> direct                        # private networks → direct (data-driven, legacy syntax compatible)
   dport(22) -> direct                                 # SSH → direct
-  dport(80,443) && !target_ip(geoip:private) -> proxy(proxy_primary)  # comma multi-value + && + ! combination
+  dport(80,443) -> proxy(proxy_primary)              # HTTP/HTTPS → proxy
   l4proto(tcp) -> proxy(proxy_primary)                # TCP → proxy
   fallback: proxy(proxy_primary)
 }
 
-dns {
-  starting_dns {
-    ip_version_prefer: 4
-    upstream: ['udp+tcp://1.1.1.1:53', 'udp+tcp://223.5.5.5:53']
-  }
-  bind: '127.0.0.1:5353'
-  cache {
-    enabled: true
-    max_size: 4096
-    max_ttl: 86400
-    min_ttl: 60
-    optimistic_cache: true          # RFC 8767 serve-stale: serve expired entries within the window below
-    optimistic_cache_ttl: 3600      # serve-stale window (seconds past TTL expiry)
-    background_refresh: true        # async re-query entries nearing expiry
-    refresh_threshold_percent: 20   # refresh when remaining TTL < 20% of original
-    serve_stale_ttl: 30             # TTL served for stale entries (so clients don't over-cache)
-  }
-  groups {
-    trusted_dns {
-      send_by: proxy_primary
-      query_mode: concurrent
-      upstream {
-        googledns: 'tcp+udp://dns.google:53'
-        cloudflare: 'udp+tcp://1.1.1.1:53'
-      }
-    }
-    china_dns {
-      send_by: direct
-      query_mode: sequence
-      upstream {
-        alidns: 'udp+tcp://dns.alidns.com:53'
-        cnnic: 'udp://1.2.4.8:53'
-      }
-    }
-  }
-  # Module-level response action: further filter / process the obtained DNS
-  # results regardless of which group produced them. `upstream(<label>)`
-  # matches/requeries within the group that answered.
-  response_action {
-    upstream(googledns) -> accept
-    ip(geoip:private) && !qname(geosite:cn) -> googledns   # free combination of && and !
-    ip(set:chinaip) -> googledns                           # response address hits chinaip → requery with another upstream
-    fallback: accept
-  }
-  routing {
-    qname(geosite:cn) -> china_dns
-    qname(set:chinadomain) -> china_dns                       # text domain list reference (DNS query routing)
-    qname(geosite:geolocation-!cn) -> trusted_dns
-    fallback: trusted_dns
-  }
-}

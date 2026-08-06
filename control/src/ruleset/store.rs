@@ -400,8 +400,8 @@ mod tests {
         assert!(data_dir.read_meta("a").await.unwrap().is_none());
         let meta = RuleSetMeta {
             name: "a".into(),
-            url: "https://example.com/a.dat".into(),
-            r#type: RuleSetType::GeoIp,
+            url: "https://example.com/a.txt".into(),
+            r#type: RuleSetType::IpList,
             last_updated: Some("2026-01-01T00:00:00Z".into()),
             etag: None,
             last_modified: None,
@@ -424,9 +424,9 @@ mod tests {
         let ip_path = data_dir.data_file_path("chinaip", RuleSetType::IpList);
         tokio::fs::write(&ip_path, "1.1.1.0/24\n2.2.2.2\n").await.unwrap();
 
-        // Corrupt geosite dat (garbage bytes)
-        let bad_path = data_dir.data_file_path("badsite", RuleSetType::GeoSite);
-        tokio::fs::write(&bad_path, b"\xff\xff\xff\xff not a protobuf").await.unwrap();
+        // Corrupt domain list (garbage bytes)
+        let bad_path = data_dir.data_file_path("badsite", RuleSetType::DomainList);
+        tokio::fs::write(&bad_path, b"\xff\xff\xff\xff not a valid text").await.unwrap();
 
         // Missing file
         let entries = vec![
@@ -441,8 +441,8 @@ mod tests {
             },
             RuleSetConfig {
                 name: "badsite".into(),
-                r#type: RuleSetType::GeoSite,
-                url: "http://x/geosite.dat".into(),
+                r#type: RuleSetType::DomainList,
+                url: "http://x/domain.txt".into(),
                 expected_sha256: None,
                 update: None,
                 update_on_start: false,

@@ -123,7 +123,6 @@ pub async fn run(
         proxy_addr = %config.proxy_addr,
         wan_count = config.wan_interface.len(),
         lan_count = config.lan_interface.len(),
-        dns_enabled = config.dns_config.is_some(),
         "Full config summary (debug)"
     );
 
@@ -159,10 +158,8 @@ pub async fn run(
         // dae-rs's own sockets and skip them (prevents self-loop).
         // Must match socket_mark used by TProxy and SOCKS5 dialers.
         dae_socket_mark: shared::DAE_SOCKET_MARK,
-        // When no `dns` section exists in the config file, disable DNS
-        // hijacking in the datapath so all DNS traffic is treated as ordinary
-        // traffic (routed by the normal routing rules).
-        dns_hijack_enabled: cp.config.dns_config.is_some() as u8,
+        // DNS hijacking is disabled (DNS module removed).
+        dns_hijack_enabled: 0,
         // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
         ..Default::default()
     };

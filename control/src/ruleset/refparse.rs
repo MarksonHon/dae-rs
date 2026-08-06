@@ -2,50 +2,39 @@
 //!
 //! This module provides:
 //!
-//! - [`RuleSetRef`]: recognizes the `set:<name>` / `geoip:<code>` / `geosite:<code>`
-//!   prefixes in arguments; anything else is treated as a plain value (§6.1 / §6.2).
+//! - [`RuleSetRef`]: recognizes the `set:<name>` prefix in arguments;
+//!   anything else is treated as a plain value (§6.1 / §6.2).
 //! - Domain name pattern matching ([`match_domain_pattern`] / [`match_domain_patterns`] /
-//!   [`match_qname_value`]): shared by DNS query routing and DNS response routing, unifying the
+//!   [`match_qname_value`]): shared by matcher and other routing, unifying the
 //!   Suffix / Keyword / Full / Regex / Domain semantics; **qname is case-insensitive**.
 //!
-//! This module does **not depend** on the matcher / DNS-specific modules; it can be reused by
-//! `matcher`, `dns::router`, and `dns::handler`, avoiding duplicate implementations.
+//! This module does **not depend** on matcher-specific modules; it can be reused by
+//! `matcher`, avoiding duplicate implementations.
 
 use crate::ruleset::types::{DomainPattern, DomainPatternType};
 
 /// A parsed rule set reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleSetRef {
-    /// `geoip:<code>` — a `country_code` in a geoip dat (e.g. `cn`, `private`).
-    GeoIp(String),
-    /// `geosite:<code>` — a category name in a geosite dat (e.g. `cn`, `geolocation-!cn`).
-    GeoSite(String),
     /// `set:<name>` — a rule set entry name from the configuration (`domain_list` / `ip_list`).
     Set(String),
     /// Other: a plain value (CIDR / domain name pattern / keyword, etc.), with no prefix.
     Plain(String),
 }
 
-/// Recognize the `set:<name>` / `geoip:<code>` / `geosite:<code>` prefixes; anything else is treated as a plain value.
+/// Recognize the `set:<name>` prefix; anything else is treated as a plain value.
 pub fn parse_ref(value: &str) -> RuleSetRef {
     let v = value.trim();
-    if let Some(code) = v.strip_prefix("geoip:") {
-        RuleSetRef::GeoIp(code.trim().to_string())
-    } else if let Some(code) = v.strip_prefix("geosite:") {
-        RuleSetRef::GeoSite(code.trim().to_string())
-    } else if let Some(name) = v.strip_prefix("set:") {
+    if let Some(name) = v.strip_prefix("set:") {
         RuleSetRef::Set(name.trim().to_string())
     } else {
         RuleSetRef::Plain(v.to_string())
     }
 }
 
-/// Whether the value is a rule set reference (`geoip:` / `geosite:` / `set:`).
+/// Whether the value is a rule set reference (`set:`).
 pub fn is_ruleset_ref(value: &str) -> bool {
-    matches!(
-        parse_ref(value),
-        RuleSetRef::GeoIp(_) | RuleSetRef::GeoSite(_) | RuleSetRef::Set(_)
-    )
+    matches!(parse_ref(value), RuleSetRef::Set(_))
 }
 
 /// Generate a human-readable reference label (for error messages): preserves the original prefix form.
@@ -94,7 +83,7 @@ pub fn match_domain_patterns(qname: &str, patterns: &[DomainPattern]) -> bool {
 /// Match a plain qname value (`suffix:`/`full:`/`keyword:`/`regex:`/`domain:` prefix or a bare value).
 ///
 /// A bare value is handled with **suffix** semantics (including itself), consistent with dae / design §6.4; case-insensitive.
-/// Reused by DNS query routing (`qname(...)`) and DNS response routing (`qname(...)`).
+/// Reused by routing (`qname(...)`).
 pub fn match_qname_value(qname: &str, value: &str) -> bool {
     let qname = normalize_qname(qname);
     let v = value.trim();
@@ -147,13 +136,10 @@ mod tests {
 
     #[test]
     fn test_parse_ref() {
-        assert_eq!(parse_ref("geoip:cn"), RuleSetRef::GeoIp("cn".into()));
-        assert_eq!(parse_ref("geosite:cn"), RuleSetRef::GeoSite("cn".into()));
         assert_eq!(parse_ref("set:chinaip"), RuleSetRef::Set("chinaip".into()));
         assert_eq!(parse_ref("  set:  mylist  "), RuleSetRef::Set("mylist".into()));
         assert_eq!(parse_ref("10.0.0.0/8"), RuleSetRef::Plain("10.0.0.0/8".into()));
         assert_eq!(parse_ref("suffix:baidu.com"), RuleSetRef::Plain("suffix:baidu.com".into()));
-        assert!(is_ruleset_ref("geoip:cn"));
         assert!(is_ruleset_ref("set:x"));
         assert!(!is_ruleset_ref("suffix:baidu.com"));
         assert!(!is_ruleset_ref("10.0.0.0/8"));

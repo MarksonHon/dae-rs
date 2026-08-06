@@ -38,8 +38,7 @@ process_exclusion # 排除不走代理的进程
 outbounds         # 代理节点与分组
 routing           # 哪些流量直连 / 代理 / 阻断
 api               # 可选 REST API
-dns               # DNS 劫持 / 路由 / 缓存
-rule_set          # 规则集（GeoIP/GeoSite/文本列表）下载与调度
+rule_set          # 规则集（文本域名/IP 列表）下载与调度
 ```
 
 示例骨架：
@@ -59,8 +58,6 @@ outbounds {
 routing { ... }
 
 api { ... }
-
-dns { ... }
 
 rule_set { ... }
 ```
@@ -207,7 +204,7 @@ groups {
 
 ```
 routing {
-  dip(geoip:private) -> direct
+  dip(10.0.0.0/8) -> direct
   dport(22) -> direct
   l4proto(tcp) -> proxy(proxy_primary)
   fallback: proxy(proxy_primary)
@@ -225,35 +222,30 @@ routing {
 |------|------|
 | `dport(80,443)` / `port(80-90)` | 目标端口 / 端口段。 |
 | `sport(...)` / `source_port(...)` | 源端口 / 端口段。 |
-| `dip(10.0.0.0/8)` / `ip(...)` / `target_ip(...)` | 目标 CIDR；`geoip:<code>` / `set:<name>` 引用规则集。 |
-| `sip(...)` / `source_ip(...)` | 源 CIDR；`geoip:<code>` / `set:<name>` 引用规则集。 |
+| `dip(10.0.0.0/8)` / `ip(...)` / `target_ip(...)` | 目标 CIDR；`set:<name>` 引用规则集。 |
+| `sip(...)` / `source_ip(...)` | 源 CIDR；`set:<name>` 引用规则集。 |
 | `mac(xx:xx:xx:xx:xx:xx)` | 源 MAC 地址。 |
 | `l4proto(tcp,udp)` | 四层协议。 |
 | `ipversion(4,6)` | IP 版本。 |
-| `domain(suffix:example.com, keyword:..., full:..., regex:...)` / `target_domain(...)` | 域名规则；`geosite:<code>` / `set:<name>` 引用规则集，其余无前缀的值默认按后缀匹配。 |
+| `domain(suffix:example.com, keyword:..., full:..., regex:...)` / `target_domain(...)` | 域名规则；`set:<name>` 引用规则集，其余无前缀的值默认按后缀匹配。 |
 | `process_name(...)` / `pname(...)` | 进程 comm 名（最多 16 字节）。 |
 | `dscp(...)` | DSCP 值。 |
-| `qtype(...)` | DNS 查询类型（完整匹配尚未实现，占位）。 |
-| `upstream(...)` | DNS 上游分组匹配。 |
 
 表达式可用 `&&` 组合（如 `dport(443) && l4proto(tcp)`），函数可用 `!`
 取反（如 `!domain(suffix:google.com)`）。
 
 #### 规则集引用语法
 
-在 `routing` 中可引用 §4.8 `rule_set` 区块配置的规则集（详见
+在 `routing` 中可引用 §4.7 `rule_set` 区块配置的规则集（详见
 [`docs/design/rule_set_zh_hans.md`](../design/rule_set_zh_hans.md)）：
 
 | 语法 | 含义 |
 |------|------|
 | `source_ip(set:chinaip)` | 源 IP 命中 `ip_list` 条目 `chinaip`。 |
-| `source_ip(geoip:cn)` / `target_ip(geoip:cn)` | 源/目标 IP 命中 GeoIP dat 的 `CN`（`geoip:private` 命中私有网段，数据驱动）。 |
 | `target_ip(set:chinaip)` | 目标 IP 命中文本 IP 列表 `chinaip`。 |
-| `target_domain(geosite:cn)` | 目标域名命中 GeoSite dat 的 `cn` 分类。 |
 | `target_domain(set:chinadomain)` | 目标域名命中 `domain_list` 条目 `chinadomain`。 |
 
-`set:` 必须引用 `rule_set` 中已定义的条目（`geoip`/`geosite` 引用在配置了
-对应类型条目后可用），否则校验报错（E2102）。
+`set:` 必须引用 `rule_set` 中已定义的条目，否则校验报错（E2102）。
 
 ### 4.6 `api`
 
@@ -267,46 +259,14 @@ routing {
 | `cert` / `key` | TLS 证书 / 私钥路径。 |
 | `token` | Bearer Token（静态密钥），用于请求鉴权。 |
 
-### 4.7 `dns`
+### 4.7 `rule_set`
 
-完整设计见 [`docs/design/dns_zh_hans.md`](../design/dns_zh_hans.md)。简要说明：
-
-| 字段 | 说明 |
-|------|------|
-| `starting_dns` | 代理可用前的引导解析器。包含 `ip_version_prefer`（`4` 或 `6`）与 `upstream` 列表（必须是 IP 字面量，避免先有鸡还是先有蛋的问题）。 |
-| `bind` | 本地 DNS 监听地址（默认 `127.0.0.1:5353`）。 |
-| `cache` | 缓存设置：`enabled`、`max_size`、`max_ttl`、`min_ttl`、`optimistic_cache`、`optimistic_cache_ttl`。 |
-| `groups` | DNS 分组。每组含 `send_by`（`direct` 或代理组名）、`query_mode`（`concurrent` / `random` / `sequence`）与 `upstream` 条目（label + URL，如 `udp+tcp://1.1.1.1:53`、`tcp+udp://dns.google:53`）。 |
-| `response_action` | DNS 模块级响应动作：对查询得到的结果做进一步筛选（无论来自哪个分组）。规则支持 `upstream(<label>)` / `ip(geoip:<code>)` / `ip(set:<name>)` / `qname(geosite:<code>)` / `qname(set:<name>)` 条件，可用 `&&` 与 `!` 组合；动作可取 `accept`、`reject` 或某个上游 label（改用该上游重查）。 |
-| `routing` | 顶层 DNS 查询路由：`qname(geosite:cn) -> china_dns`、`qname(set:chinadomain) -> china_dns` 等，外加 `fallback`。 |
-
-可解析的 URL scheme：`udp://`、`tcp://`、`udp+tcp://`（UDP 优先，失败回退 TCP）、
-`tcp+udp://`（TCP 优先，失败回退 UDP）、`https://` / `doh://`、
-`tls://` / `dot://`。DoH 与 DoT 目前**仅能解析、不可用**，使用会返回错误。
-
-### 4.8 `rule_set`
-
-规则集区块声明可供 `routing` / `dns` 引用的 GeoIP / GeoSite（v2ray `.dat`）
-与文本域名 / IP 列表数据源，并配置下载与定时更新。完整设计与语法见
+规则集区块声明可供 `routing` 引用的文本域名 / IP 列表数据源，并配置下载与
+定时更新。完整设计与语法见
 [`docs/design/rule_set_zh_hans.md`](../design/rule_set_zh_hans.md)。
 
 ```
 rule_set {
-  geoip_main {
-    type: geoip
-    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
-    name: geoip_main
-    update: time: 21:47
-    update_on_start: true
-  }
-
-  geosite_main {
-    type: geosite
-    url: 'https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
-    name: geosite_main
-    update: period: 3h2m
-  }
-
   chinadomain {
     type: domain_list
     url: 'https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt'   # 占位 URL，可替换
@@ -326,7 +286,7 @@ rule_set {
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `type` | 是 | `geoip`（dat）、`geosite`（dat）、`domain_list`（文本域名）、`ip_list`（文本 IP）。 |
+| `type` | 是 | `domain_list`（文本域名）、`ip_list`（文本 IP）。 |
 | `url` | 是 | 下载地址（`http://` / `https://`），可带 `#sha256=<64位hex>` 片段强制校验。 |
 | `name` | 否（缺省 = 块名） | **唯一备注/名称**（`[a-zA-Z0-9_-]`，≤63），用于 `set:<name>` 引用与文件命名。 |
 | `update` | 是 | 调度表达式，`time: HH:MM`（每天固定时刻）与 `period: 3h2m`（周期，`d`/`h`/`m` 组合、禁止秒）**互斥二选一**。 |
@@ -335,10 +295,9 @@ rule_set {
 
 - **唯一性**：`rule_set` 内所有条目的 `name`（含缺省 = 块名）全局唯一，违反报
   E2101。
-- 数据文件存放于 `/var/lib/dae-rs/`（dat 为 `<name>.dat`，文本为 `<name>.txt`），
-  由 dae-rs 自行下载、校验、原子替换与损坏恢复；缺失时通过第一个代理组（或
-  条目显式 `proxy`）下载。
-- 路由引用语法见 §4.5「规则集引用语法」与 §4.7（DNS 侧）。
+- 数据文件存放于 `/var/lib/dae-rs/`（`<name>.txt`），由 dae-rs 自行下载、
+  校验、原子替换与损坏恢复；缺失时通过第一个代理组（或条目显式 `proxy`）下载。
+- 路由引用语法见 §4.5「规则集引用语法」。
 
 ## 5. 配置校验
 
@@ -355,7 +314,6 @@ rule_set {
 | `E1601` / `E1602` | 正则语法错误 / 正则未匹配到任何节点。 |
 | `E1701` – `E1704` | select / auto 分组配置错误。 |
 | `E1901` – `E1903` | API 监听格式 / token / TLS 问题。 |
-| `E2001` – `E2007` | DNS 分组 / 路由 / starting_dns 问题。 |
 | `E2101` – `E2106` | 规则集：name 重复 / 引用未知规则集 / 数据缺失 / 调度表达式非法（含秒级）/ URL 非法 / 容量超限。 |
 
 警告（`W1801`、`W1901`、`W1902`）用于提示非致命问题，
@@ -366,8 +324,6 @@ rule_set {
 - TProxy 端口 `15080`，路由表 `2023`，代理 fwmark `0x08000000`，
   绕过 fwmark `0x04000000`，MTU `1500`。
 - SOCKS5 拨号超时 `5000` 毫秒。
-- DNS 绑定 `127.0.0.1:5353`；缓存默认开启，`max_size=4096`、
-  `max_ttl=86400`、`min_ttl=60`。
 - 路由回退 `proxy(proxy_primary)`。
 
 ## 7. 当前已知限制（按已实现代码）
@@ -375,8 +331,6 @@ rule_set {
 - 仅支持 `socks5` 出站节点（阶段一）。
 - 控制面实际只使用一个 SOCKS5 上游地址（配置文件中的第一个节点）；
   出站分组会做节点选择并写入连通性 map，但节点间切换仍在开发中。
-- DNS 的 DoH / DoT 传输仅解析、未实现。
-- GeoIP / GeoSite 数据不随二进制内置，而是通过 `rule_set` 区块配置的 URL
-  下载到 `/var/lib/dae-rs/` 并由 dae-rs 解析加载；`geoip:<code>` /
-  `geosite:<code>` / `set:<name>` 已接入数据面与 DNS 路由求值。编译期若引用
-  的数据缺失会报错（E2103）。
+- 规则集数据（`domain_list` / `ip_list`）通过 `rule_set` 区块配置的 URL
+  下载到 `/var/lib/dae-rs/` 并由 dae-rs 解析加载；`set:<name>` 已接入
+  数据面求值。编译期若引用的数据缺失会报错（E2103）。

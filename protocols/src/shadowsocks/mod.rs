@@ -294,7 +294,7 @@ impl OutboundDialer for ShadowsocksDialer {
         // target, the address header hex and the first-frame prefix hex (for comparison against
         // sslocal packet captures)
         let first_frame_prefix32 = framed.iter().take(32).copied().collect::<Vec<_>>();
-        tracing::info!(
+        tracing::debug!(
             "shadowsocks debug dial: target={} encode_address={} salt={} first_frame_prefix32={}",
             target,
             hex::encode(&target_addr),

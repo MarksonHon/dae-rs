@@ -1,21 +1,14 @@
 //! Rule set in-memory data structures and configuration entry types.
 //!
 //! This module only defines data and configuration types; it does not take part in any
-//! matcher / DNS / parser wiring (handled by later sub-tasks).
+//! matcher / parser wiring (handled by later sub-tasks).
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Rule set data type (corresponds to the `type` field of a configuration entry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleSetType {
-    /// dat data: geoip (`GeoIPList`).
-    #[serde(rename = "geoip")]
-    GeoIp,
-    /// dat data: geosite (`GeoSiteList`).
-    #[serde(rename = "geosite")]
-    GeoSite,
     /// Text domain list.
     #[serde(rename = "domain_list")]
     DomainList,
@@ -25,10 +18,9 @@ pub enum RuleSetType {
 }
 
 impl RuleSetType {
-    /// File type extension: dat → `.dat`, text → `.txt`.
+    /// File type extension: text → `.txt`.
     pub fn file_extension(&self) -> &'static str {
         match self {
-            RuleSetType::GeoIp | RuleSetType::GeoSite => ".dat",
             RuleSetType::DomainList | RuleSetType::IpList => ".txt",
         }
     }
@@ -36,8 +28,6 @@ impl RuleSetType {
     /// Name matching the configuration `type` string (for logs / diagnostics).
     pub fn as_str(&self) -> &'static str {
         match self {
-            RuleSetType::GeoIp => "geoip",
-            RuleSetType::GeoSite => "geosite",
             RuleSetType::DomainList => "domain_list",
             RuleSetType::IpList => "ip_list",
         }
@@ -225,16 +215,6 @@ impl RuleSetConfig {
 /// restart can load already-parsed lists without re-parsing the source text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RuleSetData {
-    /// geoip dat: `country_code` (lowercase) → CIDR list.
-    GeoIp {
-        /// `country_code` (lowercase) → CIDR list.
-        entries: HashMap<String, Vec<IpNet>>,
-    },
-    /// geosite dat: `country_code` (lowercase) → domain pattern list.
-    GeoSite {
-        /// `country_code` (normalized to lowercase) → domain name pattern list.
-        entries: HashMap<String, Vec<DomainPattern>>,
-    },
     /// Text domain list.
     DomainList(Vec<DomainPattern>),
     /// Text IP list.

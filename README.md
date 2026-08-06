@@ -29,7 +29,5 @@ This project is licensed under the **GNU Affero General Public License v3.0
 
 - Configuration: [`docs/config/config_en.md`](./docs/config/config_en.md)
   · [`docs/config/config_zh_hans.md`](./docs/config/config_zh_hans.md)
-- DNS subsystem design: [`docs/design/dns_en.md`](./docs/design/dns_en.md)
-  · [`docs/design/dns_zh_hans.md`](./docs/design/dns_zh_hans.md)
 - Routing subsystem design: [`docs/design/routing_en.md`](./docs/design/routing_en.md)
   · [`docs/design/routing_zh_hans.md`](./docs/design/routing_zh_hans.md)

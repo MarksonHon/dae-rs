@@ -190,23 +190,6 @@
     ]
   },
   "rule_set": {
-    "geoip_main": {
-      "type": "geoip",
-      "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
-      "name": "geoip_main",
-      "update": {
-        "time": "21:47"
-      },
-      "update_on_start": true
-    },
-    "geosite_main": {
-      "type": "geosite",
-      "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
-      "name": "geosite_main",
-      "update": {
-        "period": "3h2m"
-      }
-    },
     "chinadomain": {
       "type": "domain_list",
       "url": "https://cdn.jsdelivr.net/gh/Loyalsoldier/surge-rules@release/direct.txt",
@@ -233,19 +216,7 @@
         "action": "direct"
       },
       {
-        "match": "target_ip(geoip:cn)",
-        "action": "direct"
-      },
-      {
-        "match": "target_domain(geosite:cn)",
-        "action": "direct"
-      },
-      {
         "match": "target_domain(set:chinadomain)",
-        "action": "direct"
-      },
-      {
-        "match": "dip(geoip:private)",
         "action": "direct"
       },
       {
@@ -253,7 +224,7 @@
         "action": "direct"
       },
       {
-        "match": "dport(80,443) && !target_ip(geoip:private)",
+        "match": "dport(80,443)",
         "action": "proxy(proxy_primary)"
       },
       {
@@ -262,89 +233,5 @@
       }
     ],
     "fallback": "proxy(proxy_primary)"
-  },
-  "dns": {
-    "starting_dns": {
-      "ip_version_prefer": 4,
-      "upstream": [
-        "udp+tcp://1.1.1.1:53",
-        "udp+tcp://223.5.5.5:53"
-      ]
-    },
-    "bind": "127.0.0.1:5353",
-    "cache": {
-      "enabled": true,
-      "max_size": 4096,
-      "max_ttl": 86400,
-      "min_ttl": 60,
-      "optimistic_cache": true,
-      "optimistic_cache_ttl": 3600
-    },
-    "groups": [
-      {
-        "name": "trusted_dns",
-        "send_by": "proxy_primary",
-        "query_mode": "concurrent",
-        "upstream": [
-          {
-            "label": "googledns",
-            "address": "tcp+udp://dns.google:53"
-          },
-          {
-            "label": "cloudflare",
-            "address": "udp+tcp://1.1.1.1:53"
-          }
-        ]
-      },
-      {
-        "name": "china_dns",
-        "send_by": "direct",
-        "query_mode": "sequence",
-        "upstream": [
-          {
-            "label": "alidns",
-            "address": "udp+tcp://dns.alidns.com:53"
-          },
-          {
-            "label": "cnnic",
-            "address": "udp://1.2.4.8:53"
-          }
-        ]
-      }
-    ],
-    "response_action": {
-      "rules": [
-        {
-          "match": "upstream(googledns)",
-          "action": "accept"
-        },
-        {
-          "match": "ip(geoip:private) && !qname(geosite:cn)",
-          "action": "googledns"
-        },
-        {
-          "match": "ip(set:chinaip)",
-          "action": "googledns"
-        }
-      ],
-      "fallback": "accept"
-    },
-    "routing": {
-      "rules": [
-        {
-          "match": "qname(geosite:cn)",
-          "action": "china_dns"
-        },
-        {
-          "match": "qname(set:chinadomain)",
-          "action": "china_dns"
-        },
-        {
-          "match": "qname(geosite:geolocation-!cn)",
-          "action": "trusted_dns"
-        }
-      ],
-      "fallback": "trusted_dns"
-    }
   }
 }

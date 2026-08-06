@@ -3,7 +3,7 @@
 //! # Motivation
 //!
 //! The raw parsed form of a rule set (`Vec<IpNet>` / `Vec<DomainPattern>`) is matched by a
-//! **linear scan** per DNS query — O(N) for the China IP list (~10k CIDRs) and the domain
+//! **linear scan** — O(N) for the China IP list (~10k CIDRs) and the domain
 //! lists (~100k entries). This module compiles each list once into structures with fast lookups:
 //!
 //! - **IP lists** → merged, sorted inclusive address ranges + binary search (O(log N)).
@@ -353,10 +353,6 @@ impl CompiledDomainSet {
 /// Compiled matching view of a parsed rule set.
 #[derive(Debug, Clone)]
 pub enum CompiledRuleSet {
-    /// geoip dat: `country_code` → compiled IP set.
-    GeoIp(std::collections::HashMap<String, CompiledIpSet>),
-    /// geosite dat: `country_code` → compiled domain set.
-    GeoSite(std::collections::HashMap<String, CompiledDomainSet>),
     /// text ip_list.
     IpList(CompiledIpSet),
     /// text domain_list.
@@ -366,18 +362,6 @@ pub enum CompiledRuleSet {
 /// Build the compiled matching view for a parsed rule set.
 pub fn compile_rule_set(data: &RuleSetData) -> CompiledRuleSet {
     match data {
-        RuleSetData::GeoIp { entries } => CompiledRuleSet::GeoIp(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), CompiledIpSet::compile(v)))
-                .collect(),
-        ),
-        RuleSetData::GeoSite { entries } => CompiledRuleSet::GeoSite(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), CompiledDomainSet::compile(v)))
-                .collect(),
-        ),
         RuleSetData::IpList(nets) => CompiledRuleSet::IpList(CompiledIpSet::compile(nets)),
         RuleSetData::DomainList(pats) => {
             CompiledRuleSet::DomainList(CompiledDomainSet::compile(pats))
@@ -549,12 +533,6 @@ mod tests {
 
     #[test]
     fn test_compile_rule_set_variants() {
-        let mut geoip = HashMap::new();
-        geoip.insert("cn".to_string(), vec!["1.0.1.0/24".parse().unwrap()]);
-        assert!(matches!(
-            compile_rule_set(&RuleSetData::GeoIp { entries: geoip }),
-            CompiledRuleSet::GeoIp(_)
-        ));
         assert!(matches!(
             compile_rule_set(&RuleSetData::IpList(vec!["1.0.1.0/24".parse().unwrap()])),
             CompiledRuleSet::IpList(_)
@@ -565,12 +543,6 @@ mod tests {
                 "baidu.com"
             )])),
             CompiledRuleSet::DomainList(_)
-        ));
-        assert!(matches!(
-            compile_rule_set(&RuleSetData::GeoSite {
-                entries: HashMap::new()
-            }),
-            CompiledRuleSet::GeoSite(_)
         ));
     }
 
@@ -590,20 +562,17 @@ mod tests {
         assert_eq!(back.data, data);
         assert_eq!(back.source_sha, "abc");
         // The cache file struct round-trips arbitrary parsed rule set data.
-        let geosite = RuleSetData::GeoSite {
-            entries: HashMap::from([(
-                "cn".to_string(),
-                vec![pat(DomainPatternType::Suffix, "baidu.com")],
-            )]),
-        };
+        let domain_list = RuleSetData::DomainList(vec![
+            pat(DomainPatternType::Suffix, "baidu.com"),
+        ]);
         let f2 = RuleSetCacheFile {
             source_sha: "def".to_string(),
-            data: geosite,
+            data: domain_list,
         };
         let bytes = bincode::serialize(&f2).unwrap();
         let back: RuleSetCacheFile = bincode::deserialize(&bytes).unwrap();
         assert_eq!(back.source_sha, "def");
-        assert!(matches!(back.data, RuleSetData::GeoSite { .. }));
+        assert!(matches!(back.data, RuleSetData::DomainList(_)));
     }
 
     #[test]

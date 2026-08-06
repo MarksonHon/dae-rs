@@ -3,16 +3,13 @@
 //! Provides:
 //!
 //! - [`RuleSetCache`]: an in-memory map of `name → RuleSetData`, queried at matcher compile time and
-//!   at runtime by DNS query routing and DNS response routing. Internally an
+//!   at runtime by routing. Internally an
 //!   `Arc<RwLock<HashMap<String, RuleSetData>>>`, it can be safely replaced by the update flow
 //!   (scheduler notification → reload).
 //! - [`load_cache_from_dir`]: scans the on-disk data directory and fills the cache (shared by startup and post-update).
 //!
 //! Typed query semantics:
 //!
-//! - `geoip:<code>` → [`RuleSetCache::find_geoip_code`] (across all GeoIp data,
-//!   code case-insensitive);
-//! - `geosite:<code>` → [`RuleSetCache::find_geosite_code`];
 //! - `set:<name>` (ip_list) → [`RuleSetCache::get_set_ips`];
 //! - `set:<name>` (domain_list) → [`RuleSetCache::get_set_domains`].
 //!
@@ -49,7 +46,7 @@ impl Default for CacheInner {
 ///
 /// Holds both the raw parsed [`RuleSetData`] (used by the data-plane rule compiler, which needs
 /// the original CIDR / domain lists to build eBPF LPM tries) and a **compiled matching view**
-/// ([`CompiledRuleSet`]) used by the runtime DNS matcher for O(log N) / O(labels) lookups.
+/// ([`CompiledRuleSet`]) used by the runtime matcher for O(log N) / O(labels) lookups.
 #[derive(Debug, Clone, Default)]
 pub struct RuleSetCache {
     inner: Arc<RwLock<CacheInner>>,
@@ -99,40 +96,6 @@ impl RuleSetCache {
         self.len() == 0
     }
 
-    /// Find the CIDR list for a geoip `country_code` (case-insensitive).
-    ///
-    /// Iterates over all `GeoIp` data in the cache; returns `None` if not found.
-    pub fn find_geoip_code(&self, code: &str) -> Option<Vec<IpNet>> {
-        let guard = self.inner.read().ok()?;
-        for data in guard.data.values() {
-            if let RuleSetData::GeoIp { entries } = data {
-                for (k, v) in entries {
-                    if k.eq_ignore_ascii_case(code) {
-                        return Some(v.clone());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Find the domain name pattern list for a geosite `country_code` (category name).
-    ///
-    /// A geosite dat's `country_code` is a lowercase category name; matching here is also case-insensitive for robustness.
-    pub fn find_geosite_code(&self, code: &str) -> Option<Vec<DomainPattern>> {
-        let guard = self.inner.read().ok()?;
-        for data in guard.data.values() {
-            if let RuleSetData::GeoSite { entries } = data {
-                for (k, v) in entries {
-                    if k.eq_ignore_ascii_case(code) {
-                        return Some(v.clone());
-                    }
-                }
-            }
-        }
-        None
-    }
-
     /// Read the CIDR list for `set:<name>` (type must be `IpList`).
     pub fn get_set_ips(&self, name: &str) -> Option<Vec<IpNet>> {
         match self.get(name)? {
@@ -149,53 +112,7 @@ impl RuleSetCache {
         }
     }
 
-    // ==========================================================================
-    // Compiled (fast) matching — used by the runtime DNS matcher.
-    // ==========================================================================
-
-    /// Whether `ip` belongs to any CIDR in the `geoip:<code>` set.
-    pub fn geoip_contains(&self, code: &str, ip: std::net::IpAddr) -> bool {
-        if let Ok(g) = self.inner.read() {
-            for set in g.compiled.values() {
-                if let CompiledRuleSet::GeoIp(entries) = set {
-                    for (k, v) in entries {
-                        if k.eq_ignore_ascii_case(code) && v.contains(ip) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
-
     /// Whether `ip` belongs to any CIDR in the `set:<name>` ip_list.
-    pub fn ip_set_contains(&self, name: &str, ip: std::net::IpAddr) -> bool {
-        if let Ok(g) = self.inner.read() {
-            if let Some(CompiledRuleSet::IpList(c)) = g.compiled.get(name) {
-                return c.contains(ip);
-            }
-        }
-        false
-    }
-
-    /// Whether `qname` matches any domain pattern in the `geosite:<code>` set.
-    pub fn geosite_matches(&self, code: &str, qname: &str) -> bool {
-        if let Ok(g) = self.inner.read() {
-            for set in g.compiled.values() {
-                if let CompiledRuleSet::GeoSite(entries) = set {
-                    for (k, v) in entries {
-                        if k.eq_ignore_ascii_case(code) && v.matches(qname) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// Whether `qname` matches any pattern in the `set:<name>` domain_list.
     pub fn domain_set_matches(&self, name: &str, qname: &str) -> bool {
         if let Ok(g) = self.inner.read() {
             if let Some(CompiledRuleSet::DomainList(c)) = g.compiled.get(name) {
@@ -252,29 +169,8 @@ mod tests {
     }
 
     #[test]
-    fn test_find_geoip_code_case_insensitive() {
+    fn test_set_typed_queries() {
         let cache = RuleSetCache::new();
-        let mut entries = HashMap::new();
-        entries.insert(
-            "cn".to_string(),
-            vec!["1.0.1.0/24".parse::<IpNet>().unwrap()],
-        );
-        cache.insert("geoip_main".into(), RuleSetData::GeoIp { entries });
-
-        assert!(cache.find_geoip_code("cn").is_some());
-        assert!(cache.find_geoip_code("CN").is_some());
-        assert!(cache.find_geoip_code("us").is_none());
-    }
-
-    #[test]
-    fn test_find_geosite_code_and_set_typed() {
-        let cache = RuleSetCache::new();
-        let mut entries = HashMap::new();
-        entries.insert(
-            "cn".to_string(),
-            vec![DomainPattern { pattern_type: DomainPatternType::Suffix, value: "baidu.com".into() }],
-        );
-        cache.insert("geosite_main".into(), RuleSetData::GeoSite { entries });
         cache.insert(
             "chinaip".into(),
             RuleSetData::IpList(vec!["10.0.0.0/8".parse().unwrap()]),
@@ -286,10 +182,6 @@ mod tests {
                 value: "google.com".into(),
             }]),
         );
-
-        assert!(cache.find_geosite_code("cn").is_some());
-        assert!(cache.find_geosite_code("CN").is_some());
-        assert!(cache.find_geosite_code("ads").is_none());
 
         // Typed set queries
         assert!(cache.get_set_ips("chinaip").is_some());

@@ -9,7 +9,9 @@
 //! | [`netns`] | Network namespace & veth pair management |
 //! | [`iface_mgr`] | WAN/LAN interface discovery and matching |
 //! | [`udp_tracker`] | UDP connection tracking for TProxy |
+//! | [`dns_forwarder`] | DNS 转发器（UDP DNS 透明转发与缓存） |
 
+pub mod dns_forwarder;
 pub mod ebpf;
 pub mod iface_mgr;
 pub mod netns;

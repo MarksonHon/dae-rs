@@ -11,6 +11,19 @@ pub fn default_config_example() -> &'static str {
     r#"global {
   tproxy_port: 15080
   log_level: info
+  # DNS 转发全局开关，默认为 true。设为 false 则完全不触碰 DNS 流量
+  forward_dns: true
+}
+
+dns {
+  # 远端上游 DNS（通过代理查询），默认 Google DNS
+  upstream_remote: ["8.8.8.8:53", "[2001:4860:4860::8888]:53"]
+  # 上游策略：parallel（并发）或 sequential（顺序）
+  upstream_strategy: parallel
+  # 每代理组缓存条目数
+  cache_size_per_group: 1024
+  # 查询超时（毫秒）
+  query_timeout_ms: 5000
 }
 
 outbounds {

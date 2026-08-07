@@ -35,6 +35,8 @@ enum ParseState {
     Routing,
     /// Inside api section
     Api,
+    /// Inside dns section
+    Dns,
     // ── Rule set states ──
     /// Inside rule_set section
     RuleSet,
@@ -135,6 +137,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         "outbounds" => state = ParseState::Outbounds,
                         "routing" => state = ParseState::Routing,
                         "api" => state = ParseState::Api,
+                        "dns" => state = ParseState::Dns,
                         "rule_set" => state = ParseState::RuleSet,
                         _ => {
                             return Err(ConfigError::UnknownSection {
@@ -169,6 +172,14 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         }
                         "log_level" => {
                             config.runtime.log_level = unquote(value).to_string();
+                        }
+                        "forward_dns" => {
+                            config.runtime.forward_dns =
+                                parse_bool(value).map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!("cannot parse as boolean: '{}'", value),
+                                })?;
                         }
                         _ => {
                             return Err(ConfigError::Syntax {
@@ -685,6 +696,67 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 })?;
             }
 
+            // ── dns (top-level) ──
+            ParseState::Dns => {
+                if line == "}" {
+                    state = ParseState::Top;
+                    continue;
+                }
+                let dns = config.dns.get_or_insert_with(DnsConfig::default);
+                let (key, value) = split_kv(line).ok_or_else(|| ConfigError::Syntax {
+                    line: line_number,
+                    message: format!(
+                        "expected `key: value` or `key = value` in dns, got: '{}'",
+                        line
+                    ),
+                })?;
+                match key {
+                    "upstream_remote" => {
+                        dns.upstream_remote =
+                            parse_socket_addr_list(value, line_number, key)?;
+                    }
+                    "upstream_strategy" => {
+                        let v = unquote(value);
+                        dns.upstream_strategy = match v {
+                            "parallel" => UpstreamStrategy::Parallel,
+                            "sequential" => UpstreamStrategy::Sequential,
+                            _ => {
+                                return Err(ConfigError::InvalidValue {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!(
+                                        "unknown upstream_strategy '{}', expected parallel/sequential",
+                                        v
+                                    ),
+                                });
+                            }
+                        };
+                    }
+                    "cache_size_per_group" => {
+                        dns.cache_size_per_group = value.parse().map_err(|_| {
+                            ConfigError::FieldType {
+                                line: line_number,
+                                field: key.into(),
+                                message: format!("cannot parse as integer: '{}'", value),
+                            }
+                        })?;
+                    }
+                    "query_timeout_ms" => {
+                        dns.query_timeout_ms = value.parse().map_err(|_| ConfigError::FieldType {
+                            line: line_number,
+                            field: key.into(),
+                            message: format!("cannot parse as integer: '{}'", value),
+                        })?;
+                    }
+                    _ => {
+                        return Err(ConfigError::Syntax {
+                            line: line_number,
+                            message: format!("unknown dns field: '{}'", key),
+                        });
+                    }
+                }
+            }
+
             // ── rule_set (top-level) ──
             ParseState::RuleSet => {
                 if line == "}" {
@@ -852,6 +924,62 @@ where
             message: format!("expected `key: value` format, got: '{}'", line),
         })
     }
+}
+
+/// Split a `key: value` or `key = value` line into a `(key, value)` tuple.
+///
+/// Returns `None` when no separator is present or the key is empty.
+///
+/// Note: prefer `=` over `:` as the separator, since `:` may appear inside
+/// values such as `"host:port"` or IPv6 addresses.
+fn split_kv(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    let sep = line
+        .find('=')
+        .filter(|i| {
+            let key = line[..*i].trim();
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .or_else(|| line.find(':'))?;
+    let key = line[..sep].trim();
+    let value = line[sep + 1..].trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, value))
+}
+
+/// Parse a socket address list of the form `[ "host:port", ... ]` into `Vec<SocketAddr>`.
+fn parse_socket_addr_list(
+    value: &str,
+    line_number: usize,
+    field: &str,
+) -> Result<Vec<SocketAddr>> {
+    let value = value.trim();
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| ConfigError::Syntax {
+            line: line_number,
+            message: format!(
+                "field '{}' expected list syntax `[ \"host:port\", ... ]`, got: '{}'",
+                field, value
+            ),
+        })?;
+    let mut out = Vec::new();
+    for entry in inner.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let addr: SocketAddr = unquote(entry).parse().map_err(|_| ConfigError::FieldType {
+            line: line_number,
+            field: field.into(),
+            message: format!("cannot parse as socket address: '{}'", entry),
+        })?;
+        out.push(addr);
+    }
+    Ok(out)
 }
 
 /// Parse a map value of the form `{ "key1": "val1", "key2": "val2" }` into a HashMap.

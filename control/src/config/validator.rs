@@ -57,6 +57,9 @@ pub fn validate_config(config: &DaefileConfig) -> std::result::Result<(), Config
     // 9. Rule set validation (E2101 / E2104 / E2105)
     validate_rule_set(config)?;
 
+    // 10. DNS configuration validation
+    validate_dns(config)?;
+
     Ok(())
 }
 
@@ -389,6 +392,43 @@ fn validate_api(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
                 && (api.cert.is_none() || api.key.is_none()) {
                     return Err(ConfigError::ApiTlsMissingCertKey);
                 }
+        }
+    }
+    Ok(())
+}
+
+/// DNS configuration validation.
+///
+/// - `forward_dns = false` 时完全不触碰 DNS 流量，跳过后续校验；
+/// - `forward_dns = true` 时 `dns` 可以为 `None`（使用 `DnsConfig::default()`）；
+/// - `upstream_remote` 不能为空列表；
+/// - `cache_size_per_group` 必须 > 0；
+/// - `query_timeout_ms` 必须 > 0。
+fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> {
+    if !config.runtime.forward_dns {
+        return Ok(());
+    }
+    if let Some(ref dns) = config.dns {
+        if dns.upstream_remote.is_empty() {
+            return Err(ConfigError::FieldType {
+                line: 0,
+                field: "dns.upstream_remote".into(),
+                message: "upstream_remote must not be empty".into(),
+            });
+        }
+        if dns.cache_size_per_group == 0 {
+            return Err(ConfigError::OutOfRange {
+                line: 0,
+                field: "dns.cache_size_per_group".into(),
+                message: "cache_size_per_group must be > 0".into(),
+            });
+        }
+        if dns.query_timeout_ms == 0 {
+            return Err(ConfigError::OutOfRange {
+                line: 0,
+                field: "dns.query_timeout_ms".into(),
+                message: "query_timeout_ms must be > 0".into(),
+            });
         }
     }
     Ok(())

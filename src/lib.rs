@@ -151,6 +151,12 @@ pub async fn run(
     // Set eBPF PARAM global variable
     // This must be done after netns creation but before eBPF loading
     // We'll set it in start() after netns is created
+    let forward_dns = cp
+        .config
+        .daefile_config
+        .as_ref()
+        .map(|d| d.runtime.forward_dns)
+        .unwrap_or(false);
     let ebpf_param = control::net::ebpf::Daeparam {
         tproxy_port: cp.config.tproxy_port as u32,
         control_plane_pid: std::process::id(),
@@ -158,8 +164,9 @@ pub async fn run(
         // dae-rs's own sockets and skip them (prevents self-loop).
         // Must match socket_mark used by TProxy and SOCKS5 dialers.
         dae_socket_mark: shared::DAE_SOCKET_MARK,
-        // DNS hijacking is disabled (DNS module removed).
-        dns_hijack_enabled: 0,
+        // DNS hijacking is enabled only when the DNS module (forward_dns) is on.
+        // When cleared, port 53 traffic follows normal routing rules.
+        dns_hijack_enabled: if forward_dns { 1 } else { 0 },
         // dae0_ifindex, dae_netns_id, dae0peer_mac will be set after netns creation
         ..Default::default()
     };

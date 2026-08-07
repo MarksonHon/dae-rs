@@ -18,7 +18,7 @@ use tracing::{debug, info};
 use crate::config;
 use crate::config::ConfigError;
 use crate::net::ebpf::{match_type, outbound};
-use crate::net::ebpf::{CidrEntry, LpmKey, MatchSet, MatchSetValue, PortRange};
+use crate::net::ebpf::{CidrEntry, LpmKey, MatchSet, MatchSetValue, PortRange, QtypeList};
 use crate::ruleset::cache::RuleSetCache;
 use crate::ruleset::compiled::{CompiledDomainSet, CompiledIpSet};
 use crate::ruleset::refparse::{domain_pattern_to_string, parse_ref, RuleSetRef};
@@ -481,7 +481,26 @@ impl RulesBuilder {
                     );
 
                     let ms_list = parser(func, key, values, &override_outbound)?;
-                    all_sets.extend(ms_list);
+                    if is_last_in_function && ms_list.len() > 1 {
+                        // Multiple match sets from the final group of this function
+                        // are OR alternatives (e.g. `dport(80,443)`): every entry
+                        // except the last must keep the LOGICAL_OR marker so GOOD
+                        // state carries across them (mirrors eBPF route_finalize_match).
+                        let last = ms_list.len() - 1;
+                        all_sets.extend(
+                            ms_list
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, mut ms)| {
+                                    if idx != last {
+                                        ms.outbound = outbound::LOGICAL_OR;
+                                    }
+                                    ms
+                                }),
+                        );
+                    } else {
+                        all_sets.extend(ms_list);
+                    }
                 }
             }
         }
@@ -902,20 +921,126 @@ pub fn parse_mac_fn(
 }
 
 /// Parser for `qtype(...)` — DNS query type matching.
+///
+/// 将 DNS 查询类型（数字或常见类型名，如 `A`/`AAAA`/`ANY`）解析为
+/// [`QtypeList`] 存入 MatchSet，供 userspace（DNS 转发器）的
+/// [`RoutingMatcher::match_routing`] 求值。
 pub fn parse_qtype_fn(
     f: &Function,
     _key: &str,
-    _values: &[String],
+    values: &[String],
     override_outbound: &Outbound,
 ) -> Result<Vec<MatchSet>> {
+    let qtypes = qtype_values_to_list(values)?;
     let mut ms = MatchSet::zeroed();
     ms.r#type = match_type::QTYPE;
-    // QType is a placeholder; full DNS query type matching is TBD
+    ms.value = MatchSetValue { qtypes };
     ms.not = if f.not { 1 } else { 0 };
     ms.outbound = lookup_outbound_id_for_ms(override_outbound)?;
     ms.must = if override_outbound.must { 1 } else { 0 };
     ms.mark = override_outbound.mark;
     Ok(vec![ms])
+}
+
+/// 解析 `qtype(...)` 的参数值为 `[u16; 8]`（0 终止）。
+///
+/// 支持数字（如 `1`、`28`）与常见类型名（大小写不敏感，如 `A`、`AAAA`、`ANY`）。
+/// 超出 8 个值或无法解析的值返回错误。
+pub fn qtype_values_to_list(values: &[String]) -> Result<QtypeList> {
+    const MAX_QTYPES: usize = 8;
+    if values.is_empty() || values.len() > MAX_QTYPES {
+        return Err(anyhow!(
+            "qtype() requires 1..={MAX_QTYPES} values, got {}",
+            values.len()
+        ));
+    }
+    let mut types = [0u16; MAX_QTYPES];
+    for (i, v) in values.iter().enumerate() {
+        types[i] = parse_qtype_value(v)?;
+    }
+    Ok(QtypeList { types })
+}
+
+/// 将单个 qtype 值解析为 u16。数字按字面解析；否则按常见类型名匹配（不区分大小写）。
+fn parse_qtype_value(v: &str) -> Result<u16> {
+    if let Ok(num) = v.trim().parse::<u16>() {
+        return Ok(num);
+    }
+    let upper = v.trim().to_ascii_uppercase();
+    let val = match upper.as_str() {
+        "A" => 1,
+        "NS" => 2,
+        "MD" => 3,
+        "MF" => 4,
+        "CNAME" => 5,
+        "SOA" => 6,
+        "MB" => 7,
+        "MG" => 8,
+        "MR" => 9,
+        "NULL" => 10,
+        "WKS" => 11,
+        "PTR" => 12,
+        "HINFO" => 13,
+        "MINFO" => 14,
+        "MX" => 15,
+        "TXT" => 16,
+        "RP" => 17,
+        "AFSDB" => 18,
+        "X25" => 19,
+        "ISDN" => 20,
+        "RT" => 21,
+        "NSAP" => 22,
+        "SIG" => 24,
+        "KEY" => 25,
+        "PX" => 26,
+        "GPOS" => 27,
+        "AAAA" => 28,
+        "LOC" => 29,
+        "SRV" => 33,
+        "NAPTR" => 35,
+        "KX" => 36,
+        "CERT" => 37,
+        "DNAME" => 39,
+        "OPT" => 41,
+        "APL" => 42,
+        "DS" => 43,
+        "SSHFP" => 44,
+        "IPSECKEY" => 45,
+        "RRSIG" => 46,
+        "NSEC" => 47,
+        "DNSKEY" => 48,
+        "DHCID" => 49,
+        "NSEC3" => 50,
+        "NSEC3PARAM" => 51,
+        "TLSA" => 52,
+        "HIP" => 55,
+        "CDS" => 59,
+        "CDNSKEY" => 60,
+        "OPENPGPKEY" => 61,
+        "CSYNC" => 62,
+        "ZONEMD" => 63,
+        "SVCB" => 64,
+        "HTTPS" => 65,
+        "SPF" => 99,
+        "TKEY" => 249,
+        "TSIG" => 250,
+        "IXFR" => 251,
+        "AXFR" => 252,
+        "MAILB" => 253,
+        "MAILA" => 254,
+        "ANY" => 255,
+        "URI" => 256,
+        "CAA" => 257,
+        "TA" => 32768,
+        "DLV" => 32769,
+        _ => {
+            return Err(anyhow!(
+                "invalid qtype value: '{}' (expect a number or a DNS type name like A/AAAA/ANY)",
+                v
+            ))
+        }
+    };
+    Ok(val)
 }
 
 /// Parser for `upstream(...)` — upstream group matching.
@@ -1102,6 +1227,8 @@ pub struct CompiledRouting {
     pub fallback_mark: u32,
     /// Fallback must flag
     pub fallback_must: u8,
+    /// Outbound name → ID map (including unique per-group IDs).
+    pub outbound_id_map: HashMap<String, u8>,
 }
 
 /// Compile daefile routing rules into MatchSet entries for eBPF.
@@ -1258,19 +1385,38 @@ pub fn compile_rules(
                 );
                 let ov_outbound_id = resolve_outbound_id(&ov_outbound, &outbound_id_map)?;
 
-                let match_sets = build_match_set_for_function(
-                    func,
-                    key,
-                    values,
-                    ov_outbound_id,
-                    &ov_outbound,
-                    &mut lpm_tries,
-                    &mut lpm_dedup,
-                    &domain_sets,
-                    &mut rule_domain_idx,
-                    rule_set_cache,
-                )?;
-                final_match_sets.extend(match_sets);
+                    let match_sets = build_match_set_for_function(
+                        func,
+                        key,
+                        values,
+                        ov_outbound_id,
+                        &ov_outbound,
+                        &mut lpm_tries,
+                        &mut lpm_dedup,
+                        &domain_sets,
+                        &mut rule_domain_idx,
+                        rule_set_cache,
+                    )?;
+                    if is_last_in_function && match_sets.len() > 1 {
+                        // Multiple match sets from the final group of this function
+                        // are OR alternatives (e.g. `dport(80,443)`): every entry
+                        // except the last must carry the LOGICAL_OR marker so GOOD
+                        // state persists across them (mirrors eBPF route_finalize_match).
+                        let last = match_sets.len() - 1;
+                        final_match_sets.extend(
+                            match_sets
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, mut ms)| {
+                                    if idx != last {
+                                        ms.outbound = outbound::LOGICAL_OR;
+                                    }
+                                    ms
+                                }),
+                        );
+                    } else {
+                        final_match_sets.extend(match_sets);
+                    }
             }
         }
     }
@@ -1364,6 +1510,7 @@ pub fn compile_rules(
         fallback_outbound: fallback_id,
         fallback_mark,
         fallback_must,
+        outbound_id_map,
     })
 }
 
@@ -1380,6 +1527,9 @@ pub struct RoutingParams {
     pub dst_port: Option<u16>,
     pub l4proto: Option<u8>,
     pub domain: Option<String>,
+    /// DNS 查询类型（1=A, 28=AAAA ...）。仅在 DNS 路由上下文（DNS 转发器）中填充，
+    /// 供 `qtype(...)` 规则匹配。
+    pub qtype: Option<u16>,
     pub process_name: Option<String>,
     pub dscp: Option<u8>,
 }
@@ -1408,6 +1558,8 @@ pub struct RoutingMatcher {
     fallback_outbound: u8,
     fallback_mark: u32,
     fallback_must: bool,
+    /// Outbound name → ID map (including unique per-group IDs).
+    outbound_id_map: HashMap<String, u8>,
 }
 
 impl RoutingMatcher {
@@ -1432,7 +1584,17 @@ impl RoutingMatcher {
             fallback_outbound: compiled.fallback_outbound,
             fallback_mark: compiled.fallback_mark,
             fallback_must: compiled.fallback_must != 0,
+            outbound_id_map: compiled.outbound_id_map.clone(),
         }
+    }
+
+    /// Access the outbound name → ID map.
+    ///
+    /// Callers (e.g. [`crate::net::dns_forwarder::DnsForwarder`] initialization)
+    /// use the exact IDs returned by [`Self::match_routing`] so they can reverse
+    /// a routing result back to a specific proxy group.
+    pub fn get_outbound_id_map(&self) -> &HashMap<String, u8> {
+        &self.outbound_id_map
     }
 
     /// Evaluate routing rules for the given connection parameters.
@@ -1444,57 +1606,54 @@ impl RoutingMatcher {
     pub fn match_routing(&self, params: &RoutingParams) -> RoutingResult {
         let len = self.match_sets.len();
         let mut i = 0;
+        let mut must_flag = false;
 
+        // Mirrors the eBPF state machine (tproxy.c: route_finalize_match):
+        // a rule is a run of MatchSet entries where LOGICAL_OR (0xFE) joins
+        // subrule alternatives without finalizing, LOGICAL_AND (0xFF) finalizes
+        // a subrule, and any other outbound is the rule tail that carries the
+        // rule's real outbound. GOOD_SUBRULE / BAD_RULE accumulate across entries
+        // until a rule tail decides the result; a tail with BAD_RULE clears it
+        // and continues to the next rule.
         while i < len {
             let mut good_subrule = false;
             let mut bad_rule = false;
-            let mut must_flag = false;
 
             // Walk entries belonging to one rule.
             while i < len {
                 let ms = &self.match_sets[i];
                 let outbound = ms.outbound;
+                let match_not = ms.not != 0;
 
-                // If we already have a subrule result, check whether this is
-                // a continuation (LOGICAL_OR/LOGICAL_AND) or a new rule start.
-                if good_subrule || bad_rule {
-                    let is_logical_or = (outbound & outbound::LOGICAL_MASK) == outbound::LOGICAL_OR;
-                    let is_logical_and = outbound == outbound::LOGICAL_AND;
-                    if !is_logical_or && !is_logical_and {
-                        // Not a continuation — we've reached the terminal entry
-                        // (or a new rule). The result is already determined.
-                        break;
-                    }
-                    // Continue to next entry in the same rule
-                    i += 1;
-                    continue;
-                }
+                let is_logical_or = outbound == outbound::LOGICAL_OR;
+                // LOGICAL_OR / LOGICAL_AND are the only values with
+                // (outbound & LOGICAL_MASK) == LOGICAL_MASK.
+                let is_tail = !is_logical_or && outbound != outbound::LOGICAL_AND;
 
-                // No prior result — evaluate this match entry
-                let matched = self.eval_match(ms, params);
-
-                if ms.not != 0 {
-                    // NOT inverts the match logic
-                    if matched {
-                        bad_rule = true;
-                    } else {
-                        good_subrule = true;
-                    }
-                } else if matched {
+                // Evaluate this entry unless a prior subrule already settled the
+                // state (mirrors route_loop_cb skipping route_eval_match).
+                if !good_subrule && !bad_rule && self.eval_match(ms, params) {
                     good_subrule = true;
                 }
 
-                // Check if this is a terminal entry (not LOGICAL_OR/LOGICAL_AND).
-                // LOGICAL_MASK = 0xFE catches both LOGICAL_OR (0xFE) and LOGICAL_AND (0xFF).
-                if (outbound & outbound::LOGICAL_MASK) != outbound::LOGICAL_MASK {
-                    // Terminal: end of this rule.
-                    if !bad_rule && good_subrule {
+                if !is_logical_or {
+                    // This entry reaches the end of a subrule.
+                    // A subrule that did not hit (good == not) fails the rule.
+                    if good_subrule == match_not {
+                        bad_rule = true;
+                    }
+                    // Reset good_subrule.
+                    good_subrule = false;
+                }
+
+                if is_tail {
+                    // Tail of a rule: decide whether to hit.
+                    if !bad_rule {
                         if outbound == outbound::MUST_RULES {
                             must_flag = true;
-                            good_subrule = false;
-                            bad_rule = false;
+                            // Continue to the next rule with the must flag set.
                             i += 1;
-                            continue; // Continue to next rule with must flag
+                            break;
                         }
                         return RoutingResult {
                             outbound,
@@ -1502,22 +1661,19 @@ impl RoutingMatcher {
                             must: must_flag || ms.must != 0,
                         };
                     }
-                    // Rule didn't match, move to next
-                    break;
+                    // Rule didn't match, clear bad state and move to next rule.
+                    bad_rule = false;
                 }
 
-                // LOGICAL_OR or LOGICAL_AND — continue to next entry in the same rule
                 i += 1;
             }
-
-            i += 1;
         }
 
         // No rule matched — use fallback
         RoutingResult {
             outbound: self.fallback_outbound,
             mark: self.fallback_mark,
-            must: self.fallback_must,
+            must: must_flag || self.fallback_must,
         }
     }
 
@@ -1584,6 +1740,14 @@ impl RoutingMatcher {
                     .process_name
                     .as_deref() == Some(pname_str)
             }
+            t if t == match_type::QTYPE => params.qtype.is_some_and(|q| {
+                let qtypes = unsafe { ms.value.qtypes };
+                qtypes
+                    .types
+                    .iter()
+                    .take_while(|t| **t != 0)
+                    .any(|t| *t == q)
+            }),
             t if t == match_type::DSCP => {
                 let dscp = unsafe { ms.value.dscp };
                 params.dscp == Some(dscp)
@@ -1863,8 +2027,12 @@ fn build_match_set_for_function(
             }
         }
         "qtype" => {
+            // 注意：`qtype()` 是 DNS 上下文规则。数据面（eBPF）当前不实现 QTYPE 匹配，
+            // 但 userspace DNS 转发器会用它做 DNS 查询路由。此处写入真实的类型值。
+            let qtypes = qtype_values_to_list(values)?;
             let mut ms = MatchSet::zeroed();
             ms.r#type = match_type::QTYPE;
+            ms.value = MatchSetValue { qtypes };
             ms.not = if func.not { 1 } else { 0 };
             ms.outbound = outbound_id;
             ms.must = if ov_outbound.must { 1 } else { 0 };
@@ -1924,8 +2092,14 @@ pub fn choose_dial_target(routing: &RoutingMatcher, ctx: &RoutingParams) -> Rout
 /// - "block" → OUTBOUND_BLOCK (0x1)
 /// - "must" / "must_direct" → OUTBOUND_MUST_RULES (0xFC)
 /// - "control_plane_routing" → OUTBOUND_CONTROL_PLANE_ROUTING (0xFD)
-/// - proxy nodes/groups → their assigned IDs
-fn build_outbound_id_map(outbounds: &config::OutboundsConfig) -> HashMap<String, u8> {
+/// - proxy nodes → OUTBOUND_CONTROL_PLANE_ROUTING (real outbound chosen in userspace)
+/// - proxy groups → a unique ID in `0x02..=0xFB` so userspace (e.g. [`crate::net::dns_forwarder::DnsForwarder`])
+///   can distinguish one group from another via the routing result.
+///
+/// The unique group IDs avoid all reserved values: DIRECT (0x0), BLOCK (0x1),
+/// MUST_RULES (0xFC), CONTROL_PLANE_ROUTING (0xFD), LOGICAL_OR (0xFE) and
+/// LOGICAL_AND (0xFF). `0x02..=0xFB` therefore offers 250 usable group IDs.
+pub fn build_outbound_id_map(outbounds: &config::OutboundsConfig) -> HashMap<String, u8> {
     let mut map = HashMap::new();
     map.insert("direct".to_string(), outbound::DIRECT);
     map.insert("block".to_string(), outbound::BLOCK);
@@ -1936,14 +2110,25 @@ fn build_outbound_id_map(outbounds: &config::OutboundsConfig) -> HashMap<String,
         outbound::CONTROL_PLANE_ROUTING,
     );
 
-    // Map proxy nodes to CONTROL_PLANE_ROUTING
+    // Proxy nodes: the real outbound depends on connectivity health / load-balancing
+    // policies evaluated in userspace, so keep them on control-plane routing.
     for node in &outbounds.nodes {
         map.insert(node.name.clone(), outbound::CONTROL_PLANE_ROUTING);
     }
 
-    // Map proxy groups to CONTROL_PLANE_ROUTING
+    // Proxy groups: assign each a unique ID (first group → 0x02, then increment).
+    // If the u8 unique-ID space is exhausted we fall back to control-plane routing
+    // so the group still works, just without a distinguishable ID.
+    const GROUP_ID_START: u8 = 0x02;
+    const GROUP_ID_END: u8 = outbound::MUST_RULES - 1; // 0xFB
+    let mut next_id = GROUP_ID_START;
     for group in &outbounds.groups {
-        map.insert(group.name.clone(), outbound::CONTROL_PLANE_ROUTING);
+        if next_id > GROUP_ID_END {
+            map.insert(group.name.clone(), outbound::CONTROL_PLANE_ROUTING);
+            continue;
+        }
+        map.insert(group.name.clone(), next_id);
+        next_id += 1;
     }
 
     map
@@ -2152,7 +2337,7 @@ mod tests {
         assert_eq!(compiled.match_sets[1].r#type, match_type::L4_PROTO);
         assert_eq!(
             compiled.match_sets[1].outbound,
-            outbound::CONTROL_PLANE_ROUTING
+            *compiled.outbound_id_map.get("proxy_primary").unwrap()
         );
         assert_eq!(compiled.match_sets[2].r#type, match_type::FALLBACK);
     }
@@ -2324,7 +2509,7 @@ mod tests {
         assert_eq!(compiled.match_sets[0].r#type, match_type::FALLBACK);
         assert_eq!(
             compiled.match_sets[0].outbound,
-            outbound::CONTROL_PLANE_ROUTING
+            *compiled.outbound_id_map.get("proxy_primary").unwrap()
         );
     }
 
@@ -2366,12 +2551,15 @@ mod tests {
         let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
-        // Should match dport 80
+        // Should match dport 80 → proxy_primary's unique outbound id
         let result = matcher.match_routing(&RoutingParams {
             dst_port: Some(80),
             ..Default::default()
         });
-        assert_eq!(result.outbound, outbound::CONTROL_PLANE_ROUTING);
+        assert_eq!(
+            result.outbound,
+            *matcher.get_outbound_id_map().get("proxy_primary").unwrap()
+        );
 
         // Should NOT match dport 22
         let result = matcher.match_routing(&RoutingParams {
@@ -2409,6 +2597,98 @@ mod tests {
     }
 
     #[test]
+    fn test_qtype_parse() {
+        // 数字与常见类型名
+        assert_eq!(parse_qtype_value("A").unwrap(), 1);
+        assert_eq!(parse_qtype_value("aaaa").unwrap(), 28); // 大小写不敏感
+        assert_eq!(parse_qtype_value("ANY").unwrap(), 255);
+        assert_eq!(parse_qtype_value("28").unwrap(), 28);
+        assert_eq!(parse_qtype_value("HTTPS").unwrap(), 65);
+        // 非法值 → 错误
+        assert!(parse_qtype_value("NOT_A_TYPE").is_err());
+        assert!(parse_qtype_value("99999").is_err()); // 超出 u16
+
+        let list = qtype_values_to_list(&["A".into(), "AAAA".into()]).unwrap();
+        assert_eq!(&list.types[..2], &[1, 28]);
+        assert_eq!(list.types[2], 0); // 0 终止
+        // 空列表 / 超 8 个 → 错误
+        assert!(qtype_values_to_list(&[]).is_err());
+        assert!(qtype_values_to_list(&["1".repeat(9).into()]).is_err());
+    }
+
+    #[test]
+    fn test_routing_matcher_qtype() {
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "qtype(AAAA)".to_string(),
+            action: "direct".to_string(),
+        });
+
+        let outbounds = config::OutboundsConfig::default();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
+        let matcher = RoutingMatcher::from_compiled(&compiled);
+
+        // AAAA (28) → 命中 DIRECT
+        let result = matcher.match_routing(&RoutingParams {
+            qtype: Some(28),
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, outbound::DIRECT);
+
+        // A (1) → 不命中，走 fallback
+        let result = matcher.match_routing(&RoutingParams {
+            qtype: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, compiled.fallback_outbound);
+
+        // 无 qtype 上下文（普通数据面连接）→ 不命中
+        let result = matcher.match_routing(&RoutingParams {
+            dst_port: Some(443),
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, compiled.fallback_outbound);
+    }
+
+    #[test]
+    fn test_routing_matcher_qtype_negated() {
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "!qtype(A, AAAA)".to_string(),
+            action: "proxy(proxy_primary)".to_string(),
+        });
+
+        let mut outbounds = config::OutboundsConfig::default();
+        outbounds.groups.push(config::OutboundGroupConfig {
+            name: "proxy_primary".to_string(),
+            group_type: config::GroupType::Select,
+            policy: None,
+            selected: None,
+            selectors: vec![],
+        });
+
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
+        let matcher = RoutingMatcher::from_compiled(&compiled);
+
+        // TXT (16) 非 A/AAAA → 命中代理组
+        let result = matcher.match_routing(&RoutingParams {
+            qtype: Some(16),
+            ..Default::default()
+        });
+        assert_eq!(
+            result.outbound,
+            *matcher.get_outbound_id_map().get("proxy_primary").unwrap()
+        );
+
+        // A (1) → 不命中
+        let result = matcher.match_routing(&RoutingParams {
+            qtype: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, compiled.fallback_outbound);
+    }
+
+    #[test]
     fn test_routing_matcher_and_rule() {
         let mut routing = config::RoutingConfig::default();
         routing.rules.push(config::RouteRule {
@@ -2428,13 +2708,16 @@ mod tests {
         let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
         let matcher = RoutingMatcher::from_compiled(&compiled);
 
-        // TCP port 443 should match
+        // TCP port 443 should match → proxy_primary's unique outbound id
         let result = matcher.match_routing(&RoutingParams {
             dst_port: Some(443),
             l4proto: Some(0x01), // TCP
             ..Default::default()
         });
-        assert_eq!(result.outbound, outbound::CONTROL_PLANE_ROUTING);
+        assert_eq!(
+            result.outbound,
+            *matcher.get_outbound_id_map().get("proxy_primary").unwrap()
+        );
 
         // UDP port 443 should NOT match
         let result = matcher.match_routing(&RoutingParams {
@@ -2447,6 +2730,99 @@ mod tests {
         // TCP port 80 should NOT match
         let result = matcher.match_routing(&RoutingParams {
             dst_port: Some(80),
+            l4proto: Some(0x01),
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, compiled.fallback_outbound);
+    }
+
+    #[test]
+    fn test_routing_matcher_and_rule_distinct_outbound() {
+        // Regression test: an AND-composed rule whose action outbound differs
+        // from the fallback. Previously match_routing returned the fallback
+        // (or the wrong rule) because it bailed out at the rule's tail instead
+        // of finalizing the pending good_subrule. This breaks DNS routing, e.g.
+        // `dport(...) && qtype(...) -> proxy_group` when fallback is direct.
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "dport(443) && l4proto(tcp)".to_string(),
+            action: "direct".to_string(),
+        });
+
+        let mut outbounds = config::OutboundsConfig::default();
+        outbounds.groups.push(config::OutboundGroupConfig {
+            name: "proxy_primary".to_string(),
+            group_type: config::GroupType::Select,
+            policy: None,
+            selected: None,
+            selectors: vec![],
+        });
+
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
+        let matcher = RoutingMatcher::from_compiled(&compiled);
+        // fallback = proxy_primary (unique id), rule action = direct (0x0).
+        assert_ne!(compiled.fallback_outbound, outbound::DIRECT);
+
+        // Matching AND rule must yield the rule's action (DIRECT), not fallback.
+        let result = matcher.match_routing(&RoutingParams {
+            dst_port: Some(443),
+            l4proto: Some(0x01), // TCP
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, outbound::DIRECT);
+
+        // A later distinct rule must still be reachable after a non-matching AND rule.
+        let result = matcher.match_routing(&RoutingParams {
+            dst_port: Some(443),
+            l4proto: Some(0x02), // UDP
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, compiled.fallback_outbound);
+
+        let result = matcher.match_routing(&RoutingParams {
+            dst_port: Some(80),
+            l4proto: Some(0x01),
+            ..Default::default()
+        });
+        assert_eq!(result.outbound, compiled.fallback_outbound);
+    }
+
+    #[test]
+    fn test_routing_matcher_multi_value_or_in_and() {
+        // Regression test: `dport(80,443) && l4proto(tcp)` — the two port values
+        // are OR alternatives and must not be compiled as AND-joined subrules
+        // (previously both entries got LOGICAL_AND, so the rule could never match).
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "dport(80,443) && l4proto(tcp)".to_string(),
+            action: "direct".to_string(),
+        });
+        let outbounds = config::OutboundsConfig::default();
+        let compiled = compile_rules(&routing, &outbounds, &[], None).unwrap();
+
+        // PORT[80] is an OR alternative, PORT[443] ends the dport group with
+        // LOGICAL_AND, and L4PROTO carries the real outbound (direct).
+        assert_eq!(compiled.match_sets[0].r#type, match_type::PORT);
+        assert_eq!(compiled.match_sets[0].outbound, outbound::LOGICAL_OR);
+        assert_eq!(compiled.match_sets[1].r#type, match_type::PORT);
+        assert_eq!(compiled.match_sets[1].outbound, outbound::LOGICAL_AND);
+        assert_eq!(compiled.match_sets[2].r#type, match_type::L4_PROTO);
+        assert_eq!(compiled.match_sets[2].outbound, outbound::DIRECT);
+        assert_eq!(compiled.match_sets[3].r#type, match_type::FALLBACK);
+
+        let matcher = RoutingMatcher::from_compiled(&compiled);
+        for dport in [80u16, 443] {
+            let result = matcher.match_routing(&RoutingParams {
+                dst_port: Some(dport),
+                l4proto: Some(0x01), // TCP
+                ..Default::default()
+            });
+            assert_eq!(result.outbound, outbound::DIRECT, "dport={dport}");
+        }
+
+        // A non-listed port still falls through to fallback.
+        let result = matcher.match_routing(&RoutingParams {
+            dst_port: Some(22),
             l4proto: Some(0x01),
             ..Default::default()
         });
@@ -2484,13 +2860,16 @@ mod tests {
         });
         assert_eq!(result.outbound, outbound::DIRECT);
 
-        // Non-10.x.x.x, not port 22 should match proxy
+        // Non-10.x.x.x, not port 22 should match proxy → unique outbound id
         let result = matcher.match_routing(&RoutingParams {
             dst_ip: Some("8.8.8.8".parse().unwrap()),
             dst_port: Some(443),
             ..Default::default()
         });
-        assert_eq!(result.outbound, outbound::CONTROL_PLANE_ROUTING);
+        assert_eq!(
+            result.outbound,
+            *matcher.get_outbound_id_map().get("proxy_primary").unwrap()
+        );
 
         // Port 22 should not match the !dport rule, fall through to fallback
         let result = matcher.match_routing(&RoutingParams {

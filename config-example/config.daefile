@@ -1,6 +1,19 @@
 global {
   tproxy_port: 15080
   log_level: info
+  # Global DNS forwarding switch. Defaults to true. Set to false to bypass all DNS traffic.
+  forward_dns: true
+}
+
+dns {
+  # Remote upstream DNS servers (queried through proxy). Defaults to Google DNS.
+  upstream_remote = ["8.8.8.8:53", "[2001:4860:4860::8888]:53"]
+  # Upstream query strategy: "parallel" (concurrent, take fastest) or "sequential" (fallback on failure).
+  upstream_strategy = "parallel"
+  # Number of DNS cache entries per proxy group.
+  cache_size_per_group = 1024
+  # Query timeout in milliseconds.
+  query_timeout_ms = 5000
 }
 
 interface {

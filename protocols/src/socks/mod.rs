@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{OutboundDialer, ProxyConn};
 
@@ -916,7 +916,16 @@ impl crate::UdpSession for SocksUdpSession {
                 );
                 return Ok((dest, Bytes::copy_from_slice(&buf[offset..len])));
             }
-            // Non-SOCKS5 UDP packets (like fragments), ignore and retry
+            // Non-SOCKS5 UDP packets (like fragments), ignore and retry.
+            // DIAG: if the proxy relays raw DNS without the SOCKS5 UDP header (e.g.
+            // a plain UDP relay or a server that strips the header), every response
+            // fails this parse and is silently dropped → upstream DNS timeout.
+            warn!(
+                relay = %self.session.relay_addr,
+                len = len,
+                first_bytes = ?&buf[..len.min(16)],
+                "SOCKS5 UDP relay: datagram failed SOCKS5 header parse — possibly dropped response"
+            );
         }
     }
 }

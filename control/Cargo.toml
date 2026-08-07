@@ -18,6 +18,9 @@ libbpf-sys = { version = "1.4", features = ["vendored"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 tokio = { version = "1", features = ["full"] }
+# DNS 转发器：LRU 缓存与并发查询去重
+lru = "0.12"
+dashmap = "6"
 nix = { version = "0.31", features = ["net", "sched", "signal", "process", "mount", "fs"] }
 # "rc" enables Serialize/Deserialize for Arc<T> (used by RuleSetData's Arc-wrapped lists)
 serde = { version = "1", features = ["derive", "rc"] }

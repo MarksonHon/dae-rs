@@ -31,6 +31,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use thiserror::Error;
 
 pub use crate::ruleset::types::{RuleSetConfig, RuleSetType, RuleSetUpdate};
@@ -292,6 +293,10 @@ pub struct DaefileConfig {
     /// [`rule_set_serde`] adapts.
     #[serde(default, skip_serializing_if = "Vec::is_empty", with = "rule_set_serde")]
     pub rule_set: Vec<RuleSetConfig>,
+    /// DNS 转发器详细配置。forward_dns 为 true 时生效。
+    /// 若整个 `dns {}` 块不存在，使用 DnsConfig::default()。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsConfig>,
 }
 
 impl Default for DaefileConfig {
@@ -305,6 +310,7 @@ impl Default for DaefileConfig {
             routing: RoutingConfig::default(),
             api: None,
             rule_set: Vec::new(),
+            dns: None,
         }
     }
 }
@@ -383,6 +389,10 @@ pub struct RuntimeConfig {
     /// Whether to generate a temp JSON file
     #[serde(default = "default_true")]
     pub temp_json: bool,
+    /// DNS 转发全局开关，默认 true。false 时完全不触碰 DNS 流量。
+    /// 对应配置文件 `global {}` 块中的 `forward_dns`。
+    #[serde(default = "default_forward_dns")]
+    pub forward_dns: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -391,12 +401,79 @@ impl Default for RuntimeConfig {
             tproxy_port: 15080,
             log_level: "info".into(),
             temp_json: true,
+            forward_dns: true,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_forward_dns() -> bool {
+    true
+}
+
+/// DNS 转发器配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DnsConfig {
+    /// 远端上游 DNS 服务器列表（通过代理查询）。
+    /// 默认值：8.8.8.8:53 和 [2001:4860:4860::8888]:53
+    #[serde(default = "DnsConfig::default_upstream_remote")]
+    pub upstream_remote: Vec<SocketAddr>,
+
+    /// 上游选择策略
+    #[serde(default)]
+    pub upstream_strategy: UpstreamStrategy,
+
+    /// 每个代理组的 DNS 缓存条目数，默认 1024
+    #[serde(default = "DnsConfig::default_cache_size")]
+    pub cache_size_per_group: usize,
+
+    /// 单次查询超时（毫秒），默认 5000
+    #[serde(default = "DnsConfig::default_query_timeout")]
+    pub query_timeout_ms: u64,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            upstream_remote: Self::default_upstream_remote(),
+            upstream_strategy: UpstreamStrategy::default(),
+            cache_size_per_group: Self::default_cache_size(),
+            query_timeout_ms: Self::default_query_timeout(),
+        }
+    }
+}
+
+impl DnsConfig {
+    fn default_upstream_remote() -> Vec<SocketAddr> {
+        vec![
+            "8.8.8.8:53".parse().unwrap(),
+            "[2001:4860:4860::8888]:53".parse().unwrap(),
+        ]
+    }
+
+    fn default_cache_size() -> usize {
+        1024
+    }
+
+    fn default_query_timeout() -> u64 {
+        5000
+    }
+}
+
+/// DNS 上游选择策略
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum UpstreamStrategy {
+    /// 并发查询所有上游，取最快响应
+    #[serde(rename = "parallel")]
+    #[default]
+    Parallel,
+    /// 按顺序尝试，失败时切换到下一个
+    #[serde(rename = "sequential")]
+    Sequential,
 }
 
 /// Network interface configuration

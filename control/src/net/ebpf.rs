@@ -352,6 +352,15 @@ pub struct PortRange {
     pub port_end: u16,
 }
 
+/// `qtype()` 规则值列表（16 字节，最多 8 个 u16）。
+///
+/// 0 作为终止符（DNS TYPE 0 为保留类型，实际查询不会出现）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct QtypeList {
+    pub types: [u16; 8],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union MatchSetValue {
@@ -361,6 +370,7 @@ pub union MatchSetValue {
     pub ip_version: u8,
     pub pname: [u8; 16],
     pub dscp: u8,
+    pub qtypes: QtypeList,
     pub raw: [u8; 16],
 }
 unsafe impl bytemuck::Zeroable for MatchSetValue {}
@@ -2022,11 +2032,14 @@ impl EbpfManager {
     pub fn read_debug_counters(&mut self) -> Result<[u64; 36]> {
         let map = self.get_map_mut("debug_counter_map")?;
         let mut counters = [0u64; 36];
+        // debug_counter_map is a BPF_MAP_TYPE_PERCPU_ARRAY: each key holds one
+        // value per CPU. Sum all CPU slices, otherwise counters on CPUs other
+        // than 0 are silently dropped (lookup() itself errors on per-CPU maps).
         for i in 0u32..36 {
             let key = i.to_ne_bytes();
-            if let Ok(Some(val_bytes)) = map.lookup(&key, MapFlags::empty()) {
-                if val_bytes.len() >= 8 {
-                    counters[i as usize] = u64::from_ne_bytes(val_bytes[..8].try_into().unwrap());
+            if let Ok(Some(cpu_vals)) = map.lookup_percpu(&key, MapFlags::empty()) {
+                for val in cpu_vals.iter().filter(|v| v.len() >= 8) {
+                    counters[i as usize] += u64::from_ne_bytes(val[..8].try_into().unwrap());
                 }
             }
         }

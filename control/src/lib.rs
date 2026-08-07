@@ -335,6 +335,12 @@ pub struct ControlPlane {
     /// manager for `send_by` proxied DNS upstream queries. TProxy keeps using
     /// [`Self::outbound_dialer`] (first node / default).
     outbound_group_dialers: HashMap<String, Arc<dyn OutboundDialer>>,
+    /// DNS forwarder (UDP DNS hijacking dispatch).
+    ///
+    /// Built in [`Self::start_tproxy`] when `forward_dns` is enabled, then shared
+    /// with the UDP TProxy listener so hijacked DNS queries are dispatched through
+    /// it (domain-based routing / caching / anti-pollution).
+    dns_forwarder: Option<Arc<net::dns_forwarder::DnsForwarder>>,
     /// Current routing epoch slot (0 or 1) for double-buffering.
     /// On each reload, we write to the non-active slot, then flip.
     current_epoch_slot: u32,
@@ -414,6 +420,7 @@ impl ControlPlane {
             routing_matcher: None,
             outbound_dialer: None,
             outbound_group_dialers: HashMap::new(),
+            dns_forwarder: None,
             current_epoch_slot: 0,
             datapath_generation: 0,
             rule_set_scheduler: None,
@@ -1451,6 +1458,81 @@ impl ControlPlane {
             );
         }
 
+        // ---- Build DNS forwarder (if forward_dns enabled) ----
+        // Construct per-group DNS caches, per-group remote dialers and the
+        // group→outbound-id reverse map, then create the DnsForwarder. It is shared
+        // with the UDP TProxy listener so hijacked UDP DNS queries are dispatched
+        // through it (domain-based routing / caching / anti-pollution).
+        let dns_forwarder = match (self.config.daefile_config.as_ref(), self.routing_matcher.as_ref())
+        {
+            (Some(dc), Some(matcher)) if dc.runtime.forward_dns => {
+                let dns_config = dc.dns.clone().unwrap_or_default();
+                let mut group_caches: HashMap<String, net::dns_forwarder::DnsCache> =
+                    HashMap::new();
+                let mut group_dialers: HashMap<String, Arc<net::dns_forwarder::GroupDnsDialer>> =
+                    HashMap::new();
+                let mut group_outbound_ids: HashMap<String, u8> = HashMap::new();
+
+                for group in &dc.outbounds.groups {
+                    let name = group.name.clone();
+                    group_caches.insert(
+                        name.clone(),
+                        net::dns_forwarder::DnsCache::new(dns_config.cache_size_per_group),
+                    );
+                    // 组 → outbound id：从路由匹配器的 outbound_id_map 取每个组唯一的
+                    // id，与 match_routing 的返回值一致，从而能精确反向解析出具体代理组
+                    // （而非所有组都映射到 CONTROL_PLANE_ROUTING）。
+                    let group_id = matcher
+                        .get_outbound_id_map()
+                        .get(&name)
+                        .copied()
+                        .unwrap_or(net::ebpf::outbound::CONTROL_PLANE_ROUTING);
+                    group_outbound_ids.insert(name.clone(), group_id);
+                    if let Some(dialer) = self.outbound_group_dialers.get(&name) {
+                        let remote_dns = dns_config
+                            .upstream_remote
+                            .first()
+                            .copied()
+                            .unwrap_or_else(|| {
+                                "8.8.8.8:53".parse().expect("valid default DNS address")
+                            });
+                        group_dialers.insert(
+                            name.clone(),
+                            Arc::new(net::dns_forwarder::GroupDnsDialer {
+                                dialer: dialer.clone(),
+                                remote_dns,
+                            }),
+                        );
+                    }
+                }
+
+                let forwarder = Arc::new(net::dns_forwarder::DnsForwarder::new(
+                    dns_config,
+                    matcher.clone(),
+                    group_outbound_ids,
+                    group_caches,
+                    group_dialers,
+                    host_ns_fd,
+                ));
+                info!(
+                    groups = self.outbound_group_dialers.len(),
+                    "DnsForwarder initialized (forward_dns enabled)"
+                );
+                Some(forwarder)
+            }
+            (Some(_), None) => {
+                warn!(
+                    "forward_dns enabled but RoutingMatcher unavailable; DNS hijacking disabled"
+                );
+                None
+            }
+            _ => {
+                debug!("forward_dns disabled — DnsForwarder not initialized");
+                None
+            }
+        };
+        self.dns_forwarder = dns_forwarder.clone();
+
         // ---- TProxy listener (in DAENS) ----
         // eBPF data flow:
         // 1. WAN egress TC intercepts SYN packets
@@ -1487,6 +1569,10 @@ impl ControlPlane {
             );
             // Upstream UDP sockets are created in the host NS when host_ns_fd is available.
             udp.set_host_ns_fd(host_ns_fd);
+            // Route hijacked UDP DNS queries through the DnsForwarder when enabled.
+            if let Some(fwd) = dns_forwarder.clone() {
+                udp.set_dns_forwarder(fwd);
+            }
             Arc::new(udp)
         };
 

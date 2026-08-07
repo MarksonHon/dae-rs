@@ -38,6 +38,7 @@
 use anyhow::{Context, Result};
 use protocols::{OutboundDialer, ProxyStream};
 use protocols::UdpSession;
+use crate::net::dns_forwarder::DnsForwarder;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -98,14 +99,14 @@ const QUIC_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Matches kdae's `udpEndpointWriteTimeout` (10s).
 const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum time the UDP DNS hijack task waits for the internal DNS handler's
+/// Maximum time the UDP DNS hijack task waits for the legacy internal DNS handler's
 /// response before giving up.
 ///
-/// MUST be >= the handler's worst-case response time. The DNS handler may take
-/// its full per-query timeout (handler.rs `timeout`, 5s) plus a proxied
-/// UDP->TCP fallback, so a 5s window here caused the handler's response (or
-/// SERVFAIL) to arrive after this socket was dropped — the UDP datagram was
-/// silently lost and the client saw a hard timeout instead of a SERVFAIL.
+/// Only used by the fallback path (`dns_forward_addr`, when no `DnsForwarder` is
+/// installed). The primary path dispatches queries to the `DnsForwarder`, which is
+/// self-bounded by its own per-query timeout.
+///
+/// MUST be >= the legacy handler's worst-case response time.
 const DNS_HIJACK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Select the UDP flow idle timeout by original destination port (tiered timeout).
@@ -212,13 +213,6 @@ pub struct TproxyListener {
     socket_mark: u32,
     /// Stop signal (notifies the accept loop to exit; no polling needed)
     stop_signal: Arc<Notify>,
-    /// Internal DNS handler address (for cross-namespace DNS hijacking).
-    ///
-    /// When a TCP connection's original destination is port 53, the connection is not
-    /// sent through the proxy dialer; instead the DNS-over-TCP session is forwarded to
-    /// the DNS handler at this address (consistent with UDP hijacking).
-    /// `None` means no TCP DNS hijacking.
-    dns_forward_addr: Option<SocketAddr>,
     /// Host network namespace fd (upstream sockets for DNS hijacking are created in the host NS).
     host_ns_fd: Option<RawFd>,
 }
@@ -237,7 +231,6 @@ impl TproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark: shared::DAE_SOCKET_MARK, // default value from the original dae
             stop_signal: Arc::new(Notify::new()),
-            dns_forward_addr: None,
             host_ns_fd: None,
         }
     }
@@ -254,22 +247,8 @@ impl TproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
-            dns_forward_addr: None,
             host_ns_fd: None,
         }
-    }
-
-    /// Set the TCP DNS hijacking target (the internal DNS handler address).
-    ///
-    /// After setting, TCP connections whose original destination is port 53 are forwarded
-    /// to this DNS handler instead of the proxy. Consistent with UDP hijacking's
-    /// `169.254.0.1:<port>`.
-    pub fn set_dns_forward_addr(&mut self, addr: SocketAddr) {
-        self.dns_forward_addr = Some(addr);
-        tracing::info!(
-            "DNS hijacking enabled: TCP TProxy will forward DNS queries to {}",
-            addr
-        );
     }
 
     /// Set the host network namespace fd (upstream connections for DNS hijacking are
@@ -511,17 +490,11 @@ impl TproxyListener {
                                 "Accepted new TCP connection"
                             );
                             let dialer = self.dialer.clone();
-                            let dns_forward_addr = self.dns_forward_addr;
                             let host_ns_fd = self.host_ns_fd;
                             tokio::spawn(async move {
                                 let start = std::time::Instant::now();
-                                if let Err(e) = handle_connection(
-                                    stream,
-                                    dialer,
-                                    dns_forward_addr,
-                                    host_ns_fd,
-                                )
-                                .await
+                                if let Err(e) =
+                                    handle_connection(stream, dialer, host_ns_fd).await
                                 {
                                     error!(
                                         peer_addr = %peer_addr,
@@ -618,7 +591,6 @@ impl std::fmt::Debug for TproxyListener {
 async fn handle_connection(
     mut inbound: TcpStream,
     dialer: Arc<dyn OutboundDialer>,
-    dns_forward_addr: Option<SocketAddr>,
     host_ns_fd: Option<RawFd>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
@@ -636,27 +608,10 @@ async fn handle_connection(
     )?;
     debug!(orig_dst = %orig_dst, "handle_connection: got original destination");
 
-    // ---- Step 1.5: TCP DNS hijacking ----
-    // eBPF has already redirected TCP port 53 queries to the control plane
-    // (ROUTE_STATE_DNS_QUERY).
-    // Here the DNS-over-TCP session is forwarded to the internal DNS handler instead of
-    // the proxy, consistent with UDP hijacking (dns_forward_addr). This way TCP DNS also
-    // enters the DNS module's caching/anti-pollution/proxy logic.
-    if orig_dst.port() == 53 {
-        if let Some(handler_addr) = dns_forward_addr {
-            info!(
-                "TCP DNS hijack: {} -> {} (querying {})",
-                peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
-                orig_dst,
-                handler_addr,
-            );
-            return handle_dns_tcp_connection(inbound, handler_addr, host_ns_fd).await;
-        }
-        warn!(
-            orig_dst = %orig_dst,
-            "TCP DNS connection to port 53 but no DNS forward addr configured; proxying directly"
-        );
-    }
+    // TCP DNS is NOT hijacked anymore: the eBPF datapath only marks UDP port 53 as
+    // ROUTE_STATE_DNS_QUERY. TCP port 53 (DNS over TCP) is routed like ordinary TCP
+    // traffic through the proxy path, so there is nothing special to do here.
+    let _ = host_ns_fd;
 
     // ---- Step 2: Disable Nagle (TCP_NODELAY) to reduce interactive small-packet latency ----
     // Inbound connections have Nagle enabled by default on kernel accept; outbound
@@ -779,45 +734,6 @@ async fn handle_connection(
         }
     }
 
-    Ok(())
-}
-
-/// Forward a DNS-over-TCP session to the internal DNS handler.
-///
-/// DNS-over-TCP uses a 2-byte length-prefix framing (RFC 1035 §4.2.2). The byte stream
-/// between the client connection and the internal DNS handler is relayed bidirectionally:
-/// query frames go to the handler, response frames come back to the client. Since the
-/// client connection is an IP_TRANSPARENT TProxy socket (local address = original
-/// destination DNS server), the return-path source address is correct and the client
-/// will not drop the packets.
-///
-/// The upstream socket is created in the host NS (`host_ns_fd`) and marked with
-/// SO_MARK=DAE_SOCKET_MARK, consistent with the UDP hijack path, ensuring eBPF lets
-/// it through (preventing a hijack loop).
-async fn handle_dns_tcp_connection(
-    mut inbound: TcpStream,
-    handler_addr: SocketAddr,
-    host_ns_fd: Option<RawFd>,
-) -> Result<()> {
-    let timeout = Duration::from_secs(5);
-    let mut upstream = protocols::hostns::connect_tcp(
-        handler_addr,
-        &protocols::hostns::DirectSocket::control_plane(host_ns_fd),
-        false,
-        timeout,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to connect to internal DNS handler {}: {}", handler_addr, e))?;
-
-    set_tcp_nodelay(&upstream);
-    // Pure byte relay: length-prefixed frames pass through as-is, no DNS parsing here.
-    let (a, b) = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await?;
-    debug!(
-        handler_addr = %handler_addr,
-        up_bytes = a,
-        down_bytes = b,
-        "TCP DNS hijack session completed"
-    );
     Ok(())
 }
 
@@ -1580,6 +1496,10 @@ pub struct UdpTproxyListener {
     /// address is the host's real WAN address instead of the daens internal address.
     /// `None` creates sockets in the current namespace.
     host_ns_fd: Option<RawFd>,
+    /// DNS forwarder: when set, hijacked UDP DNS queries are dispatched to it via
+    /// [`DnsForwarder::handle_query`] instead of being forwarded to `dns_forward_addr`.
+    /// This is the primary DNS hijacking path when the DNS module is enabled.
+    dns_forwarder: Option<Arc<DnsForwarder>>,
 }
 
 impl UdpTproxyListener {
@@ -1593,6 +1513,7 @@ impl UdpTproxyListener {
             stop_signal: Arc::new(Notify::new()),
             dns_forward_addr: None,
             host_ns_fd: None,
+            dns_forwarder: None,
         }
     }
 
@@ -1610,7 +1531,18 @@ impl UdpTproxyListener {
             stop_signal: Arc::new(Notify::new()),
             dns_forward_addr: None,
             host_ns_fd: None,
+            dns_forwarder: None,
         }
+    }
+
+    /// Set the DNS forwarder.
+    ///
+    /// When set, hijacked UDP DNS queries are dispatched to the forwarder instead
+    /// of being relayed through the SOCKS5 proxy or to `dns_forward_addr`.
+    pub fn set_dns_forwarder(&mut self, dns_forwarder: Arc<DnsForwarder>) -> &mut Self {
+        self.dns_forwarder = Some(dns_forwarder);
+        info!("DNS hijacking: UDP DNS queries routed to DnsForwarder");
+        self
     }
 
     /// Set host network namespace fd.
@@ -1841,8 +1773,8 @@ impl UdpTproxyListener {
     ///   sends do not hold the lock, so concurrent packets to the same destination
     ///   (QUIC multiple in-flight packets) are no longer serialized by the mutex;
     /// - response sockets (IP_TRANSPARENT, bound to the original destination address) are
-    ///   reused per dest, avoiding socket()+setsockopt()+bind() per packet (2 extra setns
-    ///   calls in the host_ns_fd scenario);
+    ///   reused per dest, avoiding socket()+setsockopt()+bind() per packet (created in daens,
+    ///   so no setns is involved);
     /// - per-packet logging is downgraded to debug.
     async fn run_receive_loop(&self, socket: std::net::UdpSocket) -> Result<()> {
         use std::os::unix::io::AsRawFd;
@@ -1851,6 +1783,7 @@ impl UdpTproxyListener {
         let dialer = self.dialer.clone();
         let stop_signal = self.stop_signal.clone();
         let dns_forward_addr = self.dns_forward_addr;
+        let dns_forwarder = self.dns_forwarder.clone();
         let host_ns_fd = self.host_ns_fd;
 
         // Buffers are reused outside the loop (avoiding a 64KB allocation per packet)
@@ -1941,6 +1874,38 @@ impl UdpTproxyListener {
                     // server the client queried) so the response reaches the client
                     // with the expected source address.
                     if is_dns {
+                        // Primary path: dispatch the hijacked UDP DNS query to the
+                        // DnsForwarder (domain-based routing / caching / anti-pollution).
+                        // The forwarder sends the response back to the client with the
+                        // original destination address spoofed via an IP_TRANSPARENT socket.
+                        if let Some(forwarder) = dns_forwarder.clone() {
+                            let peer = peer_addr;
+                            let pkt = buf[..n].to_vec();
+
+                            tokio::spawn(async move {
+                                let client_addr = peer.unwrap_or_else(|| {
+                                    std::net::SocketAddr::new(
+                                        std::net::IpAddr::V4(
+                                            std::net::Ipv4Addr::UNSPECIFIED,
+                                        ),
+                                        0,
+                                    )
+                                });
+                                if let Err(e) =
+                                    forwarder.handle_query(&pkt, dest, client_addr).await
+                                {
+                                    warn!(
+                                        client = %client_addr,
+                                        dest = %dest,
+                                        "DNS forwarder handle_query failed: {}",
+                                        e
+                                    );
+                                }
+                            });
+                            guard.clear_ready();
+                            continue; // Skip SOCKS5 path for hijacked DNS
+                        }
+                        // Fallback (no forwarder): forward to the legacy internal DNS handler.
                         if let Some(handler_addr) = dns_forward_addr {
                             let peer = peer_addr;
                             let pkt = buf[..n].to_vec();
@@ -1967,11 +1932,6 @@ impl UdpTproxyListener {
                                 }
 
                                 // Wait for the handler's DNS response.
-                                // The wait window must cover the handler's
-                                // worst-case response time (see
-                                // DNS_HIJACK_WAIT_TIMEOUT); otherwise a
-                                // response/SERVFAIL arriving after the timeout
-                                // is silently dropped.
                                 let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
                                 let recv_fut = query_socket.recv_from(&mut recv_buf);
                                 let len = match tokio::time::timeout(
@@ -1996,8 +1956,7 @@ impl UdpTproxyListener {
                                 //    destination address (the DNS server it queried),
                                 //    reusing the pooled transparent socket.
                                 if let Some(peer) = peer {
-                                    if let Some(resp_sock) =
-                                        resp_socks.get(&dest, host_ns_fd).await
+                                    if let Some(resp_sock) = resp_socks.get(&dest).await
                                     {
                                         match tokio::time::timeout(
                                             UDP_WRITE_TIMEOUT,
@@ -2044,7 +2003,7 @@ impl UdpTproxyListener {
 
                     tokio::spawn(async move {
                         let session = match flows
-                            .get_or_create(dest, peer, dialer.as_ref(), &resp_socks, host_ns_fd)
+                            .get_or_create(dest, peer, dialer.as_ref(), &resp_socks)
                             .await
                         {
                             Ok(s) => s,
@@ -2135,7 +2094,6 @@ impl UdpFlowPool {
         peer: Option<SocketAddr>,
         dialer: &dyn OutboundDialer,
         resp_socks: &Arc<RespSocketPool>,
-        host_ns_fd: Option<RawFd>,
     ) -> anyhow::Result<Arc<dyn UdpSession>> {
         let key = (dest, peer);
         {
@@ -2170,7 +2128,6 @@ impl UdpFlowPool {
             key,
             session.clone(),
             resp_socks.clone(),
-            host_ns_fd,
             Arc::downgrade(self),
         );
         self.inner
@@ -2194,7 +2151,6 @@ impl UdpFlowPool {
         key: (SocketAddr, Option<SocketAddr>),
         session: Arc<dyn UdpSession>,
         resp_socks: Arc<RespSocketPool>,
-        host_ns_fd: Option<RawFd>,
         flows: std::sync::Weak<UdpFlowPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -2228,7 +2184,7 @@ impl UdpFlowPool {
                 // Full-cone relay: the response may come from any destination, so the
                 // response socket is taken by the response's destination address.
                 if let Some(peer) = peer {
-                    if let Some(sock) = resp_socks.get(&resp_dest, host_ns_fd).await {
+                    if let Some(sock) = resp_socks.get(&resp_dest).await {
                         // Response write deadline: prevents blocking the reader forever when
                         // the client is not reading UDP.
                         match tokio::time::timeout(UDP_WRITE_TIMEOUT, sock.send_to(&payload, peer))
@@ -2260,9 +2216,9 @@ impl UdpFlowPool {
 
 /// Transparent response socket pool: reuses IP_TRANSPARENT UDP sockets by original destination.
 ///
-/// One socket per dest, lazily created (in the host NS when host_ns_fd is configured),
-/// with an LRU capacity limit to prevent unbounded growth. DNS hijack responses and
-/// SOCKS5 responses share this pool.
+/// One socket per dest, lazily created in the current (daens) namespace so replies take the
+/// dae0_ingress → redirect_track → WAN ingress path, with an LRU capacity limit to prevent
+/// unbounded growth. DNS hijack responses and SOCKS5 responses share this pool.
 ///
 /// Lookup is O(1) via a `HashMap`; eviction is LRU (least-recently-used first) instead
 /// of FIFO. The `lru` deque may briefly hold stale (already-evicted) keys, which are
@@ -2290,11 +2246,13 @@ impl RespSocketPool {
     }
 
     /// Get the response socket for dest; create and cache it if absent.
-    async fn get(
-        &self,
-        dest: &SocketAddr,
-        host_ns_fd: Option<RawFd>,
-    ) -> Option<Arc<UdpSocket>> {
+    ///
+    /// Created in the current (daens) namespace: replies egress dae0peer and are
+    /// redirected by dae0_ingress via redirect_track to the WAN ingress, so they reach
+    /// clients on the physical interface — including the machine's own local addresses,
+    /// which a host-NS transparent reply would try to deliver on lo and get dropped
+    /// (martian/rp_filter on the spoofed source).
+    async fn get(&self, dest: &SocketAddr) -> Option<Arc<UdpSocket>> {
         // Fast path: already in the pool (no lock held across await)
         {
             let mut m = self.inner.lock().unwrap();
@@ -2306,11 +2264,11 @@ impl RespSocketPool {
             }
         }
 
-        // Slow path: create (may setns into the host NS, so the lock cannot be held)
-        let sock = Arc::new(create_marked_udp_socket(dest, host_ns_fd).await?);
+        // Slow path: create in daens (no lock held across the socket syscalls)
+        let sock = Arc::new(create_marked_udp_socket(dest, None).await?);
         debug!(
             dest = %dest,
-            host_ns_fd = ?host_ns_fd,
+            in_daens = true,
             "Created transparent response socket"
         );
         let mut m = self.inner.lock().unwrap();
@@ -2428,11 +2386,15 @@ fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
 
 /// Create a UDP socket with IP_TRANSPARENT and SO_MARK=0x100, bound to the target address.
 ///
-/// Used for DNS hijacking and UDP responses: IP_TRANSPARENT allows binding a non-local
-/// address (such as the upstream DNS server address), ensuring the response packet's
-/// source address is correct; SO_MARK=0x100 lets eBPF let it through (dae-rs's own
-/// traffic must connect directly). Delegates to the unified
-/// [`protocols::hostns::create_transparent_udp`] implementation.
+/// IP_TRANSPARENT allows binding a non-local address (such as the upstream DNS server
+/// address), ensuring the response packet's source address is correct; SO_MARK=0x100
+/// lets eBPF let it through (dae-rs's own traffic must connect directly). Delegates to
+/// the unified [`protocols::hostns::create_transparent_udp`] implementation.
+///
+/// `host_ns_fd = Some(...)` creates the socket in the host NS (legacy DNS handler's
+/// query socket, which must reach 169.254.0.1 on the host's lo); `None` creates it in
+/// the current (daens) namespace (response sockets, so replies take the redirect_track
+/// → WAN ingress path).
 async fn create_marked_udp_socket(
     target: &SocketAddr,
     host_ns_fd: Option<RawFd>,

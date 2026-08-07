@@ -1682,6 +1682,40 @@ static __noinline int route_loop_cb(__u32 index, void *data)
 	return route_finalize_match(ctx, match_set);
 }
 
+/* Return true when the destination address is a multicast address:
+ * IPv4 224.0.0.0/4 (first octet 224-239) or IPv6 ff00::/8 (first octet 0xff).
+ * `daddr` holds the address in network byte order, so the first octet is read
+ * as the first byte regardless of host endianness. */
+static __always_inline bool is_multicast_ip(__u8 ipversion_type,
+					    const __be32 *daddr)
+{
+	const __u8 *b = (const __u8 *)daddr;
+
+	if (ipversion_type == IpVersionType_4)
+		return (b[0] & 0xf0) == 0xe0; /* 224.0.0.0/4 */
+	return b[0] == 0xff;		     /* ff00::/8 */
+}
+
+/* Decide whether a packet should be hijacked as a DNS query:
+ * - only when the DNS module is enabled (dns_hijack_enabled);
+ * - only UDP (TCP DNS is treated as ordinary traffic);
+ * - only exact port 53 (excludes mDNS 5353, LLMNR 5355, NetBIOS 137/138);
+ * - never multicast (e.g. mDNS on 224.0.0.251). */
+static __always_inline bool should_hijack_dns(__u8 ipversion_type,
+					      __u32 l4proto_type, __u16 dport,
+					      const __be32 *daddr)
+{
+	if (!PARAM.dns_hijack_enabled)
+		return false;
+	if (l4proto_type != L4ProtoType_UDP)
+		return false;
+	if (dport != 53)
+		return false;
+	if (is_multicast_ip(ipversion_type, daddr))
+		return false;
+	return true;
+}
+
 static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 			      const __be32 *saddr, const __be32 *daddr,
 			      const __be32 *mac)
@@ -1719,12 +1753,11 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 	// Rule is like: domain(suffix:baidu.com, suffix:google.com) && port(443) ->
 	// proxy Subrule is like: domain(suffix:baidu.com, suffix:google.com) Match
 	// set is like: suffix:baidu.com
-	// Port 53 is only hijacked as a DNS query when the DNS module is enabled.
-	// Otherwise DNS traffic is routed like any other traffic.
+	// Port 53 UDP DNS is hijacked as a DNS query only when the DNS module is
+	// enabled. TCP DNS and multicast DNS are routed like ordinary traffic.
 	ctx->route_state =
-		(PARAM.dns_hijack_enabled && ctx->h_dport == 53 &&
-		 (_l4proto_type == L4ProtoType_UDP ||
-		  _l4proto_type == L4ProtoType_TCP))
+		should_hijack_dns(_ipversion_type, _l4proto_type, ctx->h_dport,
+				 daddr)
 		? ROUTE_STATE_DNS_QUERY
 		: 0;
 

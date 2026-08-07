@@ -238,6 +238,7 @@ fn build_routing_params(key: &TuplesKey, entry: &RoutingHandoffEntry) -> Routing
         dst_port: Some(key.dport),
         l4proto: Some(key.l4proto),
         domain: None, // Domain info is not available from eBPF handoff
+        qtype: None,  // DNS query type is not available from eBPF handoff
         process_name,
         dscp: Some(entry.result.dscp),
     }

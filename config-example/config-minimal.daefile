@@ -59,3 +59,11 @@ routing {
   fallback: proxy(proxy)                     # everything else → proxy
 }
 
+dns {
+  listen_addr: 169.254.0.1:53
+  proxy_dns_servers: 8.8.8.8:53, 1.1.1.1:53
+  direct_use_system_dns: true
+  query_timeout_ms: 5000
+  enable_cache: true
+}
+

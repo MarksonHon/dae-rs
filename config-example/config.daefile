@@ -235,14 +235,14 @@ routing {
 
 dns {
   # 内部 DNS 转发器（纯用户空间，默认关闭；存在该节即启用）
-  # 监听 169.254.0.1:53（仅 dae 内部，不对外暴露；需把本机 DNS 指到该地址）
-  # 命中 proxy_domains 的域名 → 换用 proxy_dns_servers 走代理解析
-  # 其余域名 → 直连（direct_dns_servers 或系统 /etc/resolv.conf）
+  # DNS 自身不定义代理规则：查询走哪个代理组由 routing 的 domain 规则推导
+  # （域名命中哪个组的代理规则，查询就走哪个组）；每组独立维护 TTL 缓存
+  # 监听 169.254.0.1:53（仅 dae 内部，不对外暴露）
   listen_addr: 169.254.0.1:53
-  proxy_dns_servers: 8.8.8.8:53, 1.1.1.1:53
-  proxy_domains: google.com, youtube.com, github.com
-  #direct_dns_servers: 223.5.5.5
+  proxy_dns_servers: 8.8.8.8:53, 1.1.1.1:53   # 走代理的查询统一使用的上游 DNS
+  #direct_dns_servers: 223.5.5.5              # 直连查询使用的上游（空→系统 DNS）
   direct_use_system_dns: true
   query_timeout_ms: 5000
+  enable_cache: true
 }
 

@@ -1503,16 +1503,36 @@ impl ControlPlane {
             udp.set_host_ns_fd(host_ns_fd);
             // ---- Attach the internal DNS forwarder (transparent port-53 hijack) ----
             // eBPF 不改动：DNS 仍被当作普通 UDP 拦截进 TProxy；这里仅在用户空间把
-            // 53 端口 DNS 流量交给 DNS 模块做域名分流（代理/直连）。
+            // 53 端口 DNS 流量交给 DNS 模块。DNS 自身不定义代理规则——域名路由表
+            // 与 fallback 全部由现有 `routing` 规则推导，查询走域名命中的代理组。
             if let Some(cfg) = self.daefile_config.as_ref().and_then(|c| c.dns.clone()) {
+                let (routes, fallback) = match self.daefile_config.as_ref() {
+                    Some(c) => {
+                        let routes = crate::routing::matcher::build_dns_domain_routes(
+                            &c.routing,
+                            Some(&self.rule_set_cache),
+                        )?;
+                        let fallback = crate::routing::matcher::dns_outbound_from_action(
+                            &c.routing.fallback,
+                        )?;
+                        (routes, fallback)
+                    }
+                    None => (
+                        Vec::new(),
+                        crate::routing::matcher::DnsOutbound::Direct,
+                    ),
+                };
                 let dns_fwd = Arc::new(crate::net::dns::DnsForwarder::new(
                     &cfg,
-                    self.outbound_dialer.clone(),
+                    routes,
+                    self.outbound_group_dialers.clone(),
+                    fallback,
                     host_ns_fd,
                 )?);
                 info!(
                     listen = %cfg.listen_addr,
-                    "DNS forwarder attached to UDP TProxy (transparent port-53 DNS)"
+                    "DNS forwarder attached to UDP TProxy (transparent port-53 DNS, \
+                     routing-derived domain split)"
                 );
                 udp.set_dns_forwarder(dns_fwd.clone());
                 self.dns_forwarder = Some(dns_fwd);

@@ -1637,20 +1637,20 @@ b {
         let text = format!(
             "{}\ndns {{\n  listen_addr: 169.254.0.1:53\n  \
              proxy_dns_servers: 8.8.8.8:53, 1.1.1.1:53\n  \
-             proxy_domains: google.com, youtube.com\n  \
              direct_dns_servers: 223.5.5.5\n  \
              direct_use_system_dns: false\n  \
-             query_timeout_ms: 3000\n}}",
+             query_timeout_ms: 3000\n  \
+             enable_cache: false\n}}",
             DNS_BASE
         );
         let config = parse_daefile(&text).unwrap();
         let dns = config.dns.as_ref().expect("dns section should parse");
         assert_eq!(dns.listen_addr, "169.254.0.1:53");
         assert_eq!(dns.proxy_dns_servers, vec!["8.8.8.8:53", "1.1.1.1:53"]);
-        assert_eq!(dns.proxy_domains, vec!["google.com", "youtube.com"]);
         assert_eq!(dns.direct_dns_servers, vec!["223.5.5.5"]);
         assert!(!dns.direct_use_system_dns);
         assert_eq!(dns.query_timeout_ms, 3000);
+        assert!(!dns.enable_cache);
         // A valid DNS section must pass semantic validation
         validate_config(&config).expect("dns config should validate");
     }
@@ -1659,7 +1659,7 @@ b {
     fn test_dns_json_roundtrip() {
         let text = format!(
             "{}\ndns {{\n  listen_addr: 169.254.0.1:53\n  \
-             proxy_dns_servers: 8.8.8.8\n  proxy_domains: example.com\n}}",
+             proxy_dns_servers: 8.8.8.8\n  enable_cache: false\n}}",
             DNS_BASE
         );
         let config = parse_daefile(&text).unwrap();
@@ -1668,7 +1668,7 @@ b {
         let dns = back.dns.as_ref().unwrap();
         assert_eq!(dns.listen_addr, "169.254.0.1:53");
         assert_eq!(dns.proxy_dns_servers, vec!["8.8.8.8"]);
-        assert_eq!(dns.proxy_domains, vec!["example.com"]);
+        assert!(!dns.enable_cache);
     }
 
     #[test]
@@ -1678,12 +1678,32 @@ b {
         let cfg = parse_daefile(&text).unwrap();
         assert!(validate_config(&cfg).is_err());
 
-        // proxy_domains configured but proxy_dns_servers empty → invalid
+        // query_timeout_ms 超范围 → E1202
         let text = format!(
-            "{}\ndns {{\n  listen_addr: 169.254.0.1:53\n  \
-             proxy_domains: google.com\n  proxy_dns_servers:\n}}",
+            "{}\ndns {{\n  listen_addr: 169.254.0.1:53\n  query_timeout_ms: 99999999\n}}",
             DNS_BASE
         );
         let cfg = parse_daefile(&text).unwrap();
         assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_config_example_daefile_parses() {
+        // 读取 workspace 根下的示例配置，确保 dns 节与解析器不脱节
+        let daefile = include_str!("../../../config-example/config.daefile");
+        let config = parse_daefile(daefile).expect("example daefile should parse");
+        let dns = config.dns.as_ref().expect("example daefile has a dns section");
+        assert_eq!(dns.listen_addr, "169.254.0.1:53");
+        assert!(!dns.proxy_dns_servers.is_empty());
+        assert!(dns.enable_cache);
+    }
+
+    #[test]
+    fn test_config_example_json_parses() {
+        let json = include_str!("../../../config-example/config.json");
+        let config: DaefileConfig =
+            serde_json::from_str(json).expect("example json should parse");
+        let dns = config.dns.as_ref().expect("example json has a dns section");
+        assert_eq!(dns.listen_addr, "169.254.0.1:53");
+        assert!(dns.enable_cache);
     }

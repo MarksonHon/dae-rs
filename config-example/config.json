@@ -240,13 +240,9 @@
       "8.8.8.8:53",
       "1.1.1.1:53"
     ],
-    "proxy_domains": [
-      "google.com",
-      "youtube.com",
-      "github.com"
-    ],
     "direct_dns_servers": [],
     "direct_use_system_dns": true,
-    "query_timeout_ms": 5000
+    "query_timeout_ms": 5000,
+    "enable_cache": true
   }
 }

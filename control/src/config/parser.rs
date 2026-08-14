@@ -731,9 +731,6 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         "proxy_dns_servers" => {
                             dns.proxy_dns_servers = split_csv_list(value);
                         }
-                        "proxy_domains" => {
-                            dns.proxy_domains = split_csv_list(value);
-                        }
                         "direct_dns_servers" => {
                             dns.direct_dns_servers = split_csv_list(value);
                         }
@@ -756,6 +753,17 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                                     field: key.into(),
                                     message: format!(
                                         "cannot parse as integer: '{}'",
+                                        value
+                                    ),
+                                })?;
+                        }
+                        "enable_cache" => {
+                            dns.enable_cache =
+                                parse_bool(value).map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!(
+                                        "cannot parse as boolean: '{}'",
                                         value
                                     ),
                                 })?;

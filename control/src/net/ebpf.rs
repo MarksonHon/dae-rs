@@ -629,7 +629,8 @@ fn find_map<'a>(obj: &'a Object, name: &str) -> Result<libbpf_rs::Map<'a>> {
 /// Delete the clsact qdisc on an interface (removes ALL filters on it).
 ///
 /// A missing qdisc is not an error ("No such file"/"Cannot find specified
-/// qdisc" are expected on first attach). Depends on iproute2's `tc` binary —
+/// qdisc"/"Invalid handle"/"handle of zero" are expected on first attach,
+/// depending on the iproute2 version). Depends on iproute2's `tc` binary —
 /// a clear error is returned if it is unavailable.
 fn delete_clsact_qdisc(ifname: &str) -> Result<(), EbpfError> {
     let output = Command::new("tc")
@@ -644,12 +645,7 @@ fn delete_clsact_qdisc(ifname: &str) -> Result<(), EbpfError> {
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // "No such file or directory" is expected on first attach — not an error.
-        // "Cannot find specified qdisc" is the same error on some kernel versions.
-        // Any other failure (permission denied, invalid interface, etc.) is serious:
-        // leaving a stale qdisc makes hook.create() a no-op, silently breaking
-        // priority/handle configuration.
-        if stderr.contains("No such file") || stderr.contains("Cannot find specified qdisc") {
+        if is_missing_qdisc_stderr(&stderr) {
             debug!(
                 iface = ifname,
                 stderr = %stderr,
@@ -668,6 +664,22 @@ fn delete_clsact_qdisc(ifname: &str) -> Result<(), EbpfError> {
         });
     }
     Ok(())
+}
+
+/// Whether a `tc qdisc del dev <if> clsact` stderr indicates the qdisc simply
+/// does not exist — a benign, expected condition on first attach — as opposed
+/// to a real failure (permission denied, invalid interface, ...).
+///
+/// Different iproute2 versions phrase "no such qdisc" differently:
+/// - "No such file or directory"
+/// - "Cannot find specified qdisc"
+/// - "Error: Invalid handle."
+/// - "Error: Cannot delete qdisc with handle of zero."
+fn is_missing_qdisc_stderr(stderr: &str) -> bool {
+    stderr.contains("No such file")
+        || stderr.contains("Cannot find specified qdisc")
+        || stderr.contains("Invalid handle")
+        || stderr.contains("handle of zero")
 }
 
 // ============================================================================
@@ -3324,6 +3336,28 @@ mod tests {
     #[test]
     fn test_daeparam_size() {
         assert_eq!(std::mem::size_of::<Daeparam>(), 36);
+    }
+
+    #[test]
+    fn test_is_missing_qdisc_stderr() {
+        // All iproute2 variants of "clsact does not exist" → benign
+        assert!(is_missing_qdisc_stderr("Error: Cannot find specified qdisc."));
+        assert!(is_missing_qdisc_stderr("Cannot find specified qdisc"));
+        assert!(is_missing_qdisc_stderr("Error: Invalid handle."));
+        assert!(is_missing_qdisc_stderr(
+            "Error: Cannot delete qdisc with handle of zero."
+        ));
+        assert!(is_missing_qdisc_stderr("Error: No such file or directory"));
+        assert!(is_missing_qdisc_stderr("RTNETLINK answers: No such file or directory"));
+
+        // Real failures must NOT be swallowed
+        assert!(!is_missing_qdisc_stderr(
+            "Error: Cannot delete qdisc: Operation not permitted"
+        ));
+        assert!(!is_missing_qdisc_stderr(
+            "Error: device wlp3s0 not found"
+        ));
+        assert!(!is_missing_qdisc_stderr(""));
     }
     #[test]
     fn test_match_set_size() {

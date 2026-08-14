@@ -595,6 +595,7 @@ dependencies = [
  "sha2",
  "shared",
  "socket2 0.5.10",
+ "subtle",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

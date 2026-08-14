@@ -83,7 +83,7 @@ static const __u32 __attribute__((unused)) two_key = 2;
 // Outbound Connectivity Map:
 
 // Key format: outbound_id * 6 + domain * 2 + ipversion
-// domain: 0=TCP, 1=DNS UDP, 2=data UDP; ipversion: 0=IPv4, 1=IPv6
+// domain: 0=TCP, 2=data UDP (1 reserved); ipversion: 0=IPv4, 1=IPv6
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -196,10 +196,9 @@ struct dae_param {
 	__u8 padding_after_mac[2]; // pad to align use_redirect_peer
 	__u8 use_redirect_peer;
 	__u8 has_bpf_get_current_task;
-	// When set, port 53 traffic is treated as DNS queries and hijacked to the
-	// control-plane DNS module. When cleared (no `dns` section in the daefile),
-	// DNS traffic follows the normal routing rules like any other traffic.
-	__u8 dns_hijack_enabled;
+	// Reserved (DNS logic removed — DNS traffic is treated as ordinary traffic).
+	// Keep in sync with the Rust Daeparam struct.
+	__u8 reserved_dns;
 	// Reserved for alignment; keep in sync with the Rust Daeparam struct.
 	__u8 reserved;
 	__u16 datapath_generation;
@@ -1286,7 +1285,6 @@ enum route_state_flags {
 	ROUTE_STATE_BAD_RULE = 1U << 0,
 	ROUTE_STATE_GOOD_SUBRULE = 1U << 1,
 	ROUTE_STATE_MUST = 1U << 2,
-	ROUTE_STATE_DNS_QUERY = 1U << 3,
 };
 
 struct wan_egress_route_scratch {
@@ -1593,27 +1591,12 @@ route_finalize_match(struct route_ctx *ctx, const struct match_set *match_set)
 				"MATCHED: match_set->type: %u, match_set->not: %d",
 				match_set->type, match_not);
 #endif
-			// DNS requests should routed by control plane if outbound is not
-			// must_direct.
 			if (unlikely(match_outbound == OUTBOUND_MUST_RULES)) {
 				ctx->route_state |= ROUTE_STATE_MUST;
 			} else {
 				bool must = !!(ctx->route_state & ROUTE_STATE_MUST) ||
 					    match_set->must;
 
-				if (!must &&
-				    (ctx->route_state & ROUTE_STATE_DNS_QUERY)) {
-					ctx->result =
-						(__s64)OUTBOUND_CONTROL_PLANE_ROUTING |
-						((__s64)match_set->mark << 8) |
-						((__s64)must << 40);
-#ifdef __DEBUG_ROUTING
-					bpf_printk(
-						"OUTBOUND_CONTROL_PLANE_ROUTING: %ld",
-						ctx->result);
-#endif
-					return 1;
-				}
 				ctx->result = (__s64)match_outbound |
 					      ((__s64)match_set->mark << 8) |
 					      ((__s64)must << 40);
@@ -1719,14 +1702,8 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 	// Rule is like: domain(suffix:baidu.com, suffix:google.com) && port(443) ->
 	// proxy Subrule is like: domain(suffix:baidu.com, suffix:google.com) Match
 	// set is like: suffix:baidu.com
-	// Port 53 is only hijacked as a DNS query when the DNS module is enabled.
-	// Otherwise DNS traffic is routed like any other traffic.
-	ctx->route_state =
-		(PARAM.dns_hijack_enabled && ctx->h_dport == 53 &&
-		 (_l4proto_type == L4ProtoType_UDP ||
-		  _l4proto_type == L4ProtoType_TCP))
-		? ROUTE_STATE_DNS_QUERY
-		: 0;
+	// DNS traffic is treated as ordinary traffic (DNS logic removed).
+	ctx->route_state = 0;
 
 	ctx->lpm_key_saddr.prefixlen = IPV6_BYTE_LENGTH * 8;
 	ctx->lpm_key_daddr.prefixlen = IPV6_BYTE_LENGTH * 8;
@@ -2041,12 +2018,11 @@ static __always_inline void copy_reversed_tuples(struct tuples_key *key,
 	dst->l4proto = key->l4proto;
 }
 
+// DNS logic has been removed: DNS traffic is cached and re-routed like any
+// other UDP flow, so no flow is ever treated as "short-lived" here.
 static __always_inline bool is_short_lived_udp_traffic(struct tuples_key *key)
 {
-	// Port 53 is only short-lived when the DNS module hijacks it. Otherwise
-	// DNS is ordinary UDP traffic and gets normal conn-state caching.
-	return PARAM.dns_hijack_enabled && key->l4proto == IPPROTO_UDP &&
-	       (key->dport == bpf_htons(53) || key->sport == bpf_htons(53));
+	return false;
 }
 
 static __always_inline bool
@@ -2366,11 +2342,6 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 			      0, NULL, 0,
 			      ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
-		if (PARAM.dns_hijack_enabled &&
-		    (ctx->udph.source == bpf_htons(53) ||
-		     ctx->udph.dest == bpf_htons(53)))
-			return TC_ACT_PIPE;
-
 		struct tuples tuples;
 		struct tuples_key reversed_tuples_key;
 
@@ -2399,8 +2370,7 @@ int tproxy_lan_egress_l3(struct __sk_buff *skb)
 }
 
 static __noinline bool
-wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
-		      __be16 dport);
+wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto);
 
 static __noinline int
 redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
@@ -2656,11 +2626,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	__u8 routing_epoch_slot =
 		routing_epoch_slot_from_route_result(s64_ret);
 
-	// Cache routing in conn state (skip DNS to avoid map churn).
-	if (pkt->l4proto == IPPROTO_UDP &&
-	    is_short_lived_udp_traffic(&pkt->tuples.five)) {
-		// Skip cache for short-lived DNS to avoid map churn.
-	} else if (pkt->l4proto == IPPROTO_TCP && tcp_state) {
+	// Cache routing in conn state.
+	if (pkt->l4proto == IPPROTO_TCP && tcp_state) {
 		// Directly update the TCP conn state we already looked up
 		__builtin_memcpy(tcp_state->mac, pkt->ethh.h_source, 6);
 		tcp_state->routing_epoch_slot = routing_epoch_slot;
@@ -2725,8 +2692,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		goto block;
 	}
 
-	if (!wan_outbound_is_alive(skb, outbound, pkt->l4proto,
-				   pkt->tuples.five.dport))
+	if (!wan_outbound_is_alive(skb, outbound, pkt->l4proto))
 		goto block;
 	pkt->datapath_generation = PARAM.datapath_generation;
 	return redirect_lan_packet_to_control_plane(
@@ -2827,11 +2793,6 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			      0, NULL, 0,
 			      ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
-		if (PARAM.dns_hijack_enabled &&
-		    (ctx->udph.source == bpf_htons(53) ||
-		     ctx->udph.dest == bpf_htons(53)))
-			return TC_ACT_PIPE;
-
 		struct tuples tuples;
 		struct tuples_key reversed_tuples_key;
 
@@ -2862,28 +2823,17 @@ int tproxy_wan_ingress_l3(struct __sk_buff *skb)
 // Routing and redirect the packet back.
 // We cannot modify the dest address here. So we cooperate with wan_ingress.
 static __noinline bool
-wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
-		      __be16 dport)
+wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto)
 {
-	/* When DNS hijacking is enabled, DNS must always reach the control
-	 * plane; userspace handles fallback. When disabled, DNS is ordinary
-	 * traffic and its outbound liveness is judged like any other flow. */
-	if (PARAM.dns_hijack_enabled && dport == bpf_htons(53))
-		return true;
-
 	// ARRAY map key: outbound_id * 6 + domain * 2 + ipversion
-	// domain: 0=TCP, 1=DNS UDP, 2=data UDP; ipversion: 0=IPv4, 1=IPv6
+	// domain: 0=TCP, 2=data UDP (1 reserved); ipversion: 0=IPv4, 1=IPv6
 	__u32 domain_idx = 0;
 	__u32 ip_idx = skb->protocol == bpf_htons(ETH_P_IP) ? 0 : 1;
 	__u32 key;
 	__u32 *alive;
 
-	if (l4proto == IPPROTO_UDP) {
-		if (PARAM.dns_hijack_enabled && dport == bpf_htons(53))
-			domain_idx = 1;
-		else
-			domain_idx = 2;
-	}
+	if (l4proto == IPPROTO_UDP)
+		domain_idx = 2;
 	key = ((__u32)outbound * 6) + (domain_idx * 2) + ip_idx;
 	alive = bpf_map_lookup_elem(&outbound_connectivity_map, &key);
 	if (alive && *alive == 0)
@@ -3040,8 +2990,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	}
 	bpf_printk("wan_egress_tcp: PROXY outbound=%u mark=%u", outbound, mark);
 
-	if (!wan_outbound_is_alive(skb, outbound, IPPROTO_TCP,
-				   tuples->five.dport)) {
+	if (!wan_outbound_is_alive(skb, outbound, IPPROTO_TCP)) {
 		bpf_printk("wan_egress_tcp: outbound NOT alive, outbound=%u",
 			   outbound);
 		__u32 _k = DBG_WAN_OUTBOUND_DEAD;
@@ -3182,12 +3131,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	routing_epoch_slot = routing_epoch_slot_from_route_result(s64_ret);
 
 fast_path_skip_routing:
-		// Hijacked DNS flows skip the conn-state meta update (they are
-		// transient and re-routed every packet). When DNS hijacking is
-		// disabled, DNS is ordinary UDP and gets cached routing.
-		if (udp_conn_state &&
-		    (tuples->five.dport != bpf_htons(53) ||
-		     !PARAM.dns_hijack_enabled)) {
+		if (udp_conn_state) {
 			if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
 				__builtin_memcpy(udp_conn_state->mac, mac, 6);
 				if (pid_pname) {
@@ -3225,8 +3169,7 @@ fast_path_skip_routing:
 		return TC_ACT_SHOT;
 
 	if (!cached_routing &&
-	    !wan_outbound_is_alive(skb, outbound, IPPROTO_UDP,
-				   tuples->five.dport))
+	    !wan_outbound_is_alive(skb, outbound, IPPROTO_UDP))
 		return TC_ACT_SHOT;
 
 	struct routing_result routing_result = {};
@@ -3323,7 +3266,7 @@ int tproxy_dae0peer_ingress(struct __sk_buff *skb) {
 	/* skb->cb[0] == TPROXY_MARK identifies packets redirected from
 	 * wan_egress or lan_ingress. Every other packet arriving on dae0peer is
 	 * return traffic of control-plane connections that originate in daens
-	 * (SOCKS5 dial handshake/data replies, UDP/DNS responses to the marked
+	 * (SOCKS5 dial handshake/data replies, UDP responses to the marked
 	 * sockets). Those MUST reach the daens network stack, otherwise no
 	 * upstream connection can ever complete.
 	 */
@@ -3333,7 +3276,7 @@ int tproxy_dae0peer_ingress(struct __sk_buff *skb) {
 	 * ip route add local default dev lo table 2023
 	 *
 	 * The fwmark forces local delivery inside daens: control-plane reply
-	 * packets with a non-local destination (e.g. a DNS response bound for an
+	 * packets with a non-local destination (e.g. a response bound for an
 	 * IP_TRANSPARENT socket bound to an upstream address) are handed to the
 	 * matching local socket instead of being routed back out the netkit.
 	 */

@@ -215,12 +215,13 @@ splice 路径与缓冲拷贝路径都经由该 guard 处理。
 ```rust
 fn udp_flow_idle_timeout(dest: SocketAddr) -> Duration {
     match dest.port() {
-        53 => DNS_UDP_IDLE_TIMEOUT,      // 17s（RFC 5452）
         443 => QUIC_UDP_IDLE_TIMEOUT,    // 2min（QUIC/DTLS 长连接）
         _   => UDP_FLOW_IDLE_TIMEOUT,    // 30s（默认）
     }
 }
 ```
+
+> 注：DNS 被视为普通流量（DNS 劫持模块已移除），端口 53 不再有专用的 17s 档，使用默认超时。
 
 ## 7. 验证计划
 

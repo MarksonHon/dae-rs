@@ -54,7 +54,10 @@ pub fn validate_config(config: &DaefileConfig) -> std::result::Result<(), Config
     // 8. API validation
     validate_api(config)?;
 
-    // 9. Rule set validation (E2101 / E2104 / E2105)
+    // 9. DNS forwarder validation
+    validate_dns(config)?;
+
+    // 10. Rule set validation (E2101 / E2104 / E2105)
     validate_rule_set(config)?;
 
     Ok(())
@@ -391,6 +394,97 @@ fn validate_api(config: &DaefileConfig) -> std::result::Result<(), ConfigError> 
                 }
         }
     }
+    Ok(())
+}
+
+/// DNS forwarder validation.
+///
+/// Checks (only when `dns` is configured):
+/// 1. `listen_addr` is a valid `ip:port`;
+/// 2. `proxy_dns_servers` / `direct_dns_servers` entries are valid `ip` or `ip:port`;
+/// 3. `proxy_domains` entries are non-empty and not oversized;
+/// 4. `query_timeout_ms` in range 100-60000;
+/// 5. `proxy_domains` configured but `proxy_dns_servers` empty → meaningless config.
+fn validate_dns(config: &DaefileConfig) -> std::result::Result<(), ConfigError> {
+    let Some(dns) = config.dns.as_ref() else {
+        return Ok(());
+    };
+
+    // 1. listen_addr
+    if dns.listen_addr.parse::<std::net::SocketAddr>().is_err() {
+        return Err(ConfigError::InvalidValue {
+            line: 0,
+            field: "dns.listen_addr".into(),
+            message: format!("invalid listen address '{}'", dns.listen_addr),
+        });
+    }
+
+    // 2. DNS server lists
+    let check_servers = |field: &str, list: &[String]| -> std::result::Result<(), ConfigError> {
+        for s in list {
+            let s = s.trim();
+            if s.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    line: 0,
+                    field: field.into(),
+                    message: format!("empty server entry in '{}'", field),
+                });
+            }
+            let ok = s.parse::<std::net::IpAddr>().is_ok()
+                || s.parse::<std::net::SocketAddr>().is_ok();
+            if !ok {
+                return Err(ConfigError::InvalidValue {
+                    line: 0,
+                    field: field.into(),
+                    message: format!("invalid DNS server '{}'", s),
+                });
+            }
+        }
+        Ok(())
+    };
+    check_servers("dns.proxy_dns_servers", &dns.proxy_dns_servers)?;
+    check_servers("dns.direct_dns_servers", &dns.direct_dns_servers)?;
+
+    // 3. proxy_domains
+    for d in &dns.proxy_domains {
+        let d = d.trim().trim_end_matches('.');
+        if d.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                line: 0,
+                field: "dns.proxy_domains".into(),
+                message: "empty domain entry".into(),
+            });
+        }
+        if d.len() > 253 {
+            return Err(ConfigError::InvalidValue {
+                line: 0,
+                field: "dns.proxy_domains".into(),
+                message: format!("domain '{}' too long", d),
+            });
+        }
+    }
+
+    // 4. query_timeout_ms
+    if dns.query_timeout_ms < 100 || dns.query_timeout_ms > 60_000 {
+        return Err(ConfigError::OutOfRange {
+            line: 0,
+            field: "dns.query_timeout_ms".into(),
+            message: format!(
+                "query_timeout_ms {} is not in range 100-60000",
+                dns.query_timeout_ms
+            ),
+        });
+    }
+
+    // 5. proxy_domains without proxy_dns_servers is meaningless
+    if !dns.proxy_domains.is_empty() && dns.proxy_dns_servers.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            line: 0,
+            field: "dns.proxy_dns_servers".into(),
+            message: "proxy_domains configured but proxy_dns_servers is empty".into(),
+        });
+    }
+
     Ok(())
 }
 

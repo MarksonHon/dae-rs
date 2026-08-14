@@ -94,10 +94,9 @@ pub struct Daeparam {
     pub padding_after_mac: [u8; 2],
     pub use_redirect_peer: u8,
     pub has_bpf_get_current_task: u8,
-    /// When set, port 53 traffic is treated as DNS queries and hijacked to the
-    /// control-plane DNS module. When cleared (no `dns` section in the daefile),
-    /// DNS traffic follows the normal routing rules like any other traffic.
-    pub dns_hijack_enabled: u8,
+    /// Reserved (DNS logic removed — DNS traffic is treated as ordinary traffic).
+    /// Keeps the struct layout in sync with `struct dae_param` in tproxy.c.
+    pub reserved_dns: u8,
     /// Reserved for alignment; keep in sync with `struct dae_param` in tproxy.c.
     pub reserved: u8,
     /// Datapath generation counter. Initial value is 0; incremented on datapath
@@ -119,7 +118,7 @@ impl Default for Daeparam {
             padding_after_mac: [0u8; 2],
             use_redirect_peer: 0,
             has_bpf_get_current_task: 0,
-            dns_hijack_enabled: 0,
+            reserved_dns: 0,
             reserved: 0,
             datapath_generation: 0,
             padding_before_mark: [0u8; 2],
@@ -625,6 +624,50 @@ fn find_map<'a>(obj: &'a Object, name: &str) -> Result<libbpf_rs::Map<'a>> {
         }
         .into()
     })
+}
+
+/// Delete the clsact qdisc on an interface (removes ALL filters on it).
+///
+/// A missing qdisc is not an error ("No such file"/"Cannot find specified
+/// qdisc" are expected on first attach). Depends on iproute2's `tc` binary —
+/// a clear error is returned if it is unavailable.
+fn delete_clsact_qdisc(ifname: &str) -> Result<(), EbpfError> {
+    let output = Command::new("tc")
+        .args(["qdisc", "del", "dev", ifname, "clsact"])
+        .output()
+        .map_err(|e| EbpfError::TcAttachError {
+            iface: ifname.to_string(),
+            detail: format!(
+                "failed to run `tc qdisc del dev {} clsact`: {} (is iproute2's `tc` installed?)",
+                ifname, e
+            ),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // "No such file or directory" is expected on first attach — not an error.
+        // "Cannot find specified qdisc" is the same error on some kernel versions.
+        // Any other failure (permission denied, invalid interface, etc.) is serious:
+        // leaving a stale qdisc makes hook.create() a no-op, silently breaking
+        // priority/handle configuration.
+        if stderr.contains("No such file") || stderr.contains("Cannot find specified qdisc") {
+            debug!(
+                iface = ifname,
+                stderr = %stderr,
+                "clsact qdisc did not exist on {}, OK",
+                ifname,
+            );
+            return Ok(());
+        }
+        return Err(EbpfError::TcAttachError {
+            iface: ifname.to_string(),
+            detail: format!(
+                "Failed to delete clsact qdisc on {}: {}",
+                ifname,
+                stderr.trim(),
+            ),
+        });
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1246,41 +1289,7 @@ impl EbpfManager {
             // egress then ingress), duplicate clsact removal destroys mounted programs.
             // Ensure each interface is only cleaned once via clsact_cleaned HashSet.
             if !self.clsact_cleaned.contains(ifname) {
-                let output = Command::new("tc")
-                    .args(["qdisc", "del", "dev", ifname, "clsact"])
-                    .output()
-                    .map_err(|e| EbpfError::TcAttachError {
-                        iface: ifname.into(),
-                        detail: format!("delete clsact qdisc failed: {}", e),
-                    })?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    // "No such file or directory" is expected on first attach — not an error.
-                    // "Cannot find specified qdisc" is the same error on some kernel versions.
-                    // Any other failure (permission denied, invalid interface, etc.)
-                    // is serious: leaving a stale qdisc will cause hook.create() to be a
-                    // no-op, silently breaking priority/handle configuration. Abort.
-                    if stderr.contains("No such file")
-                        || stderr.contains("Cannot find specified qdisc")
-                    {
-                        debug!(
-                            iface = %ifname,
-                            stderr = %stderr,
-                            "clsact qdisc did not exist on {}, OK",
-                            ifname,
-                        );
-                    } else {
-                        return Err(EbpfError::TcAttachError {
-                            iface: ifname.into(),
-                            detail: format!(
-                                "Failed to delete existing clsact qdisc on {}: {}",
-                                ifname,
-                                stderr.trim(),
-                            ),
-                        }
-                        .into());
-                    }
-                }
+                delete_clsact_qdisc(ifname)?;
                 self.clsact_cleaned.insert(ifname.to_string());
             } else {
                 debug!(
@@ -1296,11 +1305,31 @@ impl EbpfManager {
                 detail: format!("create({}): {}", prog_name, e),
             })?;
 
-            // Attach the program
-            let attached = hook.attach().map_err(|e| EbpfError::TcAttachError {
-                iface: ifname.into(),
-                detail: format!("attach({}): {}", prog_name, e),
-            })?;
+            // Attach the program. If attach fails — typically a stale filter from
+            // a previous run/reload still holds the same handle ("Exclusivity flag
+            // on" / EEXIST), which would silently break interception on this
+            // interface — force-remove the whole clsact qdisc and retry once.
+            let attached = match hook.attach() {
+                Ok(attached) => attached,
+                Err(first_err) => {
+                    warn!(
+                        "TC attach failed on {} ({}): force-deleting clsact qdisc and retrying",
+                        ifname, first_err
+                    );
+                    delete_clsact_qdisc(ifname)?;
+                    hook.create().map_err(|e| EbpfError::TcAttachError {
+                        iface: ifname.into(),
+                        detail: format!("create(retry {}): {}", prog_name, e),
+                    })?;
+                    hook.attach().map_err(|e| EbpfError::TcAttachError {
+                        iface: ifname.into(),
+                        detail: format!(
+                            "attach({}) failed after clsact reset: {}",
+                            prog_name, e
+                        ),
+                    })?
+                }
+            };
 
             self.tc_hooks.push(TcAttachInfo {
                 hook: attached,
@@ -1572,6 +1601,12 @@ impl EbpfManager {
     pub fn detach_all(&mut self) -> Result<()> {
         let start = std::time::Instant::now();
         debug!(count = self.tc_hooks.len(), cgroup_links = self.cgroup_links.len(), "detach_all starting");
+
+        // Collect the set of interfaces that had TC filters BEFORE detaching,
+        // so their clsact qdiscs can be removed afterwards (complete cleanup).
+        let ifaces: std::collections::HashSet<String> =
+            self.tc_hooks.iter().map(|i| i.iface.clone()).collect();
+
         // Detach TC hooks
         if !self.tc_hooks.is_empty() {
             info!(count = self.tc_hooks.len(), "Detaching TC programs");
@@ -1596,6 +1631,21 @@ impl EbpfManager {
                 start.elapsed().as_millis()
             );
         }
+
+        // Delete the clsact qdisc on every interface we detached from, so no TC
+        // mount point is left behind. Failures are logged but non-fatal.
+        for iface in &ifaces {
+            if let Err(e) = delete_clsact_qdisc(iface) {
+                warn!(
+                    "Failed to delete clsact qdisc on {} during detach_all: {}",
+                    iface, e
+                );
+            }
+        }
+
+        // Reset the per-interface "already cleaned" marker so a later re-attach
+        // starts from a clean slate (removes any stale filter).
+        self.clsact_cleaned.clear();
 
         // Detach cgroup links (drop the ProgramAttachment)
         if !self.cgroup_links.is_empty() {
@@ -1638,6 +1688,16 @@ impl EbpfManager {
         let detached = before - self.tc_hooks.len();
         if detached > 0 {
             info!(iface = %iface, count = detached, "Detached TC hooks for interface");
+            // Delete the clsact qdisc so no mount point is left behind, and
+            // forget the "already cleaned" marker so a future re-attach starts
+            // from a clean slate (removes any stale filter).
+            if let Err(e) = delete_clsact_qdisc(iface) {
+                warn!(
+                    "Failed to delete clsact qdisc on {} during detach_by_iface: {}",
+                    iface, e
+                );
+            }
+            self.clsact_cleaned.remove(iface);
         }
         debug!(
             "detach_by_iface {}: {} hooks ({}ms)",

@@ -224,12 +224,14 @@ Wrap upstream `session.send()` and response `sock.send_to()` with
 ```rust
 fn udp_flow_idle_timeout(dest: SocketAddr) -> Duration {
     match dest.port() {
-        53 => DNS_UDP_IDLE_TIMEOUT,      // 17 s  (RFC 5452)
         443 => QUIC_UDP_IDLE_TIMEOUT,    // 2 min (QUIC/DTLS long-lived)
         _   => UDP_FLOW_IDLE_TIMEOUT,    // 30 s  (default)
     }
 }
 ```
+
+> Note: DNS is treated as ordinary traffic (DNS hijacking module removed), so
+> port 53 no longer has a dedicated 17 s tier and uses the default timeout.
 
 ## 7. Verification Plan
 

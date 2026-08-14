@@ -659,8 +659,11 @@ impl NetnsManager {
         }
 
         if netns_created {
-            Self::delete_named_netns_sync(NS_NAME);
-            info!("Rollback: deleted netns {}", NS_NAME);
+            if let Err(e) = Self::delete_named_netns_sync(NS_NAME) {
+                warn!("Rollback: failed to delete netns {}: {}", NS_NAME, e);
+            } else {
+                info!("Rollback: deleted netns {}", NS_NAME);
+            }
         }
 
         if peer_moved || netkit_created {
@@ -792,16 +795,34 @@ impl NetnsManager {
     /// Delete the named Network namespace (sync version)
     ///
     /// Uses `MNT_DETACH | MNT_FORCE` to force unmount, consistent with the original dae's
-    /// `DeleteNamedNetns`.
-    fn delete_named_netns_sync(name: &str) {
+    /// `DeleteNamedNetns`. Returns an error if the unmount or the mount-point file
+    /// removal fails, so residual mount points are not silently left behind.
+    fn delete_named_netns_sync(name: &str) -> Result<()> {
         let ns_path = format!("{}/{}", NETNS_RUN_DIR, name);
         let ns_path = Path::new(&ns_path);
         // Use umount2 to support MNT_DETACH | MNT_FORCE, consistent with the original dae
-        let _ = nix::mount::umount2(
+        if let Err(e) = nix::mount::umount2(
             ns_path,
             nix::mount::MntFlags::MNT_DETACH | nix::mount::MntFlags::MNT_FORCE,
-        );
-        let _ = fs::remove_file(ns_path);
+        ) {
+            // Nothing mounted (EINVAL) or path gone (ENOENT) is fine.
+            if e != nix::errno::Errno::EINVAL && e != nix::errno::Errno::ENOENT {
+                return Err(anyhow::anyhow!(
+                    "failed to unmount netns mount point {}: {}",
+                    ns_path.display(),
+                    e
+                ));
+            }
+        }
+        match fs::remove_file(ns_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!(
+                "failed to remove netns mount point {}: {}",
+                ns_path.display(),
+                e
+            )),
+        }
     }
 
     // ================================================================
@@ -989,6 +1010,38 @@ impl NetnsManager {
         result
     }
 
+    /// Add an internal address (e.g. `169.254.0.1/32`) to the host `lo` interface.
+    ///
+    /// Used by the internal DNS forwarder: it listens on an internal link-local
+    /// address that must be a local (host NS) address so queries are delivered
+    /// locally without hitting the eBPF TProxy path. Binding to `lo` keeps the
+    /// address strictly internal — never announced on WAN/LAN.
+    ///
+    /// Idempotent: any existing address is removed first, then re-added (avoids
+    /// `EEXIST` on restart). Must be called from the host namespace.
+    pub async fn add_internal_lo_addr(&self, addr: &str) -> Result<()> {
+        let addr = addr.to_string();
+        // Delete-then-add keeps the operation idempotent across restarts.
+        let _ = tokio::process::Command::new("ip")
+            .args(["addr", "del", &addr, "dev", "lo"])
+            .status()
+            .await;
+        let status = tokio::process::Command::new("ip")
+            .args(["addr", "add", &addr, "dev", "lo"])
+            .status()
+            .await
+            .context("Failed to execute `ip addr add`")?;
+        if !status.success() {
+            anyhow::bail!(
+                "`ip addr add {} dev lo` failed with status {:?}",
+                addr,
+                status.code()
+            );
+        }
+        info!(addr = %addr, "Internal address added to host lo");
+        Ok(())
+    }
+
     // ================================================================
     // Destruction
     // ================================================================
@@ -1014,15 +1067,25 @@ impl NetnsManager {
 
         // Always use synchronous cleanup to avoid block_in_place panics
         // in tokio runtime shutdown context (e.g. Drop).
-        self.destroy_sync_fallback();
+        let errors = self.destroy_sync_fallback();
 
         // ---- Step 4: Close the netns fds ----
         self.host_ns_fd.take();
         self.proxy_ns_fd.take();
         self.destroyed = true;
 
-        info!("Network namespace and netkit pair destroyed successfully");
-        Ok(())
+        if errors.is_empty() {
+            info!("Network namespace and netkit pair destroyed successfully");
+            Ok(())
+        } else {
+            for e in &errors {
+                error!("Network namespace cleanup error: {}", e);
+            }
+            Err(anyhow::anyhow!(
+                "Network namespace cleanup completed with {} error(s)",
+                errors.len()
+            ))
+        }
     }
 
     /// Async destruction (called by destroy() in the tokio runtime)
@@ -1030,23 +1093,6 @@ impl NetnsManager {
     async fn destroy_async(&self) -> Result<()> {
         let (host_task, host_handle) =
             create_host_handle().context("Failed to create host netlink connection for destroy")?;
-
-        // ---- Step 0: Clean up cross-namespace DNS forwarding related resources ----
-        // Delete the 169.254.0.1/32 address on host lo
-        let _ = Command::new("ip")
-            .args(["addr", "del", "169.254.0.1/32", "dev", "lo", "2>/dev/null"])
-            .output();
-        // Delete the return route to daens 169.254.0.11/32 dev <host_if>
-        let _ = Command::new("ip")
-            .args([
-                "route",
-                "del",
-                "169.254.0.11/32",
-                "dev",
-                &self.host_if,
-                "2>/dev/null",
-            ])
-            .output();
 
         // ---- Step 1: Delete host NS policy Routing rules ----
         if let Err(e) = remove_host_policy_routing_async(
@@ -1085,36 +1131,61 @@ impl NetnsManager {
         drop(host_task);
 
         // ---- Step 3: Delete named Network namespace ----
-        Self::delete_named_netns_sync(&self.ns_name);
+        if let Err(e) = Self::delete_named_netns_sync(&self.ns_name) {
+            warn!("Failed to delete named netns {}: {}", self.ns_name, e);
+        }
 
         Ok(())
     }
 
-    /// Sync destruction fallback (uses ip commands)
-    fn destroy_sync_fallback(&self) {
+    /// Sync destruction fallback (uses ip commands).
+    ///
+    /// Collects every cleanup failure instead of silently swallowing it, so
+    /// residual netkit/veth links or netns mount points are reported to the
+    /// caller (and logged) rather than left invisible.
+    fn destroy_sync_fallback(&self) -> Vec<anyhow::Error> {
         warn!("Using sync fallback for destroy (no tokio runtime available)");
-
-        // ---- Step 0: Clean up cross-namespace DNS forwarding related resources ----
-        let _ = Command::new("ip")
-            .args(["addr", "del", "169.254.0.1/32", "dev", "lo"])
-            .output();
-        let _ = Command::new("ip")
-            .args(["route", "del", "169.254.0.11/32", "dev", &self.host_if])
-            .output();
+        let mut errors: Vec<anyhow::Error> = Vec::new();
 
         // ---- Step 1: Delete host NS policy Routing rules ----
+        // Best-effort: remove_host_policy_routing_sync() retries until the
+        // rules are gone and swallows individual failures internally.
         remove_host_policy_routing_sync(self.proxy_mark, self.proxy_mask, self.route_table);
 
         // ---- Step 2: Delete netkit pair ----
-        let _ = Command::new("ip")
-            .args(["link", "delete", &self.host_if])
-            .output();
-        let _ = Command::new("ip")
-            .args(["link", "delete", &self.peer_if])
-            .output();
+        for link in [&self.host_if, &self.peer_if] {
+            match Command::new("ip").args(["link", "delete", link]).output() {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    // "Cannot find device" / "No such device" = the link was never
+                    // created or is already gone — not an error.
+                    if stderr.contains("Cannot find device")
+                        || stderr.contains("No such device")
+                    {
+                        debug!("ip link delete {}: already gone ({})", link, stderr.trim());
+                    } else {
+                        errors.push(anyhow::anyhow!(
+                            "ip link delete {} failed: {}",
+                            link,
+                            stderr.trim()
+                        ));
+                    }
+                }
+                Err(e) => errors.push(anyhow::anyhow!(
+                    "failed to run ip link delete {}: {}",
+                    link,
+                    e
+                )),
+            }
+        }
 
         // ---- Step 3: Delete named Network namespace ----
-        Self::delete_named_netns_sync(&self.ns_name);
+        if let Err(e) = Self::delete_named_netns_sync(&self.ns_name) {
+            errors.push(e);
+        }
+
+        errors
     }
 }
 
@@ -1131,7 +1202,9 @@ impl Drop for NetnsManager {
     fn drop(&mut self) {
         if !self.destroyed && (self.host_ns_fd.is_some() || self.proxy_ns_fd.is_some()) {
             warn!("NetnsManager dropped without explicit destroy(), cleaning up via sync fallback");
-            self.destroy_sync_fallback();
+            for e in self.destroy_sync_fallback() {
+                error!("Network namespace cleanup (Drop) error: {}", e);
+            }
 
             // Close the fds holding the netns
             self.host_ns_fd.take();
@@ -1557,62 +1630,6 @@ async fn configure_dae0_async(host_handle: &rtnetlink::Handle, mgr: &NetnsManage
         .await
         .map_err(from_rtnetlink_err)
         .context("Failed to bring dae0 up")?;
-
-    // ---- Add 169.254.0.1/32 to lo ----
-    // This address is used as the default routing next hop in daens.
-    // Adding it to the host NS lo interface lets the host receive traffic destined
-    // for 169.254.0.1 coming from daens.
-    // This is critical for cross-namespace DNS hijacking: the TProxy (in daens)
-    // forwards DNS queries to 169.254.0.1:5353, where the host NS DNS handler
-    // receives and processes them.
-    // Ignore if the address already exists (handles residue after a crash).
-    let host_lo_ifindex = get_ifindex_in_ns("lo")?;
-    let internal_ip: std::net::Ipv4Addr = "169.254.0.1"
-        .parse()
-        .context("Failed to parse 169.254.0.1")?;
-    if let Err(e) = host_handle
-        .address()
-        .add(host_lo_ifindex, std::net::IpAddr::V4(internal_ip), 32)
-        .execute()
-        .await
-    {
-        let err_str = e.to_string();
-        if err_str.contains("File exists") {
-            info!("169.254.0.1/32 already exists on lo, reusing");
-        } else {
-            return Err(from_rtnetlink_err(e)).context("Failed to add 169.254.0.1/32 to lo");
-        }
-    } else {
-        info!("Added 169.254.0.1/32 to lo for cross-namespace DNS forwarding");
-    }
-
-    // ---- Add the 169.254.0.11/32 → dae0 route ----
-    // This adds a return route to dae0peer (in daens) in the host NS.
-    // After the TProxy (in daens) forwards DNS queries to the host NS DNS handler,
-    // the DNS handler needs to send the response back to the TProxy's temporary socket
-    // in daens.
-    // Without this route, response packets cannot reach daens from the host NS.
-    let add_route_msg = RouteMessageBuilder::<std::net::Ipv4Addr>::new()
-        .destination_prefix(std::net::Ipv4Addr::new(169, 254, 0, 11), 32)
-        .output_interface(host_ifindex)
-        .build();
-    if let Err(e) = host_handle.route().add(add_route_msg).execute().await {
-        let err_str = e.to_string();
-        if err_str.contains("File exists") {
-            info!(
-                "Route 169.254.0.11/32 dev {} already exists, reusing",
-                mgr.host_if
-            );
-        } else {
-            return Err(from_rtnetlink_err(e))
-                .context("Failed to add 169.254.0.11/32 route to dae0");
-        }
-    } else {
-        info!(
-            "Added route 169.254.0.11/32 dev {} for DNS response back to daens",
-            mgr.host_if
-        );
-    }
 
     // ---- sysctl parameters ----
     write_sysctl(&format!("net.ipv4.conf.{}.rp_filter", mgr.host_if), "0")?;

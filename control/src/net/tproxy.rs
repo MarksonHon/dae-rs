@@ -85,9 +85,6 @@ const CMSG_BUFFER_SIZE: usize = 128;
 /// received within this time
 const UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// DNS UDP flow idle timeout (RFC 5452 recommends 17s)
-const DNS_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(17);
-
 /// Idle timeout for long-lived UDP flows such as QUIC/DTLS (matches kdae's QuicNatTimeout)
 const QUIC_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -98,24 +95,12 @@ const QUIC_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Matches kdae's `udpEndpointWriteTimeout` (10s).
 const UDP_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum time the UDP DNS hijack task waits for the internal DNS handler's
-/// response before giving up.
-///
-/// MUST be >= the handler's worst-case response time. The DNS handler may take
-/// its full per-query timeout (handler.rs `timeout`, 5s) plus a proxied
-/// UDP->TCP fallback, so a 5s window here caused the handler's response (or
-/// SERVFAIL) to arrive after this socket was dropped — the UDP datagram was
-/// silently lost and the client saw a hard timeout instead of a SERVFAIL.
-const DNS_HIJACK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// Select the UDP flow idle timeout by original destination port (tiered timeout).
 ///
-/// * 53 (DNS) → 17s (RFC 5452)
 /// * 443 (QUIC/DTLS) → 2min
 /// * others → 30s (default)
 fn udp_flow_idle_timeout(dest: SocketAddr) -> Duration {
     match dest.port() {
-        53 => DNS_UDP_IDLE_TIMEOUT,
         443 => QUIC_UDP_IDLE_TIMEOUT,
         _ => UDP_FLOW_IDLE_TIMEOUT,
     }
@@ -212,15 +197,6 @@ pub struct TproxyListener {
     socket_mark: u32,
     /// Stop signal (notifies the accept loop to exit; no polling needed)
     stop_signal: Arc<Notify>,
-    /// Internal DNS handler address (for cross-namespace DNS hijacking).
-    ///
-    /// When a TCP connection's original destination is port 53, the connection is not
-    /// sent through the proxy dialer; instead the DNS-over-TCP session is forwarded to
-    /// the DNS handler at this address (consistent with UDP hijacking).
-    /// `None` means no TCP DNS hijacking.
-    dns_forward_addr: Option<SocketAddr>,
-    /// Host network namespace fd (upstream sockets for DNS hijacking are created in the host NS).
-    host_ns_fd: Option<RawFd>,
 }
 
 impl TproxyListener {
@@ -237,8 +213,6 @@ impl TproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark: shared::DAE_SOCKET_MARK, // default value from the original dae
             stop_signal: Arc::new(Notify::new()),
-            dns_forward_addr: None,
-            host_ns_fd: None,
         }
     }
 
@@ -254,28 +228,7 @@ impl TproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
-            dns_forward_addr: None,
-            host_ns_fd: None,
         }
-    }
-
-    /// Set the TCP DNS hijacking target (the internal DNS handler address).
-    ///
-    /// After setting, TCP connections whose original destination is port 53 are forwarded
-    /// to this DNS handler instead of the proxy. Consistent with UDP hijacking's
-    /// `169.254.0.1:<port>`.
-    pub fn set_dns_forward_addr(&mut self, addr: SocketAddr) {
-        self.dns_forward_addr = Some(addr);
-        tracing::info!(
-            "DNS hijacking enabled: TCP TProxy will forward DNS queries to {}",
-            addr
-        );
-    }
-
-    /// Set the host network namespace fd (upstream connections for DNS hijacking are
-    /// created in the host NS).
-    pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) {
-        self.host_ns_fd = host_ns_fd;
     }
 
     /// Get listen address
@@ -511,17 +464,9 @@ impl TproxyListener {
                                 "Accepted new TCP connection"
                             );
                             let dialer = self.dialer.clone();
-                            let dns_forward_addr = self.dns_forward_addr;
-                            let host_ns_fd = self.host_ns_fd;
                             tokio::spawn(async move {
                                 let start = std::time::Instant::now();
-                                if let Err(e) = handle_connection(
-                                    stream,
-                                    dialer,
-                                    dns_forward_addr,
-                                    host_ns_fd,
-                                )
-                                .await
+                                if let Err(e) = handle_connection(stream, dialer).await
                                 {
                                     error!(
                                         peer_addr = %peer_addr,
@@ -618,8 +563,6 @@ impl std::fmt::Debug for TproxyListener {
 async fn handle_connection(
     mut inbound: TcpStream,
     dialer: Arc<dyn OutboundDialer>,
-    dns_forward_addr: Option<SocketAddr>,
-    host_ns_fd: Option<RawFd>,
 ) -> Result<()> {
     let start = std::time::Instant::now();
     let peer_addr = inbound.peer_addr().ok();
@@ -635,28 +578,6 @@ async fn handle_connection(
          (ensure IP_TRANSPARENT is set and CAP_NET_ADMIN is available)",
     )?;
     debug!(orig_dst = %orig_dst, "handle_connection: got original destination");
-
-    // ---- Step 1.5: TCP DNS hijacking ----
-    // eBPF has already redirected TCP port 53 queries to the control plane
-    // (ROUTE_STATE_DNS_QUERY).
-    // Here the DNS-over-TCP session is forwarded to the internal DNS handler instead of
-    // the proxy, consistent with UDP hijacking (dns_forward_addr). This way TCP DNS also
-    // enters the DNS module's caching/anti-pollution/proxy logic.
-    if orig_dst.port() == 53 {
-        if let Some(handler_addr) = dns_forward_addr {
-            info!(
-                "TCP DNS hijack: {} -> {} (querying {})",
-                peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
-                orig_dst,
-                handler_addr,
-            );
-            return handle_dns_tcp_connection(inbound, handler_addr, host_ns_fd).await;
-        }
-        warn!(
-            orig_dst = %orig_dst,
-            "TCP DNS connection to port 53 but no DNS forward addr configured; proxying directly"
-        );
-    }
 
     // ---- Step 2: Disable Nagle (TCP_NODELAY) to reduce interactive small-packet latency ----
     // Inbound connections have Nagle enabled by default on kernel accept; outbound
@@ -779,45 +700,6 @@ async fn handle_connection(
         }
     }
 
-    Ok(())
-}
-
-/// Forward a DNS-over-TCP session to the internal DNS handler.
-///
-/// DNS-over-TCP uses a 2-byte length-prefix framing (RFC 1035 §4.2.2). The byte stream
-/// between the client connection and the internal DNS handler is relayed bidirectionally:
-/// query frames go to the handler, response frames come back to the client. Since the
-/// client connection is an IP_TRANSPARENT TProxy socket (local address = original
-/// destination DNS server), the return-path source address is correct and the client
-/// will not drop the packets.
-///
-/// The upstream socket is created in the host NS (`host_ns_fd`) and marked with
-/// SO_MARK=DAE_SOCKET_MARK, consistent with the UDP hijack path, ensuring eBPF lets
-/// it through (preventing a hijack loop).
-async fn handle_dns_tcp_connection(
-    mut inbound: TcpStream,
-    handler_addr: SocketAddr,
-    host_ns_fd: Option<RawFd>,
-) -> Result<()> {
-    let timeout = Duration::from_secs(5);
-    let mut upstream = protocols::hostns::connect_tcp(
-        handler_addr,
-        &protocols::hostns::DirectSocket::control_plane(host_ns_fd),
-        false,
-        timeout,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to connect to internal DNS handler {}: {}", handler_addr, e))?;
-
-    set_tcp_nodelay(&upstream);
-    // Pure byte relay: length-prefixed frames pass through as-is, no DNS parsing here.
-    let (a, b) = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await?;
-    debug!(
-        handler_addr = %handler_addr,
-        up_bytes = a,
-        down_bytes = b,
-        "TCP DNS hijack session completed"
-    );
     Ok(())
 }
 
@@ -1164,88 +1046,6 @@ async fn relay_bidirectional(
 }
 
 // ============================================================================
-// DNS Query Name Extraction
-// ============================================================================
-
-/// Extract the query name from a DNS packet (question section).
-///
-/// Supports DNS name compression (RFC 1035 §4.1.4). When a compression pointer
-/// (high two bits `0xC0`) is encountered, the function follows the pointer to
-/// continue reading labels from elsewhere in the message.
-///
-/// Safety measures:
-/// - Tracks visited positions to detect pointer loops
-/// - Limits total jumps to 10 to prevent abuse
-/// - Returns `None` on malformed packets
-pub fn extract_dns_query_name(packet: &[u8]) -> Option<String> {
-    if packet.len() < 12 {
-        return None;
-    }
-
-    // Maximum number of compression-pointer jumps before giving up.
-    const MAX_JUMPS: usize = 10;
-
-    // Fixed-size visited-pointer array replaces the HashSet: at most MAX_JUMPS
-    // pointers can be followed, so a bounded linear scan is cheaper and avoids
-    // per-packet hashing/allocation.
-    let mut visited = [0usize; MAX_JUMPS];
-    let mut visited_len = 0usize;
-
-    let mut name = String::with_capacity(128);
-    let mut pos = 12usize;
-
-    loop {
-        if pos >= packet.len() {
-            return None;
-        }
-
-        let len = packet[pos] as usize;
-
-        // DNS compression pointer (RFC 1035 §4.1.4):
-        // High two bits are `11`, remaining 14 bits are the pointer offset
-        if len & 0xC0 == 0xC0 {
-            if pos + 1 >= packet.len() {
-                return None;
-            }
-            let ptr = ((len & 0x3F) << 8) | packet[pos + 1] as usize;
-
-            // Loop detection: if we've seen this pointer before, it's a loop
-            if visited_len >= MAX_JUMPS || visited[..visited_len].contains(&ptr) {
-                return None;
-            }
-            visited[visited_len] = ptr;
-            visited_len += 1;
-            pos = ptr;
-            continue;
-        }
-
-        // End-of-name marker (zero-length label)
-        if len == 0 {
-            break;
-        }
-
-        // Normal label: read `len` bytes of label data, writing directly into
-        // the output string (no intermediate `Vec<String>` + `join`).
-        pos += 1;
-        if pos + len > packet.len() {
-            return None;
-        }
-        let label = std::str::from_utf8(&packet[pos..pos + len]).ok()?;
-        if !name.is_empty() {
-            name.push('.');
-        }
-        name.push_str(label);
-        pos += len;
-    }
-
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1327,183 +1127,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_dns_query_name() {
-        // Simple A record query for "google.com"
-        // Transaction ID: 0x1234, Flags: 0x0100 (standard query, recursion desired)
-        // Questions: 1, Answer RRs: 0
-        let dns_query: Vec<u8> = vec![
-            0x12, 0x34, // Transaction ID
-            0x01, 0x00, // Flags: standard query
-            0x00, 0x01, // Questions: 1
-            0x00, 0x00, // Answer RRs: 0
-            0x00, 0x00, // Authority RRs: 0
-            0x00, 0x00, // Additional RRs: 0
-            6, b'g', b'o', b'o', b'g', b'l', b'e', // "google" (len=6)
-            3, b'c', b'o', b'm', // "com" (len=3)
-            0,    // End of domain name
-            0x00, 0x01, // QTYPE: A
-            0x00, 0x01, // QCLASS: IN
-        ];
-        let name = extract_dns_query_name(&dns_query);
-        assert_eq!(name.as_deref(), Some("google.com"));
-    }
-
-    #[test]
-    fn test_extract_dns_query_name_with_compression_pointer() {
-        // DNS packet with compression pointer in question section.
-        // Query name: "www.example.com" where "example.com" is stored at offset 12
-        // and the question uses a pointer to reference it.
-        //
-        // Layout:
-        //   [0..12]   DNS header
-        //   [12..]    name: 3, 'w','w','w', 0xC0, 12  → pointer to offset 12
-        //   [12..]    (at offset 12): 7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0
-        //
-        // The question section name at offset 12 would be "www.example.com"
-        // if the pointer points back to offset 12. But that's a loop!
-        // Let's construct a proper non-looping case.
-        //
-        // Correct layout for "www.example.com":
-        //   Header [0..12]
-        //   [12]: 3, 'w','w','w'         — "www" label
-        //   [16]: 0xC0, 24              — pointer to offset 24
-        //   [18]: QTYPE, QCLASS
-        //   ... (answer section or padding)
-        //   [24]: 7, 'e','x','a','m','p','l','e'  — "example"
-        //   [32]: 3, 'c','o','m'         — "com"
-        //   [36]: 0                       — end of name
-        let mut packet = vec![0u8; 37];
-        // DNS header
-        packet[0] = 0x12;
-        packet[1] = 0x34;
-        packet[2] = 0x01;
-        packet[3] = 0x00;
-        packet[4] = 0x00;
-        packet[5] = 0x01; // QDCOUNT=1
-        // Question section name at offset 12: "www" + pointer to 24
-        packet[12] = 3;
-        packet[13] = b'w';
-        packet[14] = b'w';
-        packet[15] = b'w';
-        packet[16] = 0xC0; // compression pointer high byte
-        packet[17] = 24;   // pointer offset = 24
-        // QTYPE at offset 18
-        packet[18] = 0x00;
-        packet[19] = 0x01; // A
-        // QCLASS at offset 20
-        packet[20] = 0x00;
-        packet[21] = 0x01; // IN
-        // "example.com" at offset 22 (wait, let me recalculate)
-        // Actually offset 24 is where the pointer points. Let me place the data there.
-        // Offset 22-23 is QTYPE+QCLASS end. We need data at offset 24.
-        // But we only allocated 37 bytes. Let me redo:
-        // [12] 3 'w' 'w' 'w'     = offset 12..16
-        // [16] 0xC0 0x18           = offset 16..18, pointer to 0x18=24
-        // [18] QTYPE(2) + QCLASS(2) = offset 18..22
-        // [24] 7 'e' 'x' 'a' 'm' 'p' 'l' 'e' = offset 24..32
-        // [32] 3 'c' 'o' 'm' = offset 32..36
-        // [36] 0 = end
-        // Need packet size >= 37. Already allocated 37, good.
-        packet[22] = 7;
-        packet[23] = b'e';
-        packet[24] = b'x';
-        packet[25] = b'a';
-        packet[26] = b'm';
-        packet[27] = b'p';
-        packet[28] = b'l';
-        packet[29] = b'e';
-        packet[30] = 3;
-        packet[31] = b'c';
-        packet[32] = b'o';
-        packet[33] = b'm';
-        packet[34] = 0; // end of name
-        // Fix: pointer at [16] should point to offset 22, not 24
-        // Let me recalculate again:
-        // [12] 3 'w' 'w' 'w'  → bytes 12,13,14,15
-        // [16] 0xC0 [17] → pointer
-        // [18] QTYPE_H
-        // [19] QTYPE_L
-        // [20] QCLASS_H
-        // [21] QCLASS_L
-        // Then "example.com" should be somewhere accessible. Let's put it after the question.
-        // Actually for a question-only packet, the name must be parseable from the question.
-        // Let's just put "example.com" at offset 22:
-        // [22] 7 'e'x'a'm'p'l'e' → bytes 22..30
-        // [30] 3 'c'o'm' → bytes 30..34
-        // [34] 0 → end
-        // Pointer at [16] should be 0xC0, 22
-        packet[16] = 0xC0;
-        packet[17] = 22;
-        packet.truncate(35);
-
-        let name = extract_dns_query_name(&packet);
-        assert_eq!(name.as_deref(), Some("www.example.com"));
-    }
-
-    #[test]
-    fn test_extract_dns_query_name_compression_loop_detected() {
-        // Malicious DNS packet: pointer creates a loop (A -> B -> A)
-        let mut packet = vec![0u8; 20];
-        // DNS header
-        packet[0] = 0x12;
-        packet[1] = 0x34;
-        packet[2] = 0x01;
-        packet[3] = 0x00;
-        packet[4] = 0x00;
-        packet[5] = 0x01;
-        // [12]: label "a" (len=1, 'a')
-        packet[12] = 1;
-        packet[13] = b'a';
-        // [14]: pointer to offset 12 → will loop
-        packet[14] = 0xC0;
-        packet[15] = 12;
-
-        let name = extract_dns_query_name(&packet);
-        assert_eq!(name, None, "Looping pointer should return None");
-    }
-
-    #[test]
-    fn test_extract_dns_query_name_empty() {
-        // Empty DNS packet (too short)
-        assert_eq!(extract_dns_query_name(&[]), None);
-        // Header only, no name
-        assert_eq!(extract_dns_query_name(&[0u8; 12]), None);
-    }
-
-    #[test]
-    fn test_extract_dns_query_name_pointer_at_start() {
-        // Name is entirely a compression pointer
-        let mut packet = vec![0u8; 30];
-        // Header
-        packet[0] = 0x12;
-        packet[1] = 0x34;
-        packet[2] = 0x01;
-        packet[3] = 0x00;
-        packet[4] = 0x00;
-        packet[5] = 0x01;
-        // [12]: pointer to offset 20
-        packet[12] = 0xC0;
-        packet[13] = 20;
-        // [20]: "test" → 4, 't', 'e', 's', 't'
-        packet[20] = 4;
-        packet[21] = b't';
-        packet[22] = b'e';
-        packet[23] = b's';
-        packet[24] = b't';
-        // [25]: 0 (end of name)
-        packet[25] = 0;
-
-        let name = extract_dns_query_name(&packet);
-        assert_eq!(name.as_deref(), Some("test"));
-    }
-
-    #[test]
     fn test_udp_flow_idle_timeout_tiers() {
         let dns: SocketAddr = "8.8.8.8:53".parse().unwrap();
         let quic: SocketAddr = "1.1.1.1:443".parse().unwrap();
         let other: SocketAddr = "9.9.9.9:1234".parse().unwrap();
 
-        assert_eq!(udp_flow_idle_timeout(dns), DNS_UDP_IDLE_TIMEOUT);
+        // DNS is treated as ordinary traffic — port 53 uses the default timeout.
+        assert_eq!(udp_flow_idle_timeout(dns), UDP_FLOW_IDLE_TIMEOUT);
         assert_eq!(udp_flow_idle_timeout(quic), QUIC_UDP_IDLE_TIMEOUT);
         assert_eq!(udp_flow_idle_timeout(other), UDP_FLOW_IDLE_TIMEOUT);
     }
@@ -1555,9 +1185,7 @@ mod tests {
 ///
 /// Transparently proxies UDP traffic, obtaining the original destination address via
 /// `IP_RECVORIGDSTADDR`.
-/// For DNS traffic (destination port 53), DNS hijacking is used: queries are forwarded
-/// to the internal DNS handler instead of through the SOCKS5 proxy. This enables
-/// domain-based routing, caching, and other features.
+/// DNS traffic is treated as ordinary traffic and relayed like any other UDP flow.
 pub struct UdpTproxyListener {
     /// Listen address (e.g. `0.0.0.0:15080` or `[::]:15080`)
     listen_addr: SocketAddr,
@@ -1569,17 +1197,17 @@ pub struct UdpTproxyListener {
     socket_mark: u32,
     /// Stop signal (notifies the receive loop to exit immediately)
     stop_signal: Arc<Notify>,
-    /// DNS forwarding target address (for DNS hijacking).
-    /// When a DNS query is received, it is forwarded to the DNS handler at this address
-    /// instead of through the SOCKS5 proxy. None disables DNS hijacking (falls back to SOCKS5).
-    dns_forward_addr: Option<SocketAddr>,
     /// Host network namespace fd.
     ///
-    /// After setting, all upstream UDP sockets (DNS hijack query sockets, UDP relay responses
-    /// sockets) are created and sent from the host NS (aligned with kdae), so the source
-    /// address is the host's real WAN address instead of the daens internal address.
+    /// After setting, all upstream UDP sockets (UDP relay responses sockets) are created
+    /// and sent from the host NS (aligned with kdae), so the source address is the host's
+    /// real WAN address instead of the daens internal address.
     /// `None` creates sockets in the current namespace.
     host_ns_fd: Option<RawFd>,
+    /// Optional DNS forwarder: when set, UDP flows whose original destination port is 53
+    /// (and that parse as valid DNS queries) are handed to it for domain-based split,
+    /// instead of being relayed like ordinary UDP traffic.
+    dns_forwarder: Option<Arc<crate::net::dns::DnsForwarder>>,
 }
 
 impl UdpTproxyListener {
@@ -1591,8 +1219,8 @@ impl UdpTproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark: shared::DAE_SOCKET_MARK,
             stop_signal: Arc::new(Notify::new()),
-            dns_forward_addr: None,
             host_ns_fd: None,
+            dns_forwarder: None,
         }
     }
 
@@ -1608,29 +1236,30 @@ impl UdpTproxyListener {
             running: Arc::new(AtomicBool::new(false)),
             socket_mark,
             stop_signal: Arc::new(Notify::new()),
-            dns_forward_addr: None,
             host_ns_fd: None,
+            dns_forwarder: None,
         }
+    }
+
+    /// Attach the internal DNS forwarder.
+    ///
+    /// When attached, UDP packets whose original destination port is 53 (and that parse
+    /// as valid DNS queries) are routed to the forwarder (domain-based proxy/direct split)
+    /// instead of the ordinary SOCKS5 UDP ASSOCIATE path. Responses are sent back through
+    /// the transparent response socket pool bound to the original DNS server address, so
+    /// clients see a transparent reply — no eBPF changes required.
+    pub fn set_dns_forwarder(&mut self, f: Arc<crate::net::dns::DnsForwarder>) -> &mut Self {
+        self.dns_forwarder = Some(f);
+        self
     }
 
     /// Set host network namespace fd.
     ///
-    /// After setting, all upstream UDP sockets (DNS hijack query sockets, UDP relay responses
-    /// sockets) are created in the host NS (aligned with kdae).
+    /// After setting, all upstream UDP sockets (UDP relay responses sockets) are created
+    /// in the host NS (aligned with kdae).
     pub fn set_host_ns_fd(&mut self, host_ns_fd: Option<RawFd>) -> &mut Self {
         self.host_ns_fd = host_ns_fd;
         self
-    }
-
-    /// Set the DNS forwarding target address.
-    /// After setting, DNS queries are forwarded directly to this address instead of
-    /// through the SOCKS5 proxy.
-    pub fn set_dns_forward_addr(&mut self, addr: SocketAddr) {
-        self.dns_forward_addr = Some(addr);
-        info!(
-            "DNS hijacking enabled: forwarding DNS queries to {}",
-            addr
-        );
     }
 
     /// Get listen address
@@ -1828,9 +1457,7 @@ impl UdpTproxyListener {
     /// UDP receive loop core — uses recvmsg to get cmsg for parsing the original
     /// destination address, and forwards packets to the original destination via
     /// SOCKS5 UDP ASSOCIATE.
-    /// For DNS traffic, if dns_forward_addr is configured, queries are forwarded
-    /// directly to the internal DNS handler, implementing DNS hijacking instead of
-    /// going through the SOCKS5 proxy.
+    /// DNS traffic is treated as ordinary traffic and relayed like any other UDP flow.
     ///
     /// # Optimization notes
     ///
@@ -1850,7 +1477,6 @@ impl UdpTproxyListener {
         let fd = socket.as_raw_fd();
         let dialer = self.dialer.clone();
         let stop_signal = self.stop_signal.clone();
-        let dns_forward_addr = self.dns_forward_addr;
         let host_ns_fd = self.host_ns_fd;
 
         // Buffers are reused outside the loop (avoiding a 64KB allocation per packet)
@@ -1908,131 +1534,73 @@ impl UdpTproxyListener {
                         }
                     };
 
-                    // Per-packet logging (info would flood under high-frequency UDP like QUIC/games; use debug)
-                    let is_dns = dest.port() == 53 && n > 12;
-                    if is_dns {
-                        let qname = extract_dns_query_name(&buf[..n]);
-                        debug!(
-                            "DNS  {}:{} -> {} QUERY {}",
-                            peer_addr
-                                .map(|a| a.ip())
-                                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                            peer_addr.map(|a| a.port()).unwrap_or(0),
-                            dest,
-                            qname.as_deref().unwrap_or("<parse-failed>"),
-                        );
-                    } else {
-                        debug!(
-                            "UDP  {}:{} -> {} {}bytes",
-                            peer_addr
-                                .map(|a| a.ip())
-                                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-                            peer_addr.map(|a| a.port()).unwrap_or(0),
-                            dest,
-                            n,
-                        );
-                    }
+                    // Per-packet logging (debug level; info would flood under high-frequency UDP like QUIC/games)
+                    debug!(
+                        "UDP  {}:{} -> {} {}bytes",
+                        peer_addr
+                            .map(|a| a.ip())
+                            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                        peer_addr.map(|a| a.port()).unwrap_or(0),
+                        dest,
+                        n,
+                    );
 
-                    // ---- DNS hijacking: forward DNS queries to the internal DNS handler ----
-                    // Only intercept UDP packets to port 53. The internal DNS handler
-                    // listens on 169.254.0.1:<port> (IPv4) in the host NS. We use a
-                    // separate IPv4 socket to talk to the handler, then reuse a pooled
-                    // IP_TRANSPARENT socket bound to the original destination (the DNS
-                    // server the client queried) so the response reaches the client
-                    // with the expected source address.
-                    if is_dns {
-                        if let Some(handler_addr) = dns_forward_addr {
-                            let peer = peer_addr;
-                            let pkt = buf[..n].to_vec();
-                            let resp_socks = resp_socks.clone();
-
-                            tokio::spawn(async move {
-                                // 1. Send the query to the internal DNS handler. The handler
-                                //    is IPv4-only, so use an IPv4 socket bound to any port.
-                                let query_bind: SocketAddr =
-                                    "0.0.0.0:0".parse().expect("valid IPv4 any addr");
-                                let query_socket =
-                                    match create_marked_udp_socket(&query_bind, host_ns_fd).await
-                                    {
-                                        Some(s) => s,
-                                        None => {
-                                            warn!("DNS hijack: failed to create query socket for handler {}", handler_addr);
-                                            return;
-                                        }
-                                    };
-
-                                if let Err(e) = query_socket.send_to(&pkt, handler_addr).await {
-                                    warn!("DNS hijack: send_to internal handler {} failed: {}", handler_addr, e);
-                                    return;
-                                }
-
-                                // Wait for the handler's DNS response.
-                                // The wait window must cover the handler's
-                                // worst-case response time (see
-                                // DNS_HIJACK_WAIT_TIMEOUT); otherwise a
-                                // response/SERVFAIL arriving after the timeout
-                                // is silently dropped.
-                                let mut recv_buf = vec![0u8; MAX_UDP_SIZE];
-                                let recv_fut = query_socket.recv_from(&mut recv_buf);
-                                let len = match tokio::time::timeout(
-                                    DNS_HIJACK_WAIT_TIMEOUT,
-                                    recv_fut,
-                                )
-                                .await
-                                {
-                                    Ok(Ok((len, _))) => len,
-                                    Ok(Err(e)) => {
-                                        warn!("DNS hijack: recv from handler error: {}", e);
-                                        return;
-                                    }
-                                    Err(_) => {
-                                        warn!("DNS hijack: timeout waiting for internal handler {}", handler_addr);
-                                        return;
-                                    }
-                                };
-                                recv_buf.truncate(len);
-
-                                // 2. Send the response back to the client from the original
-                                //    destination address (the DNS server it queried),
-                                //    reusing the pooled transparent socket.
-                                if let Some(peer) = peer {
-                                    if let Some(resp_sock) =
-                                        resp_socks.get(&dest, host_ns_fd).await
-                                    {
-                                        match tokio::time::timeout(
-                                            UDP_WRITE_TIMEOUT,
-                                            resp_sock.send_to(&recv_buf, peer),
-                                        )
-                                        .await
+                    // ---- DNS branch: dport 53 + valid DNS query + forwarder attached ----
+                    // eBPF 不改动：DNS 仍被当作普通 UDP 拦截进 TProxy。这里仅在用户空间
+                    // 识别 53 端口 DNS 流量，交给 DNS 模块做域名分流（代理/直连）。
+                    // 响应经透明响应 socket（bound 到原目标 DNS 地址）发回客户端，
+                    // 客户端看到的就是"原 DNS 服务器"的应答，完全透明。
+                    if dest.port() == 53
+                        && self.dns_forwarder.is_some()
+                        && crate::net::dns::parse_dns_query(&buf[..n]).is_some()
+                    {
+                        let fwd = self.dns_forwarder.clone().unwrap();
+                        let resp_socks = resp_socks.clone();
+                        let peer = peer_addr;
+                        let peer_str = peer
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "unknown".into());
+                        let payload = buf[..n].to_vec();
+                        tokio::spawn(async move {
+                            match fwd.resolve(&payload).await {
+                                Ok(response) => {
+                                    if let Some(peer) = peer {
+                                        if let Some(sock) =
+                                            resp_socks.get(&dest, host_ns_fd).await
                                         {
-                                            Ok(Ok(bytes)) => {
-                                                debug!(
-                                                    client = %peer,
-                                                    dest = %dest,
-                                                    bytes = bytes,
-                                                    "DNS hijack response sent"
-                                                );
+                                            // Response write deadline: prevents blocking the
+                                            // reader forever when the client is not reading.
+                                            match tokio::time::timeout(
+                                                UDP_WRITE_TIMEOUT,
+                                                sock.send_to(&response, peer),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(_)) => {}
+                                                Ok(Err(e)) => debug!(
+                                                    "DNS response send failed: {}",
+                                                    e
+                                                ),
+                                                Err(_) => debug!(
+                                                    "DNS response send to {} timed out",
+                                                    peer
+                                                ),
                                             }
-                                            Ok(Err(e)) => debug!(
-                                                "DNS hijack: response send_to client {} failed: {}",
-                                                peer, e
-                                            ),
-                                            Err(_) => debug!(
-                                                "DNS hijack: response send_to client {} timed out",
-                                                peer
-                                            ),
                                         }
-                                    } else {
-                                        debug!("DNS hijack: failed to get response socket for {}", dest);
                                     }
                                 }
-                            });
-                            guard.clear_ready();
-                            continue; // Skip SOCKS5 path for hijacked DNS
-                        }
+                                Err(e) => {
+                                    debug!(
+                                        "DNS resolve failed for {} -> {}: {}",
+                                        peer_str, dest, e
+                                    );
+                                }
+                            }
+                        });
+                        continue;
                     }
 
-                    // ---- SOCKS5 UDP ASSOCIATE path (non-DNS traffic) ----
+                    // ---- SOCKS5 UDP ASSOCIATE path ----
                     // Flows are reused by (dest, peer): sends complete immediately, and responses
                     // are sent back by the flow's reader task (send and recv are decoupled,
                     // no lock held while waiting).

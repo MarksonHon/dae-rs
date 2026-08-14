@@ -227,12 +227,11 @@ impl Config {
 
         Ok(Self {
             tproxy_port: runtime.tproxy_port,
-            // namespace/marks are hardcoded in Config::default() — not configurable via daefile
-            route_table: 2023,
-            fwmark_proxy: 0x08000000,
-            fwmark_bypass: 0x04000000,
-            fwmark_mask: 0x08000000,
-            mtu: 1500,
+            route_table: runtime.route_table,
+            fwmark_proxy: runtime.fwmark_proxy,
+            fwmark_bypass: runtime.fwmark_bypass,
+            fwmark_mask: runtime.fwmark_mask,
+            mtu: runtime.mtu,
             log_level: runtime.log_level.clone(),
             ebpf_path: net::ebpf::DEFAULT_EBPF_PATH.to_string(),
             proxy_addr,
@@ -327,12 +326,10 @@ pub struct ControlPlane {
     routing_matcher: Option<Arc<crate::routing::matcher::RoutingMatcher>>,
     /// Outbound dialer built from the configured proxy node/group.
     ///
-    /// Built once before the DNS manager and TProxy start, then shared between
-    /// the TProxy listeners and the DNS manager (for `send_by` proxied DNS
-    /// upstream queries).
+    /// Built once before the TProxy starts, then shared between the TProxy
+    /// listeners.
     outbound_dialer: Option<Arc<dyn OutboundDialer>>,
-    /// Outbound dialers keyed by outbound **group name**, used by the DNS
-    /// manager for `send_by` proxied DNS upstream queries. TProxy keeps using
+    /// Outbound dialers keyed by outbound **group name**. TProxy keeps using
     /// [`Self::outbound_dialer`] (first node / default).
     outbound_group_dialers: HashMap<String, Arc<dyn OutboundDialer>>,
     /// Current routing epoch slot (0 or 1) for double-buffering.
@@ -353,7 +350,7 @@ pub struct ControlPlane {
     /// ~33 seconds for CIDR processing. This eliminates the `wan_route_fail`
     /// spike during startup where TCP SYNs arrive before any rules exist.
     compiled_routing: Option<routing::matcher::CompiledRouting>,
-    /// Ruleset in-memory cache (shared by matcher compilation / DNS routing / DNS response Routing).
+    /// Ruleset in-memory cache (shared by matcher compilation).
     ///
     /// Scanned and populated from `/var/lib/dae-rs/` at startup; refreshed by background watcher after scheduler updates complete.
     pub rule_set_cache: ruleset::cache::RuleSetCache,
@@ -362,13 +359,20 @@ pub struct ControlPlane {
     /// Consumed by the external main loop (or [`ControlPlane::handle_rule_set_reloads`]),
     /// to execute Routing recompilation + eBPF double-buffer hot-reload.
     rule_set_reload_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    /// Internal DNS forwarder (runs in the host namespace; `None` when disabled).
+    dns_forwarder: Option<Arc<crate::net::dns::DnsForwarder>>,
+    /// Tokio task handle for the DNS forwarder.
+    dns_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ControlPlane {
     /// Convenience accessor for the locked eBPF manager.
-    /// Panics if the mutex is poisoned.
+    /// Recovers from mutex poisoning by extracting the inner guard.
     fn ebpf(&self) -> std::sync::MutexGuard<'_, net::ebpf::EbpfManager> {
-        self.ebpf_mgr.lock().expect("ebpf_mgr lock poisoned")
+        self.ebpf_mgr.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ebpf_mgr mutex was poisoned, recovering");
+            poisoned.into_inner()
+        })
     }
 
     /// Create a new control plane instance
@@ -421,6 +425,8 @@ impl ControlPlane {
             rule_set_cache: ruleset::cache::RuleSetCache::new(),
             compiled_routing: None,
             rule_set_reload_rx: None,
+            dns_forwarder: None,
+            dns_handle: None,
         }
     }
 
@@ -803,15 +809,16 @@ impl ControlPlane {
                     .register(
                         pattern,
                         Arc::new(move |ifname| {
-                            let mut mgr = ebpf_bind.lock().expect("ebpf lock");
+                            let mut mgr = ebpf_bind.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             mgr.attach_wan(ifname)?;
                             configure_kernel_if(ifname);
                             info!("InterfaceManager: WAN TC attached to {}", ifname);
                             Ok(())
                         }),
                         Some(Arc::new(move |ifname| {
-                            let mut mgr = ebpf_unbind.lock().expect("ebpf lock");
+                            let mut mgr = ebpf_unbind.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             mgr.detach_by_iface(ifname)?;
+                            restore_kernel_if(ifname);
                             info!("InterfaceManager: WAN TC detached from {}", ifname);
                             Ok(())
                         })),
@@ -828,15 +835,16 @@ impl ControlPlane {
                     .register(
                         pattern,
                         Arc::new(move |ifname| {
-                            let mut mgr = ebpf_bind.lock().expect("ebpf lock");
+                            let mut mgr = ebpf_bind.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             mgr.attach_lan(ifname)?;
                             configure_kernel_if(ifname);
                             info!("InterfaceManager: LAN TC attached to {}", ifname);
                             Ok(())
                         }),
                         Some(Arc::new(move |ifname| {
-                            let mut mgr = ebpf_unbind.lock().expect("ebpf lock");
+                            let mut mgr = ebpf_unbind.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                             mgr.detach_by_iface(ifname)?;
+                            restore_kernel_if(ifname);
                             info!("InterfaceManager: LAN TC detached from {}", ifname);
                             Ok(())
                         })),
@@ -1040,7 +1048,7 @@ impl ControlPlane {
 
         // ---- Step 3.6: Dump generated configuration as JSON for debugging ----
         // This helps diagnose why traffic might not be hijacked — verify routing rules,
-        // outbound nodes, process exclusions, DNS config, etc. are correctly parsed.
+        // outbound nodes, process exclusions, etc. are correctly parsed.
         match serde_json::to_string_pretty(&self.config) {
             Ok(json_str) => {
                 tracing::debug!("Generated configuration:\n{}", json_str);
@@ -1054,7 +1062,7 @@ impl ControlPlane {
         // The eBPF programs need to track all dae-rs sockets regardless of
         // which network namespace they're created in. Since dae-rs runs
         // components in both:
-        //   - Host NS: DNS listener, API server, connectivity checker
+        //   - Host NS: API server, connectivity checker
         //   - Proxy NS (daens): TProxy listener, SOCKS5 dialer
         //
         // We attach the cgroup programs to both namespaces' cgroups.
@@ -1128,6 +1136,17 @@ impl ControlPlane {
         self.start_tproxy().await?;
         debug!("Step 4 completed: {}ms", step_start.elapsed().as_millis());
 
+        // ---- Step 4.1: Start internal DNS forwarder (if configured) ----
+        if self
+            .daefile_config
+            .as_ref()
+            .and_then(|c| c.dns.as_ref())
+            .is_some()
+        {
+            info!("Step 4.1/5: Starting internal DNS forwarder");
+            self.start_dns_forwarder().await?;
+        }
+
         // ---- Step 4.5: Start routing handoff consumer ----
         // Consumes entries from routing_handoff_map that the eBPF program
         // produces when it cannot determine the outbound (CONTROL_PLANE_ROUTING).
@@ -1184,7 +1203,7 @@ impl ControlPlane {
                 // Ruleset update → refresh in-memory cache + trigger Routing hot-reload signal.
                 //
                 // After each successful update, the watcher:
-                //   1. Re-scan disk data directory → refresh `RuleSetCache` (matcher / DNS shared);
+                //   1. Re-scan disk data directory → refresh `RuleSetCache` (shared with matcher);
                 //   2. Send signal via mpsc; main control plane via
                 //      [`ControlPlane::handle_rule_set_reloads`] consumes the signal and recompiles
                 //      Routing and performs eBPF double-buffer hot-reload (reuses `reload_config`).
@@ -1244,8 +1263,8 @@ impl ControlPlane {
         debug!("Cookie PID map janitor spawned");
 
         // Connectivity checker (proxies health)
-        let proxy_addr: std::net::SocketAddr =
-            self.config.proxy_addr.parse().expect("valid proxy address");
+        let proxy_addr: std::net::SocketAddr = self.config.proxy_addr.parse()
+            .context("Invalid proxy_addr in config")?;
         debug!(
             proxy_addr = %proxy_addr,
             "Starting connectivity checker"
@@ -1307,8 +1326,8 @@ impl ControlPlane {
     /// Build the outbound dialer from the configured proxy node, or the legacy
     /// flat config fields (single SOCKS5 node) when no daefile nodes exist.
     ///
-    /// The result is cached in `self.outbound_dialer` so the DNS manager and
-    /// TProxy listeners share one dialer.
+    /// The result is cached in `self.outbound_dialer` so the TProxy listeners
+    /// share one dialer.
     fn build_outbound_dialer(
         &self,
         host_ns_fd: Option<i32>,
@@ -1356,11 +1375,10 @@ impl ControlPlane {
 
     /// Build outbound dialers for every outbound **group**, keyed by group name.
     ///
-    /// Used by the DNS manager: a DNS group's `send_by` names an outbound group,
-    /// and the DNS upstream query goes through that group's dialer. Each group's
-    /// node selection is resolved to its first concrete node (the current
-    /// architecture has no per-node liveness selection — the TProxy path already
-    /// uses only the first node). Groups that fail to resolve a node are skipped.
+    /// Each group's node selection is resolved to its first concrete node (the
+    /// current architecture has no per-node liveness selection — the TProxy path
+    /// already uses only the first node). Groups that fail to resolve a node are
+    /// skipped.
     fn build_outbound_group_dialers(
         &self,
         host_ns_fd: Option<i32>,
@@ -1380,7 +1398,7 @@ impl ControlPlane {
                         debug!(
                             group = %group.name,
                             node = %node.name,
-                            "Outbound group dialer built for DNS send_by"
+                            "Outbound group dialer built"
                         );
                         map.insert(group.name.clone(), d);
                     }
@@ -1395,7 +1413,7 @@ impl ControlPlane {
                 None => {
                     warn!(
                         group = %group.name,
-                        "Outbound group has no resolvable node (skipped for DNS send_by)"
+                        "Outbound group has no resolvable node (skipped)"
                     );
                 }
             }
@@ -1410,7 +1428,7 @@ impl ControlPlane {
 
         // ---- Host network namespace fd ----
         // TProxy listen socket remains in daens, but all upstream connections (to proxy,
-        // TCP, UDP ASSOCIATE, DNS hijack/UDP relay response sockets) are created in host NS
+        // TCP, UDP ASSOCIATE, UDP relay response sockets) are created in host NS
         // and issued (aligned with kdae), source address is the host real WAN address.
         let host_ns_fd = self.netns_mgr.get_host_ns_fd();
         info!(
@@ -1427,8 +1445,7 @@ impl ControlPlane {
         );
 
         // ---- Construct outbound Dialer according to configured protocol ----
-        // If the DNS manager already triggered dialer construction (it needs it
-        // for `send_by` proxied DNS upstreams), reuse it; otherwise build it now.
+        // Reuse the already-built dialer if present; otherwise build it now.
         let dialer: Arc<dyn OutboundDialer> = if let Some(d) = self.outbound_dialer.clone() {
             d
         } else {
@@ -1438,16 +1455,14 @@ impl ControlPlane {
         };
         debug!("Outbound dialer created: {}", dialer.protocol_name());
 
-        // ---- Build per-group outbound dialers (for DNS `send_by`) ----
-        // DNS groups may reference any outbound group via `send_by`. Build a
-        // dialer for every group once, keyed by group name, and pass it to the
-        // DNS manager so proxied DNS upstream queries use the correct group.
+        // ---- Build per-group outbound dialers ----
+        // Build a dialer for every outbound group once, keyed by group name.
         if self.outbound_group_dialers.is_empty() {
             let group_dialers = self.build_outbound_group_dialers(host_ns_fd, socket_mark);
             self.outbound_group_dialers = group_dialers;
             debug!(
                 groups = self.outbound_group_dialers.len(),
-                "Per-group outbound dialers built for DNS send_by"
+                "Per-group outbound dialers built"
             );
         }
 
@@ -1471,12 +1486,11 @@ impl ControlPlane {
         debug!(listen_addr = %listen_addr, "TProxy listen address");
 
         let tproxy_tcp = {
-            let mut tcp = TproxyListener::new_with_mark(
+            let tcp = TproxyListener::new_with_mark(
                 listen_addr,
                 dialer.clone(),
                 tproxy_listener_mark,
             );
-            tcp.set_host_ns_fd(host_ns_fd);
             Arc::new(tcp)
         };
         let tproxy_udp = {
@@ -1487,6 +1501,22 @@ impl ControlPlane {
             );
             // Upstream UDP sockets are created in the host NS when host_ns_fd is available.
             udp.set_host_ns_fd(host_ns_fd);
+            // ---- Attach the internal DNS forwarder (transparent port-53 hijack) ----
+            // eBPF 不改动：DNS 仍被当作普通 UDP 拦截进 TProxy；这里仅在用户空间把
+            // 53 端口 DNS 流量交给 DNS 模块做域名分流（代理/直连）。
+            if let Some(cfg) = self.daefile_config.as_ref().and_then(|c| c.dns.clone()) {
+                let dns_fwd = Arc::new(crate::net::dns::DnsForwarder::new(
+                    &cfg,
+                    self.outbound_dialer.clone(),
+                    host_ns_fd,
+                )?);
+                info!(
+                    listen = %cfg.listen_addr,
+                    "DNS forwarder attached to UDP TProxy (transparent port-53 DNS)"
+                );
+                udp.set_dns_forwarder(dns_fwd.clone());
+                self.dns_forwarder = Some(dns_fwd);
+            }
             Arc::new(udp)
         };
 
@@ -1642,6 +1672,41 @@ impl ControlPlane {
         let elapsed_ms = start_time.elapsed().as_millis();
         debug!("start_tproxy completed: {}ms", elapsed_ms);
         info!("TProxy listener launching in background thread (in daens)");
+        Ok(())
+    }
+
+    /// Start the internal DNS forwarder listener (if configured).
+    ///
+    /// The forwarder instance itself is built during [`ControlPlane::start_tproxy`] and
+    /// attached to the UDP TProxy listener (transparent port-53 DNS hijack, no eBPF
+    /// change). This step additionally starts the standalone listener on the internal
+    /// address (e.g. `169.254.0.1:53`) for dae-rs's own / explicitly-pointed queries.
+    async fn start_dns_forwarder(&mut self) -> Result<()> {
+        let start_time = std::time::Instant::now();
+        let Some(forwarder) = self.dns_forwarder.clone() else {
+            debug!("dns not configured — internal DNS forwarder disabled");
+            return Ok(());
+        };
+
+        // ---- Ensure the internal listen address exists on host lo ----
+        let listen_addr = forwarder.listen_addr();
+        let prefix = if listen_addr.is_ipv4() { 32 } else { 128 };
+        let cidr = format!("{}/{}", listen_addr.ip(), prefix);
+        self.netns_mgr.add_internal_lo_addr(&cidr).await?;
+
+        // ---- Spawn the standalone listener on the shared runtime (host NS) ----
+        let f = forwarder.clone();
+        self.dns_handle = Some(tokio::spawn(async move {
+            if let Err(e) = f.start().await {
+                error!("DNS forwarder listener exited with error: {}", e);
+            }
+        }));
+
+        info!(
+            "DNS forwarder listener started in {}ms (listen {})",
+            start_time.elapsed().as_millis(),
+            listen_addr,
+        );
         Ok(())
     }
 
@@ -1831,7 +1896,7 @@ impl ControlPlane {
     /// `outbound_connectivity_map` so the kernel program can make routing decisions.
     ///
     /// Key format: `outbound_id * 6 + domain * 2 + ipversion`
-    /// - domain: 0=TCP, 1=DNS UDP, 2=data UDP
+    /// - domain: 0=TCP, 1=reserved, 2=data UDP
     /// - ipversion: 0=IPv4, 1=IPv6
     pub fn start_connectivity_checker(
         ebpf_mgr: Arc<Mutex<crate::net::ebpf::EbpfManager>>,
@@ -1919,15 +1984,8 @@ impl ControlPlane {
                     tcp_alive,
                 );
 
-                // For DNS and data UDP, we use the same TCP health as a proxy
+                // For data UDP, we use the same TCP health as a proxy.
                 // In a full implementation, actual UDP probing would be done.
-                let _ = mgr.update_outbound_connectivity(
-                    outbound_id,
-                    1, // domain: 1=DNS UDP
-                    false,
-                    false, // ipv: 0=IPv4
-                    tcp_alive,
-                );
                 let _ = mgr.update_outbound_connectivity(
                     outbound_id,
                     2, // domain: 2=data UDP
@@ -1937,7 +1995,7 @@ impl ControlPlane {
                 );
 
                 debug!(
-                    "Connectivity: tcp={}, dns={}",
+                    "Connectivity: tcp={}, udp={}",
                     if tcp_alive { "up" } else { "down" },
                     if tcp_alive { "up" } else { "down" },
                 );
@@ -2099,6 +2157,15 @@ impl ControlPlane {
             .await;
             debug!("Ringbuf consumer joined: {}ms", join_start.elapsed().as_millis());
         }
+        // 0g. Internal DNS forwarder (graceful stop, then abort the task)
+        if let Some(f) = self.dns_forwarder.take() {
+            f.stop();
+            debug!("DNS forwarder stop signal sent");
+        }
+        if let Some(handle) = self.dns_handle.take() {
+            handle.abort();
+            debug!("DNS forwarder task aborted");
+        }
         // 0g. Routing handoff consumer
         if let Some(handle) = self.routing_handoff_handle.take() {
             handle.abort();
@@ -2161,6 +2228,18 @@ impl ControlPlane {
         }
         debug!("Detach completed: {}ms", step_start.elapsed().as_millis());
 
+        // ---- Step 5.5: Restore kernel sysctl settings changed by configure_kernel_if ----
+        // configure_kernel_if() sets forwarding=1 / rp_filter / proxy_arp on WAN/LAN
+        // interfaces; restore the originals so the host is left clean.
+        for iface in self
+            .config
+            .wan_interface
+            .iter()
+            .chain(self.config.lan_interface.iter())
+        {
+            restore_kernel_if(iface);
+        }
+
         // ---- Step 6: Unload eBPF program ----
         info!("Step 5/5: Unloading eBPF program");
         let step_start = std::time::Instant::now();
@@ -2213,8 +2292,9 @@ impl ControlPlane {
     /// Hot-reload configuration without restarting eBPF or TProxy.
     ///
     /// Re-parses the daefile and updates all eBPF maps in-place.
-    /// Also toggles the flip bit for TC handle rotation to support
-    /// filter switching on hot-reload.
+    /// TC hooks are NOT re-attached on reload, so the flip bit is not toggled
+    /// here: flipping it without re-attaching would make a later re-attach use a
+    /// different handle than the running filter, causing a duplicate/stale filter.
     /// Safe to call even when eBPF is not loaded (maps are skipped).
     ///
     /// # Reload Coverage
@@ -2226,7 +2306,6 @@ impl ControlPlane {
     /// **NOT supported — require full restart:**
     /// - Proxy address / credentials (TProxy dialer is immutable at runtime)
     /// - `tproxy_port` (TProxy listener socket is immutable)
-    /// - DNS configuration (`dns_manager` is immutable)
     /// - WAN/LAN interface patterns (`InterfaceManager` bindings are immutable)
     /// - MTU, fwmark values (kernel network stack parameters)
     ///
@@ -2237,13 +2316,6 @@ impl ControlPlane {
         let start = std::time::Instant::now();
         info!("Hot-reloading configuration");
         debug!("reload_config: input size {} bytes", daefile_content.len());
-
-        // ---- Step 0: Toggle flip bit for TC handle rotation ----
-        // Flip the flip bit so subsequent attach uses the new handle,
-        // old filter is deleted on detach using the old handle.
-        let new_flip = self.ebpf().flip() ^ 1;
-        self.ebpf().set_flip(new_flip);
-        debug!("Hot-reload: toggled flip bit to {}", new_flip);
 
         // 1. Re-parse daefile
         let daefile_config = config::parse_daefile(daefile_content)
@@ -2298,7 +2370,7 @@ impl ControlPlane {
         // either the old rules (until the flip) or the new rules (after the flip).
         //
         // Note: domain_routing entries are cleared on reload but not re-populated
-        // (DNS-driven domain routing has been removed).
+        // (domain-driven routing is not re-populated after reload).
 
         // 3a. Increment datapath_generation
         self.datapath_generation = self.datapath_generation.wrapping_add(1);
@@ -2605,6 +2677,53 @@ pub async fn connect_with_mark(
 // Kernel Parameter Configuration
 // ============================================================================
 
+/// Original sysctl values overwritten by [`configure_kernel_if`], keyed by
+/// interface name → (sysctl path → original value). Used to restore the host to
+/// its prior state on shutdown / interface unbind.
+static SYSCTL_SNAPSHOT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Read the current value of a sysctl path (trimmed), if readable.
+fn read_sysctl(path: &str) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+/// Record the original value of `path` for `iface` if not already recorded
+/// (first write wins, so re-configuration never clobbers the true original).
+fn snapshot_sysctl(iface: &str, path: &str, value: &str) {
+    if let Ok(mut map) = SYSCTL_SNAPSHOT.lock() {
+        let entry = map.entry(iface.to_string()).or_default();
+        entry.entry(path.to_string()).or_insert_with(|| value.to_string());
+    }
+}
+
+/// Snapshot the current value of `path` for `iface`, then write `value`.
+fn write_sysctl_snapshot(iface: &str, path: &str, value: &str) -> std::io::Result<()> {
+    if let Some(orig) = read_sysctl(path) {
+        snapshot_sysctl(iface, path, &orig);
+    }
+    std::fs::write(path, format!("{}\n", value))
+}
+
+/// Restore every sysctl that [`configure_kernel_if`] changed on `iface` back to
+/// its original value. Called on interface unbind and on control-plane shutdown.
+fn restore_kernel_if(iface: &str) {
+    let originals = if let Ok(mut map) = SYSCTL_SNAPSHOT.lock() {
+        map.remove(iface)
+    } else {
+        None
+    };
+    if let Some(originals) = originals {
+        for (path, value) in originals {
+            match std::fs::write(&path, format!("{}\n", value)) {
+                Ok(()) => info!("Kernel: restored {}={} on {}", path, value, iface),
+                Err(e) => warn!("Failed to restore sysctl {} on {}: {}", path, iface, e),
+            }
+        }
+    }
+}
+
 /// Configure kernel parameters for a WAN/LAN interface.
 ///
 /// Mirrors original dae's `SetSendRedirects` and `SetForwarding`:
@@ -2612,14 +2731,16 @@ pub async fn connect_with_mark(
 /// - `net.ipv4.conf.<iface>.forwarding = 1` — enable IP forwarding
 ///
 /// These are needed for transparent proxying to work correctly.
-/// Errors are logged but not propagated (best-effort).
+/// Each original value is snapshotted so [`restore_kernel_if`] can put the host
+/// back to its prior state on shutdown / unbind. Errors are logged but not
+/// propagated (best-effort).
 fn configure_kernel_if(iface: &str) {
     let is_dae_iface = iface.starts_with("dae");
 
     // net.ipv4.conf.<iface>.send_redirects = 0
     if !is_dae_iface {
         let path_send_redirects = format!("/proc/sys/net/ipv4/conf/{}/send_redirects", iface);
-        if let Err(e) = std::fs::write(&path_send_redirects, b"0\n") {
+        if let Err(e) = write_sysctl_snapshot(iface, &path_send_redirects, "0") {
             warn!(
                 "Failed to set send_redirects=0 on {}: {} (non-critical)",
                 iface, e
@@ -2632,7 +2753,7 @@ fn configure_kernel_if(iface: &str) {
     // net.ipv4.conf.<iface>.forwarding = 1
     if !is_dae_iface {
         let path_forwarding = format!("/proc/sys/net/ipv4/conf/{}/forwarding", iface);
-        if let Err(e) = std::fs::write(&path_forwarding, b"1\n") {
+        if let Err(e) = write_sysctl_snapshot(iface, &path_forwarding, "1") {
             warn!(
                 "Failed to set forwarding=1 on {}: {} (non-critical)",
                 iface, e
@@ -2646,26 +2767,25 @@ fn configure_kernel_if(iface: &str) {
     if !is_dae_iface {
         let path_fwd6 = format!("/proc/sys/net/ipv6/conf/{}/forwarding", iface);
         // Don't error if IPv6 is not configured on this interface
-        let _ = std::fs::write(&path_fwd6, b"1\n");
+        let _ = write_sysctl_snapshot(iface, &path_fwd6, "1");
     }
 
     // net.ipv4.conf.<iface>.rp_filter
     // Keep dae netkit path aligned with original kdae: dae0/dae0peer use 0.
     // Other interfaces keep loose mode (2).
     let path_rp = format!("/proc/sys/net/ipv4/conf/{}/rp_filter", iface);
-    let rp_value = if iface.starts_with("dae") { b"0\n" } else { b"2\n" };
-    if let Err(e) = std::fs::write(&path_rp, rp_value) {
+    let rp_value = if iface.starts_with("dae") { "0" } else { "2" };
+    if let Err(e) = write_sysctl_snapshot(iface, &path_rp, rp_value) {
         warn!(
             "Failed to set rp_filter on {}: {} (may affect TProxy)",
             iface, e
         );
     } else {
-        let rp_trim = std::str::from_utf8(rp_value).unwrap_or("?").trim();
-        info!("Kernel: {}={}", path_rp, rp_trim);
+        info!("Kernel: {}={}", path_rp, rp_value);
     }
 
     // net.ipv4.conf.<iface>.proxy_arp = 1
-    // The SOCKS5 dial and DNS sockets live in daens and therefore source their
+    // The SOCKS5 dial and upstream sockets live in daens and therefore source their
     // packets from 169.254.0.11 (the dae0peer address). That address is not
     // reachable from the WAN/router side: the proxy's reply targets 169.254.0.11
     // (link-local) and is ARP-resolved on the LAN, but nothing answers — the host
@@ -2675,7 +2795,7 @@ fn configure_kernel_if(iface: &str) {
     // This is required for control-plane dialing to ever complete.
     if !is_dae_iface {
         let path_proxy_arp = format!("/proc/sys/net/ipv4/conf/{}/proxy_arp", iface);
-        if let Err(e) = std::fs::write(&path_proxy_arp, b"1\n") {
+        if let Err(e) = write_sysctl_snapshot(iface, &path_proxy_arp, "1") {
             warn!(
                 "Failed to set proxy_arp=1 on {}: {} (dial replies may not return)",
                 iface, e

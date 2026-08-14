@@ -44,6 +44,7 @@ netlink-packet-route = "0.21"
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors", "auth", "trace"] }
 chrono = "0.4"
+subtle = "2"
 shared = { path = "../shared" }
 protocols = { path = "../protocols" }
 

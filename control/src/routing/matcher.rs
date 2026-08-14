@@ -902,6 +902,11 @@ pub fn parse_mac_fn(
 }
 
 /// Parser for `qtype(...)` — DNS query type matching.
+///
+/// NOTE: This is a placeholder implementation. DNS query type matching is not yet
+/// functional because the DNS module has been removed from dae-rs. When used in
+/// routing rules, this matcher will be created but won't affect routing decisions
+/// since DNS traffic is not intercepted.
 pub fn parse_qtype_fn(
     f: &Function,
     _key: &str,
@@ -910,7 +915,7 @@ pub fn parse_qtype_fn(
 ) -> Result<Vec<MatchSet>> {
     let mut ms = MatchSet::zeroed();
     ms.r#type = match_type::QTYPE;
-    // QType is a placeholder; full DNS query type matching is TBD
+    // QType matching is not implemented (DNS module removed)
     ms.not = if f.not { 1 } else { 0 };
     ms.outbound = lookup_outbound_id_for_ms(override_outbound)?;
     ms.must = if override_outbound.must { 1 } else { 0 };
@@ -1625,6 +1630,116 @@ fn domain_strings_to_patterns(patterns: &[String]) -> Vec<DomainPattern> {
             }
         })
         .collect()
+}
+
+// ============================================================================
+// DNS domain routing (derived from data-plane routing rules)
+// ============================================================================
+
+/// DNS 查询走向——由现有 routing 规则推导，DNS 模块自身**不**定义代理规则。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsOutbound {
+    /// 直连（系统 DNS / `dns.direct_dns_servers`）。
+    Direct,
+    /// 阻断（返回构造的错误应答）。
+    Block,
+    /// 走指定代理组（使用该组的拨号器转发 DNS 查询）。
+    Group(String),
+}
+
+/// 一条 DNS 域名路由：由 routing 规则里的 `domain(...)` / `target_domain(...)`
+/// 规则提取，复用 [`CompiledDomainSet`] 的匹配语义。
+#[derive(Debug, Clone)]
+pub struct DnsDomainRoute {
+    matcher: CompiledDomainSet,
+    outbound: DnsOutbound,
+}
+
+impl DnsDomainRoute {
+    /// 该域名是否命中本路由。
+    pub fn matches(&self, qname: &str) -> bool {
+        self.matcher.matches(qname)
+    }
+
+    /// 命中后的 DNS 走向。
+    pub fn outbound(&self) -> &DnsOutbound {
+        &self.outbound
+    }
+}
+
+/// 从 routing 配置构建 DNS 域名路由表。
+///
+/// 复用 [`NormalizedProgram`] 的解析与 [`CompiledDomainSet`] 的匹配语义：
+/// - 仅收集含 `domain(...)` / `target_domain(...)` 的规则；
+/// - `set:` 引用从 `rule_set_cache` 展开；
+/// - 规则顺序即优先级（与数据面一致，先定义先命中）。
+///
+/// DNS 查询阶段只有域名，无法评估 `dport`/`l4proto` 等其它维度；因此只把
+/// "能单靠域名判定" 的 domain 规则纳入 DNS 路由表，未命中的域名走
+/// `routing.fallback`。
+pub fn build_dns_domain_routes(
+    routing: &config::RoutingConfig,
+    rule_set_cache: Option<&RuleSetCache>,
+) -> Result<Vec<DnsDomainRoute>> {
+    let program = NormalizedProgram::from_config(routing)?;
+    let mut routes = Vec::new();
+
+    for rule in &program.rules {
+        let mut patterns: Vec<DomainPattern> = Vec::new();
+        let mut has_domain = false;
+
+        for func in &rule.and_functions {
+            if func.name != "domain" && func.name != "target_domain" {
+                continue;
+            }
+            has_domain = true;
+            for raw in &func.raw_params {
+                match parse_ref(raw) {
+                    RuleSetRef::Set(name) => {
+                        let cache = rule_set_cache.ok_or_else(|| {
+                            ruleset_data_missing(raw, "rule set memory cache not available")
+                        })?;
+                        let pats = cache.get_set_domains(&name).ok_or_else(|| {
+                            ruleset_data_missing(
+                                raw,
+                                "domain_list rule set not found or rule set type mismatch",
+                            )
+                        })?;
+                        patterns.extend(pats.iter().cloned());
+                    }
+                    RuleSetRef::Plain(v) => {
+                        patterns.extend(domain_strings_to_patterns(std::slice::from_ref(&v)));
+                    }
+                }
+            }
+        }
+
+        if !has_domain || patterns.is_empty() {
+            continue;
+        }
+
+        let outbound = match rule.outbound.name.as_str() {
+            "direct" => DnsOutbound::Direct,
+            "block" => DnsOutbound::Block,
+            name => DnsOutbound::Group(name.to_string()),
+        };
+        routes.push(DnsDomainRoute {
+            matcher: CompiledDomainSet::compile(&patterns),
+            outbound,
+        });
+    }
+
+    Ok(routes)
+}
+
+/// 将 `routing.fallback` 动作解析为 DNS 走向。
+pub fn dns_outbound_from_action(action: &str) -> Result<DnsOutbound> {
+    let outbound = Outbound::parse_action(action)?;
+    Ok(match outbound.name.as_str() {
+        "direct" => DnsOutbound::Direct,
+        "block" => DnsOutbound::Block,
+        name => DnsOutbound::Group(name.to_string()),
+    })
 }
 
 /// Build MatchSet entries for a single function invocation, assigning correct LPM/domain indices.

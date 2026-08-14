@@ -35,6 +35,8 @@ enum ParseState {
     Routing,
     /// Inside api section
     Api,
+    /// Inside dns section
+    Dns,
     // ── Rule set states ──
     /// Inside rule_set section
     RuleSet,
@@ -135,6 +137,7 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         "outbounds" => state = ParseState::Outbounds,
                         "routing" => state = ParseState::Routing,
                         "api" => state = ParseState::Api,
+                        "dns" => state = ParseState::Dns,
                         "rule_set" => state = ParseState::RuleSet,
                         _ => {
                             return Err(ConfigError::UnknownSection {
@@ -169,6 +172,34 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                         }
                         "log_level" => {
                             config.runtime.log_level = unquote(value).to_string();
+                        }
+                        "route_table" => {
+                            let table: u32 = value.parse().map_err(|_| ConfigError::FieldType {
+                                line: line_number,
+                                field: key.into(),
+                                message: format!("cannot parse as integer: '{}'", value),
+                            })?;
+                            config.runtime.route_table = table;
+                        }
+                        "fwmark_proxy" => {
+                            let mark = parse_hex_or_decimal(value, line_number, key)?;
+                            config.runtime.fwmark_proxy = mark;
+                        }
+                        "fwmark_bypass" => {
+                            let mark = parse_hex_or_decimal(value, line_number, key)?;
+                            config.runtime.fwmark_bypass = mark;
+                        }
+                        "fwmark_mask" => {
+                            let mark = parse_hex_or_decimal(value, line_number, key)?;
+                            config.runtime.fwmark_mask = mark;
+                        }
+                        "mtu" => {
+                            let mtu: u32 = value.parse().map_err(|_| ConfigError::FieldType {
+                                line: line_number,
+                                field: key.into(),
+                                message: format!("cannot parse as integer: '{}'", value),
+                            })?;
+                            config.runtime.mtu = mtu;
                         }
                         _ => {
                             return Err(ConfigError::Syntax {
@@ -685,6 +716,61 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
                 })?;
             }
 
+            // ── dns ──
+            ParseState::Dns => {
+                if line == "}" {
+                    state = ParseState::Top;
+                    continue;
+                }
+                let dns = config.dns.get_or_insert_with(DnsConfig::default);
+                parse_kv_pair(line, line_number, |key, value| {
+                    match key {
+                        "listen_addr" => {
+                            dns.listen_addr = unquote(value).to_string();
+                        }
+                        "proxy_dns_servers" => {
+                            dns.proxy_dns_servers = split_csv_list(value);
+                        }
+                        "proxy_domains" => {
+                            dns.proxy_domains = split_csv_list(value);
+                        }
+                        "direct_dns_servers" => {
+                            dns.direct_dns_servers = split_csv_list(value);
+                        }
+                        "direct_use_system_dns" => {
+                            dns.direct_use_system_dns =
+                                parse_bool(value).map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!(
+                                        "cannot parse as boolean: '{}'",
+                                        value
+                                    ),
+                                })?;
+                        }
+                        "query_timeout_ms" => {
+                            dns.query_timeout_ms = value
+                                .parse()
+                                .map_err(|_| ConfigError::FieldType {
+                                    line: line_number,
+                                    field: key.into(),
+                                    message: format!(
+                                        "cannot parse as integer: '{}'",
+                                        value
+                                    ),
+                                })?;
+                        }
+                        _ => {
+                            return Err(ConfigError::Syntax {
+                                line: line_number,
+                                message: format!("unknown dns field: '{}'", key),
+                            });
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+
             // ── rule_set (top-level) ──
             ParseState::RuleSet => {
                 if line == "}" {
@@ -831,6 +917,23 @@ pub fn parse_daefile(input: &str) -> Result<DaefileConfig> {
 // Parse Helper Functions
 // ============================================================================
 
+/// Parse a value as hexadecimal (0x prefix) or decimal
+fn parse_hex_or_decimal(value: &str, line_number: usize, key: &str) -> Result<u32> {
+    if value.starts_with("0x") || value.starts_with("0X") {
+        u32::from_str_radix(&value[2..], 16).map_err(|_| ConfigError::FieldType {
+            line: line_number,
+            field: key.into(),
+            message: format!("cannot parse as hex value: '{}'", value),
+        })
+    } else {
+        value.parse().map_err(|_| ConfigError::FieldType {
+            line: line_number,
+            field: key.into(),
+            message: format!("cannot parse as integer: '{}'", value),
+        })
+    }
+}
+
 /// Parse a key-value pair line `key: value`
 fn parse_kv_pair<F>(line: &str, line_number: usize, f: F) -> Result<()>
 where
@@ -852,6 +955,16 @@ where
             message: format!("expected `key: value` format, got: '{}'", line),
         })
     }
+}
+
+/// Split a comma-separated value into a list of strings (quotes stripped,
+/// empty entries dropped). Used for `dns.*` list fields.
+fn split_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| unquote(s.trim()).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Parse a map value of the form `{ "key1": "val1", "key2": "val2" }` into a HashMap.

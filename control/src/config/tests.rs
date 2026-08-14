@@ -1625,3 +1625,65 @@ b {
             assert_eq!(a, b, "rule set entry {} should roundtrip", a.name);
         }
     }
+
+    /// Minimal valid config (multi-line daefile) to which a `dns` section is appended.
+    const DNS_BASE: &str = "global {\n  tproxy_port: 15080\n}\n\
+        outbounds {\n  nodes {\n    n {\n      protocol: socks5\n      \
+        address: 127.0.0.1:1080\n    }\n  }\n  groups {\n    g {\n      nodes(n)\n    }\n  }\n}\n\
+        routing {\n  fallback: proxy(g)\n}";
+
+    #[test]
+    fn test_parse_dns_daefile() {
+        let text = format!(
+            "{}\ndns {{\n  listen_addr: 169.254.0.1:53\n  \
+             proxy_dns_servers: 8.8.8.8:53, 1.1.1.1:53\n  \
+             proxy_domains: google.com, youtube.com\n  \
+             direct_dns_servers: 223.5.5.5\n  \
+             direct_use_system_dns: false\n  \
+             query_timeout_ms: 3000\n}}",
+            DNS_BASE
+        );
+        let config = parse_daefile(&text).unwrap();
+        let dns = config.dns.as_ref().expect("dns section should parse");
+        assert_eq!(dns.listen_addr, "169.254.0.1:53");
+        assert_eq!(dns.proxy_dns_servers, vec!["8.8.8.8:53", "1.1.1.1:53"]);
+        assert_eq!(dns.proxy_domains, vec!["google.com", "youtube.com"]);
+        assert_eq!(dns.direct_dns_servers, vec!["223.5.5.5"]);
+        assert!(!dns.direct_use_system_dns);
+        assert_eq!(dns.query_timeout_ms, 3000);
+        // A valid DNS section must pass semantic validation
+        validate_config(&config).expect("dns config should validate");
+    }
+
+    #[test]
+    fn test_dns_json_roundtrip() {
+        let text = format!(
+            "{}\ndns {{\n  listen_addr: 169.254.0.1:53\n  \
+             proxy_dns_servers: 8.8.8.8\n  proxy_domains: example.com\n}}",
+            DNS_BASE
+        );
+        let config = parse_daefile(&text).unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: DaefileConfig = serde_json::from_str(&json).unwrap();
+        let dns = back.dns.as_ref().unwrap();
+        assert_eq!(dns.listen_addr, "169.254.0.1:53");
+        assert_eq!(dns.proxy_dns_servers, vec!["8.8.8.8"]);
+        assert_eq!(dns.proxy_domains, vec!["example.com"]);
+    }
+
+    #[test]
+    fn test_dns_validator_invalid() {
+        // Invalid listen_addr → E1203
+        let text = format!("{}\ndns {{\n  listen_addr: not-an-addr\n}}", DNS_BASE);
+        let cfg = parse_daefile(&text).unwrap();
+        assert!(validate_config(&cfg).is_err());
+
+        // proxy_domains configured but proxy_dns_servers empty → invalid
+        let text = format!(
+            "{}\ndns {{\n  listen_addr: 169.254.0.1:53\n  \
+             proxy_domains: google.com\n  proxy_dns_servers:\n}}",
+            DNS_BASE
+        );
+        let cfg = parse_daefile(&text).unwrap();
+        assert!(validate_config(&cfg).is_err());
+    }

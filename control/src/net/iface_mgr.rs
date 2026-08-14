@@ -199,6 +199,11 @@ impl InterfaceManager {
             );
             if let Err(e) = cb(&name) {
                 warn!("InterfaceManager: bind failed {}: {}", name, e);
+                // A failed bind must not be left tracked: forget it so the next
+                // poll can retry (the interface may not have been ready yet).
+                let mut tracked = self.tracked.lock().await;
+                tracked.remove(&name);
+                auto_bound.remove(&name);
             }
         }
 
@@ -325,6 +330,18 @@ impl InterfaceManager {
                     info!("InterfaceManager: bind {}", name);
                     if let Err(e) = cb(&name) {
                         warn!("InterfaceManager: bind failed {}: {}", name, e);
+                        // Forget the failed bind so the next scan retries it
+                        // (the interface may not have been ready yet).
+                        {
+                            let mut tracked_set = tracked.lock().await;
+                            tracked_set.remove(&name);
+                        }
+                        {
+                            let mut bindings_guard = bindings.lock().await;
+                            for binding in bindings_guard.iter_mut() {
+                                binding.auto_bound.remove(&name);
+                            }
+                        }
                     }
                 }
                 for (name, cb) in pending_unbinds {

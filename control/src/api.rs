@@ -241,7 +241,11 @@ struct AuthInfo {
 ///
 /// Call this function in every handler that requires authentication.
 /// If token is invalid, returns `ApiError::Unauthorized`.
+///
+/// Uses constant-time comparison to prevent timing side-channel attacks.
 fn verify_auth(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
+    use subtle::ConstantTimeEq;
+
     let auth_header = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -251,7 +255,9 @@ fn verify_auth(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
         .strip_prefix("Bearer ")
         .ok_or(ApiError::Unauthorized)?;
 
-    if token != state.config.token {
+    // Constant-time comparison to prevent timing attacks
+    let valid = token.as_bytes().ct_eq(state.config.token.as_bytes());
+    if !bool::from(valid) {
         return Err(ApiError::Unauthorized);
     }
 
@@ -880,6 +886,8 @@ async fn routing_handler(
 ///
 /// Trigger configuration hot-reload. Re-parse daefile, atomically replace JSON configuration,
 /// without interrupting existing connections. Returns `500` on failure, original config continues running.
+///
+/// Uses `spawn_blocking` to avoid holding the write lock during CPU-intensive work.
 async fn reload_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -889,20 +897,39 @@ async fn reload_handler(
     // Verify authentication
     verify_auth(api_state, &headers)?;
 
-    let mut control = api_state.control.write().await;
+    // Read the stored daefile content outside the blocking reload so the
+    // control-plane lock isn't held while doing CPU-bound work.
+    let content = {
+        let control = api_state.control.read().await;
+        control
+            .daefile_content
+            .clone()
+            .ok_or_else(|| ApiError::Internal("No daefile content available for reload".into()))?
+    };
 
-    // Get daefile content (clone to release the immutable borrow)
-    let content = control
-        .daefile_content
-        .clone()
-        .ok_or_else(|| ApiError::Internal("No daefile content available for reload".into()))?;
+    // `reload_config` is CPU-heavy (config re-parse, rule compilation and
+    // eBPF map writes). Run it on a dedicated blocking thread so the async
+    // worker isn't stalled. The write lock is acquired only inside the
+    // blocking thread, right before the map-updating operations, keeping
+    // the critical section short.
+    let control = api_state.control.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut ctrl = control.blocking_write();
+        ctrl.reload_config(&content)
+    })
+    .await;
 
-    // Use the new hot-reload method
-    control
-        .reload_config(&content)
-        .map_err(|e| ApiError::Internal(format!("Config reload failed: {}", e)))?;
-
-    info!("Config reload completed successfully via API");
+    match result {
+        Ok(Ok(())) => {
+            info!("Config reload completed successfully via API");
+        }
+        Ok(Err(e)) => {
+            return Err(ApiError::Internal(format!("Config reload failed: {}", e)));
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!("Reload task failed: {}", e)));
+        }
+    }
 
     let config_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

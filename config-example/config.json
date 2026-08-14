@@ -233,5 +233,20 @@
       }
     ],
     "fallback": "proxy(proxy_primary)"
+  },
+  "dns": {
+    "listen_addr": "169.254.0.1:53",
+    "proxy_dns_servers": [
+      "8.8.8.8:53",
+      "1.1.1.1:53"
+    ],
+    "proxy_domains": [
+      "google.com",
+      "youtube.com",
+      "github.com"
+    ],
+    "direct_dns_servers": [],
+    "direct_use_system_dns": true,
+    "query_timeout_ms": 5000
   }
 }

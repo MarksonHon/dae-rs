@@ -283,6 +283,14 @@ pub struct DaefileConfig {
     /// API configuration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
+    /// Internal DNS forwarder configuration (default: disabled).
+    ///
+    /// When set, a user-space DNS forwarder listens on an internal address
+    /// (default `169.254.0.1:53`) and forwards queries by domain rules:
+    /// proxied domains use `proxy_dns_servers` through the proxy, other domains
+    /// are resolved directly via system DNS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsConfig>,
     /// Rule set configuration (design §5).
     ///
     /// - daefile: top-level `rule_set { <name> { ... } }` block;
@@ -304,6 +312,7 @@ impl Default for DaefileConfig {
             outbounds: OutboundsConfig::default(),
             routing: RoutingConfig::default(),
             api: None,
+            dns: None,
             rule_set: Vec::new(),
         }
     }
@@ -383,6 +392,21 @@ pub struct RuntimeConfig {
     /// Whether to generate a temp JSON file
     #[serde(default = "default_true")]
     pub temp_json: bool,
+    /// Policy routing table ID (1-2^31-1)
+    #[serde(default = "default_route_table")]
+    pub route_table: u32,
+    /// Socket mark for proxied traffic
+    #[serde(default = "default_fwmark_proxy")]
+    pub fwmark_proxy: u32,
+    /// Socket mark for bypassed traffic
+    #[serde(default = "default_fwmark_bypass")]
+    pub fwmark_bypass: u32,
+    /// Socket mark mask
+    #[serde(default = "default_fwmark_mask")]
+    pub fwmark_mask: u32,
+    /// Network interface MTU
+    #[serde(default = "default_mtu")]
+    pub mtu: u32,
 }
 
 impl Default for RuntimeConfig {
@@ -391,12 +415,95 @@ impl Default for RuntimeConfig {
             tproxy_port: 15080,
             log_level: "info".into(),
             temp_json: true,
+            route_table: 2023,
+            fwmark_proxy: 0x08000000,
+            fwmark_bypass: 0x04000000,
+            fwmark_mask: 0x08000000,
+            mtu: 1500,
         }
     }
 }
 
+fn default_route_table() -> u32 {
+    2023
+}
+
+fn default_fwmark_proxy() -> u32 {
+    0x08000000
+}
+
+fn default_fwmark_bypass() -> u32 {
+    0x04000000
+}
+
+fn default_fwmark_mask() -> u32 {
+    0x08000000
+}
+
+fn default_mtu() -> u32 {
+    1500
+}
+
 fn default_true() -> bool {
     true
+}
+
+/// DNS forwarder configuration (dae 内部 DNS 转发器，默认关闭)。
+///
+/// 纯用户空间转发器。**DNS 自身不定义代理规则**：一个查询走哪个代理组
+/// （或直连/阻断）由现有 `routing` 规则的 `domain(...)` / `target_domain(...)`
+/// 推导——域名命中哪个组的代理规则，查询就走哪个组。
+///
+/// - `proxy_dns_servers`：走代理的查询统一使用的上游 DNS（取第一个）；
+/// - `direct_dns_servers`：直连查询使用的上游（为空则回退系统 `/etc/resolv.conf`）；
+/// - 每个代理组（含直连）独立维护 DNS 缓存，遵循响应 TTL。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(clippy::struct_excessive_bools)]
+pub struct DnsConfig {
+    /// 监听地址（仅 dae 内部，不对外暴露）。
+    #[serde(default = "default_dns_listen")]
+    pub listen_addr: String,
+    /// 走代理的查询使用的上游 DNS 服务器（`ip:port`，取第一个）。
+    #[serde(default = "default_proxy_dns_servers")]
+    pub proxy_dns_servers: Vec<String>,
+    /// 直连查询使用的 DNS 服务器（`ip:port`）；为空时回退系统 `/etc/resolv.conf`。
+    #[serde(default)]
+    pub direct_dns_servers: Vec<String>,
+    /// 直连查询是否回退到系统 DNS（默认 true）。
+    #[serde(default = "default_true")]
+    pub direct_use_system_dns: bool,
+    /// 上游查询超时（毫秒）。
+    #[serde(default = "default_dns_timeout_ms")]
+    pub query_timeout_ms: u64,
+    /// 是否启用按组隔离的 TTL DNS 缓存（默认 true）。
+    #[serde(default = "default_true")]
+    pub enable_cache: bool,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "169.254.0.1:53".into(),
+            proxy_dns_servers: vec!["8.8.8.8:53".into(), "1.1.1.1:53".into()],
+            direct_dns_servers: Vec::new(),
+            direct_use_system_dns: true,
+            query_timeout_ms: 5000,
+            enable_cache: true,
+        }
+    }
+}
+
+fn default_dns_listen() -> String {
+    "169.254.0.1:53".into()
+}
+
+fn default_proxy_dns_servers() -> Vec<String> {
+    vec!["8.8.8.8:53".into(), "1.1.1.1:53".into()]
+}
+
+fn default_dns_timeout_ms() -> u64 {
+    5000
 }
 
 /// Network interface configuration

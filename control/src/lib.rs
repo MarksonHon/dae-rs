@@ -996,7 +996,7 @@ impl ControlPlane {
             // Write MatchSet entries to routing_map
             if !compiled.match_sets.is_empty() {
                 let write_start = std::time::Instant::now();
-                self.ebpf().write_routing_rules(&compiled.match_sets, init_slot)?;
+                self.ebpf().write_routing_rules(compiled.match_sets.as_slice(), init_slot)?;
                 info!(
                     "Wrote {} MatchSet entries to routing_map slot {} ({}ms)",
                     compiled.match_sets.len(),
@@ -2475,7 +2475,7 @@ impl ControlPlane {
 
                 // Write new rules to the NEXT slot
                 if !compiled.match_sets.is_empty() {
-                    ebpf.write_routing_rules(&compiled.match_sets, next_slot)?;
+                    ebpf.write_routing_rules(compiled.match_sets.as_slice(), next_slot)?;
                     info!(
                         "Hot-reload: wrote {} match sets to routing_map slot {}",
                         compiled.match_sets.len(),

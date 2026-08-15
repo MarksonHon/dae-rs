@@ -13,6 +13,7 @@ use bytemuck::Zeroable;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config;
@@ -21,7 +22,7 @@ use crate::net::ebpf::{match_type, outbound};
 use crate::net::ebpf::{CidrEntry, LpmKey, MatchSet, MatchSetValue, PortRange};
 use crate::ruleset::cache::RuleSetCache;
 use crate::ruleset::compiled::{CompiledDomainSet, CompiledIpSet};
-use crate::ruleset::refparse::{domain_pattern_to_string, parse_ref, RuleSetRef};
+use crate::ruleset::refparse::{parse_ref, RuleSetRef};
 use crate::ruleset::types::{DomainPattern, DomainPatternType};
 
 // ============================================================================
@@ -1095,12 +1096,17 @@ fn find_or_create_lpm_trie(
 
 /// Compiled routing rules ready to be written to eBPF maps.
 pub struct CompiledRouting {
-    /// MatchSet entries for routing_map
-    pub match_sets: Vec<MatchSet>,
+    /// MatchSet entries for routing_map (shared with [`RoutingMatcher`] via `Arc`).
+    pub match_sets: Arc<Vec<MatchSet>>,
     /// LPM trie data: index -> list of CIDR prefixes
     pub lpm_tries: Vec<Vec<ipnet::IpNet>>,
-    /// Domain routing data: rule_index -> list of domain suffixes/patterns
-    pub domain_sets: Vec<Vec<String>>,
+    /// Domain routing data: rule_index -> compiled domain matcher.
+    ///
+    /// Compiled **once** here (a single suffix-trie build per rule) and shared with
+    /// [`RoutingMatcher`] through the `Arc`. Previously the patterns were
+    /// round-tripped through `Vec<String>` and re-compiled (a second trie build)
+    /// in `from_compiled`, duplicating every domain string in memory.
+    pub domain_sets: Vec<Arc<CompiledDomainSet>>,
     /// Fallback outbound ID
     pub fallback_outbound: u8,
     /// Fallback mark value
@@ -1175,7 +1181,7 @@ pub fn compile_rules(
     // find_or_create_lpm_trie, avoiding a separate function-dispatch pass.
     let mut lpm_tries: Vec<Vec<ipnet::IpNet>> = Vec::new();
     let mut lpm_dedup: HashMap<u64, usize> = HashMap::new();
-    let mut domain_sets: Vec<Vec<String>> = Vec::new();
+    let mut domain_sets: Vec<Arc<CompiledDomainSet>> = Vec::new();
     let mut final_match_sets: Vec<MatchSet> = Vec::new();
 
     // ── Step 3.5: Create LPM trie for proxy server IPs ──
@@ -1206,7 +1212,7 @@ pub fn compile_rules(
     for rule in &program.rules {
         for func in &rule.and_functions {
             if func.name.as_str() == "domain" || func.name.as_str() == "target_domain" {
-                let mut patterns: Vec<String> = Vec::new();
+                let mut patterns: Vec<DomainPattern> = Vec::new();
                 for raw in &func.raw_params {
                     match parse_ref(raw) {
                         RuleSetRef::Set(name) => {
@@ -1219,15 +1225,19 @@ pub fn compile_rules(
                                     "domain_list rule set not found or rule set type mismatch",
                                 )
                             })?;
-                            patterns.extend(pats.iter().map(domain_pattern_to_string));
+                            // Clone the shared `Arc<Vec<DomainPattern>>` entries instead of
+                            // serializing each pattern to a String (avoids a duplicate copy).
+                            patterns.extend(pats.iter().cloned());
                         }
                         RuleSetRef::Plain(v) => {
-                            // Plain domain pattern: keep the key prefix (suffix:/keyword:/full:/regex:/domain: or bare value)
-                            patterns.push(v.to_string());
+                            // Plain domain pattern: parse the key prefix
+                            // (suffix:/keyword:/full:/regex:/domain: or bare value)
+                            // directly into a DomainPattern — no String round-trip.
+                            patterns.extend(domain_strings_to_patterns(std::slice::from_ref(&v)));
                         }
                     }
                 }
-                domain_sets.push(patterns);
+                domain_sets.push(Arc::new(CompiledDomainSet::compile(&patterns)));
             }
         }
     }
@@ -1381,7 +1391,7 @@ pub fn compile_rules(
     );
 
     Ok(CompiledRouting {
-        match_sets: final_match_sets,
+        match_sets: Arc::new(final_match_sets),
         lpm_tries,
         domain_sets,
         fallback_outbound: fallback_id,
@@ -1421,12 +1431,15 @@ pub struct RoutingResult {
 /// using LPM tries (IP matching) and domain suffix matching.
 /// Used for DNS response processing, diagnostics, and fallback routing.
 pub struct RoutingMatcher {
-    /// MatchSet entries (same order as written to routing_map).
-    match_sets: Vec<MatchSet>,
+    /// MatchSet entries (same order as written to routing_map), shared with
+    /// [`CompiledRouting`] via `Arc` so both sides hold the same allocation.
+    match_sets: Arc<Vec<MatchSet>>,
     /// Compiled LPM trie data: index -> compiled IP set (O(log N) lookups).
     compiled_lpm: Vec<CompiledIpSet>,
     /// Compiled domain set data: rule_index -> compiled domain matcher.
-    compiled_domains: Vec<CompiledDomainSet>,
+    /// Shares the compiled sets with `CompiledRouting` (Arc clone) so the
+    /// suffix trie is built exactly once per rule.
+    compiled_domains: Vec<Arc<CompiledDomainSet>>,
     /// Fallback outbound.
     fallback_outbound: u8,
     fallback_mark: u32,
@@ -1441,17 +1454,15 @@ impl RoutingMatcher {
     /// instead of a linear scan over every CIDR / pattern on each evaluation.
     pub fn from_compiled(compiled: &CompiledRouting) -> Self {
         Self {
+            // Arc clones — both sides share the same MatchSet / domain-set
+            // allocations (no deep copy, no duplicate trie build).
             match_sets: compiled.match_sets.clone(),
             compiled_lpm: compiled
                 .lpm_tries
                 .iter()
                 .map(|nets| CompiledIpSet::compile(nets))
                 .collect(),
-            compiled_domains: compiled
-                .domain_sets
-                .iter()
-                .map(|pats| CompiledDomainSet::compile(&domain_strings_to_patterns(pats)))
-                .collect(),
+            compiled_domains: compiled.domain_sets.clone(),
             fallback_outbound: compiled.fallback_outbound,
             fallback_mark: compiled.fallback_mark,
             fallback_must: compiled.fallback_must != 0,
@@ -1784,7 +1795,7 @@ fn build_match_set_for_function(
     ov_outbound: &Outbound,
     lpm_tries: &mut Vec<Vec<ipnet::IpNet>>,
     lpm_dedup: &mut HashMap<u64, usize>,
-    #[allow(unused)] domain_sets: &[Vec<String>],
+    #[allow(unused)] domain_sets: &[Arc<CompiledDomainSet>],
     rule_domain_idx: &mut usize,
     rule_set_cache: Option<&RuleSetCache>,
 ) -> Result<Vec<MatchSet>> {
@@ -2327,8 +2338,11 @@ mod tests {
         assert_eq!(compiled.match_sets.len(), 2);
         assert_eq!(compiled.match_sets[0].r#type, match_type::DOMAIN_SET);
         assert_eq!(compiled.domain_sets.len(), 1);
-        // Keep the key prefix to support suffix/full/regex/domain semantics (no longer degraded to a bare suffix)
-        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com"]);
+        // suffix:baidu.com semantics preserved: matches the apex and any subdomain.
+        let ds = &compiled.domain_sets[0];
+        assert!(ds.matches("baidu.com"));
+        assert!(ds.matches("www.baidu.com"));
+        assert!(!ds.matches("notbaidu.com"));
     }
 
     #[test]
@@ -2761,7 +2775,15 @@ mod tests {
         let compiled = compile_rules(&routing, &outbounds, &[], Some(&cache)).unwrap();
 
         assert_eq!(compiled.domain_sets.len(), 1);
-        assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com", "full:google.cn", "suffix:example.cn"]);
+        // suffix:/full:/suffix: semantics preserved: suffix matches apex+subdomains,
+        // full matches only the exact name.
+        let ds = &compiled.domain_sets[0];
+        assert!(ds.matches("baidu.com"));
+        assert!(ds.matches("www.baidu.com"));
+        assert!(ds.matches("google.cn"));
+        assert!(!ds.matches("www.google.cn"));
+        assert!(ds.matches("example.cn"));
+        assert!(ds.matches("a.example.cn"));
 
         // Userspace evaluation verification
         let matcher = RoutingMatcher::from_compiled(&compiled);

@@ -160,13 +160,17 @@ fn contains_in_ranges<T: Copy + Ord>(ranges: &[(T, T)], ip: T) -> bool {
 
 /// Reverse-label suffix trie node (index-based children, HashMap lookup).
 ///
-/// Children use `HashMap<String, u32>` instead of a linear `Vec` scan:
+/// Children use `HashMap<Box<str>, u32>` instead of a linear `Vec` scan:
 /// inserting a large domain list (e.g. ~100k+ geosite entries) through a linear
 /// scan is O(n²) — seconds per startup — whereas HashMap lookup keeps both
 /// insert and query at O(labels). Measured ~50-100x faster on real-size lists.
+///
+/// `Box<str>` (single fat pointer, no spare capacity) is used over `String`
+/// (ptr + len + capacity) to save 8 bytes per trie node — meaningful with tens
+/// of thousands of label nodes.
 #[derive(Debug, Clone, Default)]
 struct SuffixTrieNode {
-    children: HashMap<String, u32>,
+    children: HashMap<Box<str>, u32>,
     terminal: bool,
 }
 
@@ -191,7 +195,11 @@ impl SuffixTrie {
                 None => {
                     let idx = self.nodes.len() as u32;
                     self.nodes.push(SuffixTrieNode::default());
-                    self.nodes[node].children.insert(label.to_string(), idx);
+                    // `Box<str>` drops the spare capacity a String would keep.
+                    // `get(label)` above still works because `Box<str>: Borrow<str>`.
+                    self.nodes[node]
+                        .children
+                        .insert(label.to_string().into_boxed_str(), idx);
                     idx as usize
                 }
             };
@@ -440,8 +448,7 @@ pub fn load_rule_set_data_cached(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use crate::ruleset::refparse::{match_domain_pattern, match_domain_patterns};
-    use std::collections::HashMap;
+    use crate::ruleset::refparse::match_domain_patterns;
 
     // ── CompiledIpSet ──
 

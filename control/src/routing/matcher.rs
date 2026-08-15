@@ -13,7 +13,7 @@ use bytemuck::Zeroable;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config;
 use crate::config::ConfigError;
@@ -1281,23 +1281,41 @@ pub fn compile_rules(
     }
 
     // ── Step 4: Prepend proxy server auto-direct rules ──
-    // Insert `dip(<proxy_server_ip>) -> direct` at the FRONT of the match set list,
-    // so they are evaluated BEFORE any user-defined rules.
-    // This prevents traffic destined for proxy servers from being re-proxied,
-    // which would create a loop: eBPF intercepts → TProxy → proxy server → eBPF intercepts again.
+    // Insert `dip(<proxy_server_ip>) && !dport(53) -> direct` at the FRONT of the
+    // match set list, so they are evaluated BEFORE any user-defined rules.
+    //
+    // Rationale:
+    // - 目标为代理服务器 IP 的流量直接放行（防自环：eBPF 拦截 → TProxy →
+    //   代理服务器 → eBPF 再次拦截）。
+    // - 但 **dport 53（DNS 查询）不 bypass**：系统 DNS nameserver 常与代理服务器
+    //   同机/同网段（如 192.168.12.1 既是代理也是 resolv.conf nameserver），
+    //   若被 auto-direct 放行，透明 DNS 拦截会失效（查询直连网关，dae-rs 的
+    //   DNS 模块收不到）。因此 DNS 走正常路由（fallback → 代理 → 进 daens →
+    //   DNS 模块接管）。
     if let Some(proxy_idx) = proxy_lpm_index {
-        let mut ms = MatchSet::zeroed();
-        ms.r#type = match_type::IP_SET;
-        ms.value.index = proxy_idx as u32;
-        ms.not = 0;
-        ms.outbound = outbound::DIRECT;
-        ms.must = 0;
-        ms.mark = 0;
-        final_match_sets.insert(0, ms);
+        // subrule 1: dip ∈ proxy_lpm（命中代理服务器 IP）
+        let mut ip_ms = MatchSet::zeroed();
+        ip_ms.r#type = match_type::IP_SET;
+        ip_ms.value.index = proxy_idx as u32;
+        ip_ms.not = 0;
+        ip_ms.outbound = outbound::LOGICAL_AND; // 与下一 subrule AND
+        ip_ms.must = 0;
+        ip_ms.mark = 0;
+
+        // subrule 2: dport != 53（排除 DNS）
+        let mut port_ms = MatchSet::zeroed();
+        port_ms.r#type = match_type::PORT;
+        port_ms.value.port_range = PortRange { port_start: 53, port_end: 53 };
+        port_ms.not = 1; // not=1 → 端口为 53 时该 subrule 判负（不 bypass）
+        port_ms.outbound = outbound::DIRECT; // 规则尾部，动作 direct
+        port_ms.must = 0;
+        port_ms.mark = 0;
+
+        final_match_sets.splice(0..0, [ip_ms, port_ms]);
         info!(
             proxy_ips = proxy_cidrs.len(),
             lpm_index = proxy_idx,
-            "Auto-added direct rule for proxy server IPs",
+            "Auto-added direct rule for proxy server IPs (excluding dport 53/DNS)",
         );
     }
 
@@ -1687,6 +1705,9 @@ pub fn build_dns_domain_routes(
     for rule in &program.rules {
         let mut patterns: Vec<DomainPattern> = Vec::new();
         let mut has_domain = false;
+        // 规则集缺失时跳过整条规则（降级），而不是让数据面启动失败：
+        // 未命中的域名会走 fallback，避免"一个 set: 下载失败 → 整个 TProxy 起不来"。
+        let mut skip_rule = false;
 
         for func in &rule.and_functions {
             if func.name != "domain" && func.name != "target_domain" {
@@ -1696,25 +1717,37 @@ pub fn build_dns_domain_routes(
             for raw in &func.raw_params {
                 match parse_ref(raw) {
                     RuleSetRef::Set(name) => {
-                        let cache = rule_set_cache.ok_or_else(|| {
-                            ruleset_data_missing(raw, "rule set memory cache not available")
-                        })?;
-                        let pats = cache.get_set_domains(&name).ok_or_else(|| {
-                            ruleset_data_missing(
-                                raw,
-                                "domain_list rule set not found or rule set type mismatch",
-                            )
-                        })?;
-                        patterns.extend(pats.iter().cloned());
+                        let Some(cache) = rule_set_cache else {
+                            warn!(
+                                set = %name,
+                                "DNS route: rule set memory cache unavailable, skipping rule (fallback applies)"
+                            );
+                            skip_rule = true;
+                            break;
+                        };
+                        match cache.get_set_domains(&name) {
+                            Some(pats) => patterns.extend(pats.iter().cloned()),
+                            None => {
+                                warn!(
+                                    set = %name,
+                                    "DNS route: domain_list rule set not loaded, skipping rule (fallback applies)"
+                                );
+                                skip_rule = true;
+                                break;
+                            }
+                        }
                     }
                     RuleSetRef::Plain(v) => {
                         patterns.extend(domain_strings_to_patterns(std::slice::from_ref(&v)));
                     }
                 }
             }
+            if skip_rule {
+                break;
+            }
         }
 
-        if !has_domain || patterns.is_empty() {
+        if skip_rule || !has_domain || patterns.is_empty() {
             continue;
         }
 
@@ -2296,6 +2329,34 @@ mod tests {
         assert_eq!(compiled.domain_sets.len(), 1);
         // Keep the key prefix to support suffix/full/regex/domain semantics (no longer degraded to a bare suffix)
         assert_eq!(compiled.domain_sets[0], vec!["suffix:baidu.com"]);
+    }
+
+    #[test]
+    fn test_auto_direct_rule_excludes_dns_port() {
+        // 代理服务器 IP 的 auto-direct 必须排除 dport 53：否则系统 DNS nameserver
+        // 若与代理服务器同地址（如 192.168.12.1），DNS 查询会被直连放行，
+        // 透明 DNS 拦截失效。
+        let mut routing = config::RoutingConfig::default();
+        routing.rules.push(config::RouteRule {
+            r#match: "dport(22)".to_string(),
+            action: "direct".to_string(),
+        });
+        let outbounds = config::OutboundsConfig::default();
+        let proxy_ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 12, 1))];
+        let compiled = compile_rules(&routing, &outbounds, &proxy_ips, None).unwrap();
+
+        // 最前两条：dip(proxy) && !dport(53) -> direct
+        //   match_sets[0] = IP_SET(proxy_lpm), outbound=LOGICAL_AND
+        //   match_sets[1] = PORT(53) not=1, outbound=DIRECT
+        assert_eq!(compiled.match_sets[0].r#type, match_type::IP_SET);
+        assert_eq!(compiled.match_sets[0].not, 0);
+        assert_eq!(compiled.match_sets[0].outbound, outbound::LOGICAL_AND);
+        assert_eq!(compiled.match_sets[1].r#type, match_type::PORT);
+        assert_eq!(compiled.match_sets[1].not, 1);
+        let range = unsafe { compiled.match_sets[1].value.port_range };
+        assert_eq!(range.port_start, 53);
+        assert_eq!(range.port_end, 53);
+        assert_eq!(compiled.match_sets[1].outbound, outbound::DIRECT);
     }
 
     #[test]

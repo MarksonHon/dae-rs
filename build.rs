@@ -36,21 +36,26 @@ fn main() {
     let llvm_strip = env::var("LLVM_STRIP").unwrap_or_else(|_| "llvm-strip".to_string());
     let max_match_set_len =
         env::var("MAX_MATCH_SET_LEN").unwrap_or_else(|_| "1024".to_string());
+    // Build with per-packet debug counters when DEBUG_COUNTERS=1 (off by default).
+    let debug_counters =
+        env::var("DEBUG_COUNTERS").unwrap_or_else(|_| "0".to_string()) == "1";
 
     // Re-run the build when these environment variables change.
     println!("cargo:rerun-if-env-changed=CLANG");
     println!("cargo:rerun-if-env-changed=LLVM_STRIP");
     println!("cargo:rerun-if-env-changed=MAX_MATCH_SET_LEN");
+    println!("cargo:rerun-if-env-changed=DEBUG_COUNTERS");
 
     // Compile tproxy.c → ebpf.o
-    let cflags = [
+    let max_match_set_len_flag = format!("-DMAX_MATCH_SET_LEN={}", max_match_set_len);
+    let mut cflags = vec![
         "-O2",
         "-Wall",
         "-Werror",
         "-target",
         "bpf",
         "-g",
-        &format!("-DMAX_MATCH_SET_LEN={}", max_match_set_len),
+        max_match_set_len_flag.as_str(),
         "-I",
         headers_dir.to_str().unwrap(),
         "-I",
@@ -60,6 +65,9 @@ fn main() {
         "-o",
         output_obj.to_str().unwrap(),
     ];
+    if debug_counters {
+        cflags.push("-DDEBUG_COUNTERS");
+    }
 
     println!(
         "cargo:warning=Compiling eBPF: {} {}",

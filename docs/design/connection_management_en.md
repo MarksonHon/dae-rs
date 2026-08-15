@@ -115,7 +115,8 @@ goroutine/task indefinitely. Reference (kdae): `armWriteDeadline()` resets a
 ### 3.6 Others
 
 - `RespSocketPool` eviction (LRU, cap 256) drops a socket with no log.
-- DNS-over-TCP hijack uses a hard-coded 5 s timeout.
+- The DNS-over-TCP hijack module was removed with the DNS refactor (DNS is
+  treated as ordinary traffic); there is no such timeout anymore.
 - `UdpConnStateTracker` already implements retain/release two-phase cleanup,
   which is functionally equivalent to kdae's "pinned" concept.
 
@@ -148,7 +149,7 @@ goroutine/task indefinitely. Reference (kdae): `armWriteDeadline()` resets a
 |---|--------|------|
 | 5 | Log LRU eviction in `RespSocketPool` (warn on evict) | `tproxy.rs` |
 | 6 | Add third janitor cadence tier (30 s max backoff) | `lib.rs` |
-| 7 | Make DNS-over-TCP hijack timeout configurable | `tproxy.rs` |
+| 7 | ~~Make DNS-over-TCP hijack timeout configurable~~ (DNS hijack module removed, no longer applicable) | — |
 
 ## 6. Implementation Details
 

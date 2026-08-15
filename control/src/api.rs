@@ -444,8 +444,8 @@ async fn status_handler(
 
     let mut programs = Vec::new();
     if tc_attached {
-        programs.push("tc_ingress".to_string());
-        programs.push("tc_egress".to_string());
+        programs.push("tcx_ingress".to_string());
+        programs.push("tcx_egress".to_string());
     }
 
     let netns_status = if control.netns_mgr.is_created() {
@@ -482,10 +482,8 @@ async fn metrics_handler(
     let control = api_state.control.write().await;
 
     // Read metrics from eBPF STATS_MAP, return zero values if eBPF not loaded
-    let stats = control
-        .ebpf_mgr
-        .lock()
-        .unwrap()
+    let mut ebpf = control.ebpf_mgr.lock().unwrap();
+    let stats = ebpf
         .read_stats()
         .unwrap_or([0u64; crate::net::ebpf::STATS_MAP_SIZE as usize]);
 
@@ -498,7 +496,7 @@ async fn metrics_handler(
         proxy_decisions: 0,    // tproxy.c tracks overflow, not per-decision stats
         bypass_count: 0,       // tproxy.c tracks overflow, not per-decision stats
         conntrack_hits: 0,     // tproxy.c tracks overflow, not per-decision stats
-        active_connections: 0, // TODO: count from conn_state_map
+        active_connections: ebpf.active_connection_count(),
     }))
 }
 

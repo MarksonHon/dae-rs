@@ -29,3 +29,19 @@ Linux 高性能透明代理解决方案。
   · [`docs/config/config_en.md`](./docs/config/config_en.md)
 - 路由子系统设计：[`docs/design/routing_zh_hans.md`](./docs/design/routing_zh_hans.md)
   · [`docs/design/routing_en.md`](./docs/design/routing_en.md)
+
+## 环境要求
+
+- **Linux 内核 ≥ 6.6**（必需）：数据面通过 **TCX**（`BPF_LINK_TYPE_TCX`）
+  挂载 eBPF 程序，无传统 TC 回退；内核过旧会直接启动失败。
+- **root** 权限（创建网络命名空间、挂载 eBPF 程序、配置接口）；
+  构建 eBPF 对象需要 `clang` / `llvm-strip`。
+- 支持的代理后端：SOCKS5、Shadowsocks、Trojan、VMess、TUIC、Juicity。
+
+## DNS
+
+dae-rs 内置纯用户空间 **DNS 转发器**（替代已移除的 eBPF DNS 劫持）：53 端口
+查询仍被 TProxy 当作普通 UDP 拦截，再按现有 `routing` 规则的
+`domain` / `target_domain` 进行域名分流（代理组 / 直连 / 阻断）。每个组
+独立 TTL 缓存，并复用持久 UDP 中继会话。详见
+[`docs/config/config_zh_hans.md`](./docs/config/config_zh_hans.md) 的 `dns` 节。

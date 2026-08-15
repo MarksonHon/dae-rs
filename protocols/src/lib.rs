@@ -344,6 +344,16 @@ pub trait OutboundDialer: Send + Sync {
     /// Return the upstream proxy server address this dialer connects to.
     fn proxy_addr(&self) -> SocketAddr;
 
+    /// Whether this dialer speaks plain SOCKS5 on `proxy_addr()`.
+    ///
+    /// Consumers that only know how to do a SOCKS5 handshake (e.g. the
+    /// rule-set downloader) must check this before using `proxy_addr()` as a
+    /// SOCKS5 endpoint: for TUIC/vmess/trojan/shadowsocks/juicity the address
+    /// is the *protocol* server address, not a SOCKS5 proxy.
+    fn is_socks5(&self) -> bool {
+        false
+    }
+
     /// Downcast support (e.g. for the SOCKS5-only UDP relay path).
     fn as_any(&self) -> &dyn std::any::Any;
 }

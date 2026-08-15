@@ -28,6 +28,8 @@ anyhow = "1"
 tracing = "0.1"
 futures = "0.3"
 fastrand = "2"
+# GroupDialer (group.rs) and DNS forwarder tests implement OutboundDialer / UdpSession
+async-trait = "0.1"
 socket2 = { version = "0.5", features = ["all"] }
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
@@ -57,6 +59,7 @@ libbpf-cargo = "0.24"
 
 [dev-dependencies]
 tower = "0.5"
+bytes = "1"
 # Rule-set storage/download unit tests use a temporary directory
 tempfile = "3"
 # Rule-set scheduler tests: paused time (start_paused / tokio::time::advance)

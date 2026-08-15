@@ -31,3 +31,21 @@ This project is licensed under the **GNU Affero General Public License v3.0
   · [`docs/config/config_zh_hans.md`](./docs/config/config_zh_hans.md)
 - Routing subsystem design: [`docs/design/routing_en.md`](./docs/design/routing_en.md)
   · [`docs/design/routing_zh_hans.md`](./docs/design/routing_zh_hans.md)
+
+## Requirements
+
+- **Linux kernel >= 6.6** (required): the data plane attaches its eBPF programs
+  via **TCX** (`BPF_LINK_TYPE_TCX`). There is no classic-TC fallback — startup
+  aborts on older kernels.
+- **root** privileges (creating network namespaces, attaching eBPF programs,
+  configuring interfaces), plus `clang` / `llvm-strip` to build the eBPF object.
+- A supported proxy backend: SOCKS5, Shadowsocks, Trojan, VMess, TUIC, Juicity.
+
+## DNS
+
+dae-rs ships a userspace **DNS forwarder** (replacing the removed eBPF DNS
+hijack): port-53 queries are still intercepted as ordinary UDP by TProxy, then
+split by domain using the existing `routing` rules (`domain` / `target_domain`
+→ proxy group / direct / block). Each group keeps its own TTL cache and
+persistent UDP relay sessions. See
+[`docs/config/config_en.md`](./docs/config/config_en.md) for the `dns` section.

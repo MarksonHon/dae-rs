@@ -30,10 +30,11 @@
 //! ```
 
 use crate::config::DnsConfig;
+use crate::group::GroupDialer;
 use crate::routing::matcher::{DnsDomainRoute, DnsOutbound};
 use anyhow::{Context, Result};
 use protocols::hostns::{with_host_ns, DirectSocket};
-use protocols::OutboundDialer;
+use protocols::{OutboundDialer, UdpSession};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -156,6 +157,12 @@ pub struct DnsForwarder {
     host_ns_fd: Option<RawFd>,
     /// 每组（含 direct）独立 DNS 缓存：outbound key → cache。
     caches: Mutex<HashMap<String, Arc<Mutex<DnsCache>>>>,
+    /// 每个代理组的持久 UDP 会话（组名 → (建会话时的节点名, 会话)），复用避免每个
+    /// 查询重新握手（SOCKS5 的 TCP+UDP ASSOCIATE、TUIC/Juicity 的全新 QUIC 连接都很
+    /// 昂贵）。记录节点名用于在建会话的节点失效/切换后识别并重建会话。
+    proxy_sessions: Mutex<HashMap<String, (String, Arc<dyn UdpSession>)>>,
+    /// 每组合并锁：持久会话共享时同一时刻每组至多一个 in-flight 查询。
+    group_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 运行标志。
     running: Arc<AtomicBool>,
     /// 停止信号。
@@ -201,6 +208,8 @@ impl DnsForwarder {
             fallback,
             host_ns_fd,
             caches: Mutex::new(HashMap::new()),
+            proxy_sessions: Mutex::new(HashMap::new()),
+            group_locks: Mutex::new(HashMap::new()),
             running: Arc::new(AtomicBool::new(false)),
             stop_signal: Arc::new(Notify::new()),
         })
@@ -337,6 +346,7 @@ impl DnsForwarder {
                     return Ok(resp);
                 }
                 let response = self.forward_direct(query, server).await?;
+                Self::log_dns_result(&parsed.qname, "direct", server, &response);
                 self.cache_store(&cache, &parsed.qname, parsed.qtype, &response);
                 Ok(response)
             }
@@ -349,17 +359,58 @@ impl DnsForwarder {
                     return Ok(resp);
                 }
                 match self.group_dialers.get(&group) {
-                    Some(dialer) => {
-                        let server = self
-                            .proxy_dns_servers
-                            .first()
-                            .copied()
-                            .context("no proxy DNS server configured")?;
-                        let response =
-                            self.forward_via_proxy(query, dialer.as_ref(), server).await?;
-                        self.cache_store(&cache, &parsed.qname, parsed.qtype, &response);
-                        Ok(response)
-                    }
+                    Some(dialer) => match self.proxy_dns_servers.first().copied() {
+                        Some(server) => {
+                            // 持久会话共享需每组合并：同一时刻每组至多一个 in-flight
+                            // 查询，否则并发查询会在共享会话上互相抢走对方响应。
+                            let _lock = self.group_lock(&group).await;
+                            // 等锁期间前面的查询可能已填充本组缓存。
+                            if let Some(resp) =
+                                self.cached_lookup(&cache, &parsed.qname, parsed.qtype, parsed.id)
+                            {
+                                return Ok(resp);
+                            }
+                            let response = match self
+                                .forward_via_proxy(&group, query, dialer.as_ref(), server)
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    // 组内节点全挂/组冷却 → 回退直连，避免丢查询
+                                    // （与"无拨号器/无上游"的回退一致）。
+                                    warn!(
+                                        group = %group,
+                                        error = %e,
+                                        "DNS: proxy group unavailable, falling back to direct"
+                                    );
+                                    let server = self.pick_direct_server()?;
+                                    let dcache = self.get_cache("direct");
+                                    let response = self.forward_direct(query, server).await?;
+                                    Self::log_dns_result(&parsed.qname, "direct-fallback", server, &response);
+                                    self.cache_store(
+                                        &dcache, &parsed.qname, parsed.qtype, &response,
+                                    );
+                                    return Ok(response);
+                                }
+                            };
+                            Self::log_dns_result(&parsed.qname, "proxy", server, &response);
+                            self.cache_store(&cache, &parsed.qname, parsed.qtype, &response);
+                            Ok(response)
+                        }
+                        None => {
+                            // 与 validator 注释一致：未配置代理上游 → 回退直连，避免丢查询。
+                            warn!(
+                                group = %group,
+                                "DNS: no proxy DNS server configured, falling back to direct"
+                            );
+                            let server = self.pick_direct_server()?;
+                            let dcache = self.get_cache("direct");
+                            let response = self.forward_direct(query, server).await?;
+                            Self::log_dns_result(&parsed.qname, "direct-fallback", server, &response);
+                            self.cache_store(&dcache, &parsed.qname, parsed.qtype, &response);
+                            Ok(response)
+                        }
+                    },
                     None => {
                         // 组没有可用拨号器（无节点被跳过）→ 回退直连，避免丢查询。
                         warn!(
@@ -369,12 +420,32 @@ impl DnsForwarder {
                         let server = self.pick_direct_server()?;
                         let dcache = self.get_cache("direct");
                         let response = self.forward_direct(query, server).await?;
+                        Self::log_dns_result(&parsed.qname, "direct-fallback", server, &response);
                         self.cache_store(&dcache, &parsed.qname, parsed.qtype, &response);
                         Ok(response)
                     }
                 }
             }
         }
+    }
+
+    /// 记录一次 DNS 查询结果：来源（proxy / direct / direct-fallback）+ 上游
+    /// + RCODE（flags 低 4 位：0=NOERROR, 2=SERVFAIL, 3=NXDOMAIN）。
+    ///
+    /// 用于定位"SERVFAIL / 无响应"来自哪条路径（代理上游还是回退直连）。
+    fn log_dns_result(domain: &str, source: &str, server: SocketAddr, resp: &[u8]) {
+        let rcode = if resp.len() >= 4 {
+            u16::from_be_bytes([resp[2], resp[3]]) & 0x000F
+        } else {
+            u16::MAX
+        };
+        info!(
+            domain = domain,
+            source = source,
+            server = %server,
+            rcode = rcode,
+            "DNS response"
+        );
     }
 
     /// 域名分流：返回该域名在数据面 routing 规则里对应的走向。
@@ -464,25 +535,104 @@ impl DnsForwarder {
         Ok(buf)
     }
 
-    /// 代理转发：经指定代理组拨号器的 `udp_dial()` full-cone UDP 会话发送到 `server`。
+    /// 取（或懒创建）某个代理组的合并锁，串行化该组的 in-flight 查询。
+    ///
+    /// 返回 [`tokio::sync::OwnedMutexGuard`]（自持 `Arc`，无借用），可安全跨 await。
+    async fn group_lock(&self, group: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.group_locks.lock().unwrap();
+            locks
+                .entry(group.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    /// 代理转发：经指定代理组拨号器的 full-cone UDP 会话发送到 `server`。
+    ///
+    /// 每个代理组复用**持久** UDP 会话（[`DnsForwarder::proxy_sessions`]），避免每个
+    /// 查询重新握手（SOCKS5 的 TCP+UDP ASSOCIATE、TUIC/Juicity 的全新 QUIC 连接都很
+    /// 昂贵）。会话失联（send/recv 报连接错误）时移除，下次查询重建。
+    ///
+    /// 持久会话绑定**建会话时的节点**：若组内当前节点已切换（原节点死亡被
+    /// `GroupDialer` 回退到其它节点），旧会话打向失效节点，这里按节点名识别并重建。
+    /// 非 `GroupDialer`（测试 fake 等）不比较节点名，仅按组复用。
+    ///
+    /// 响应校验 `resp_dest == server`：full-cone 会话可能收到发往其它目标的杂散
+    /// 数据报，不匹配则忽略并继续等待（受 `query_timeout` 约束）。
     async fn forward_via_proxy(
         &self,
+        group: &str,
         query: &[u8],
         dialer: &dyn OutboundDialer,
         server: SocketAddr,
     ) -> Result<Vec<u8>> {
-        let session = dialer
-            .udp_dial()
-            .await
-            .context("DNS forward_via_proxy: udp_dial failed")?;
-        session
-            .send(&server, query)
-            .await
-            .with_context(|| format!("DNS proxy query to {} send failed", server))?;
-        let (_resp_dest, payload) = tokio::time::timeout(self.query_timeout, session.recv())
-            .await
-            .with_context(|| format!("DNS proxy query to {} timed out", server))??;
-        Ok(payload.to_vec())
+        // 组当前选中的节点名（GroupDialer 才有效；否则为空串 = 不做节点比较）。
+        let node_key = dialer
+            .as_any()
+            .downcast_ref::<GroupDialer>()
+            .and_then(|g| g.current_node_name())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        // ---- 取（或建）本组的持久会话 ----
+        // 快路径先查缓存（锁不跨 await）；未命中/节点已切换再创建，创建期间不持锁。
+        let cached = self.proxy_sessions.lock().unwrap().get(group).cloned();
+        let session = match cached {
+            // 会话存在，且（非 GroupDialer，或）仍绑定当前节点 → 直接复用。
+            Some((stored_node, s)) if node_key.is_empty() || stored_node == node_key => s,
+            _ => {
+                // 会话缺失，或组内当前节点已切换（旧会话绑定失效节点）→ 重建。
+                // 先移除旧会话；创建期间不持 std MutexGuard，避免跨 await 不 Send。
+                self.proxy_sessions.lock().unwrap().remove(group);
+                let boxed = dialer
+                    .udp_dial()
+                    .await
+                    .context("DNS forward_via_proxy: udp_dial failed")?;
+                let arc: Arc<dyn UdpSession> = Arc::from(boxed);
+                self.proxy_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(group.to_string(), (node_key, arc.clone()));
+                arc
+            }
+        };
+
+        // ---- 发送 ----
+        if let Err(e) = session.send(&server, query).await {
+            self.proxy_sessions.lock().unwrap().remove(group);
+            return Err(anyhow::anyhow!(
+                "DNS proxy query to {} send failed: {}",
+                server,
+                e
+            ));
+        }
+
+        // ---- 接收：校验来源 == server，杂散数据报忽略 ----
+        let payload = tokio::time::timeout(self.query_timeout, async {
+            loop {
+                let (resp_dest, payload) = match session.recv().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // 底层连接/会话失联（TCP 断开、QUIC 失效等）→ 移除以便重建。
+                        self.proxy_sessions.lock().unwrap().remove(group);
+                        return Err(anyhow::anyhow!("DNS proxy query recv failed: {}", e));
+                    }
+                };
+                if resp_dest == server {
+                    return Ok(payload.to_vec());
+                }
+                debug!(
+                    got = %resp_dest,
+                    want = %server,
+                    "DNS: ignoring relay datagram from unexpected destination"
+                );
+            }
+        })
+        .await
+        .with_context(|| format!("DNS proxy query to {} timed out", server))??;
+        Ok(payload)
     }
 }
 
@@ -721,9 +871,13 @@ fn bind_udp_in_ns(listen: SocketAddr) -> io::Result<std::net::UdpSocket> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{RouteRule, RoutingConfig};
+    use crate::config::{PolicyType, RouteRule, RoutingConfig};
+    use crate::group::{GroupDialer, GroupNode};
     use crate::routing::matcher::{build_dns_domain_routes, dns_outbound_from_action};
+    use protocols::ProxyConn;
+    use std::collections::VecDeque;
     use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicUsize;
 
     /// 构造测试用转发器（空路由表 + 指定 fallback，无拨号器）。
     fn test_forwarder(routes: Vec<DnsDomainRoute>, fallback: DnsOutbound) -> DnsForwarder {
@@ -943,5 +1097,289 @@ mod tests {
         assert_eq!(resp[..2], [0x12, 0x34]); // ID 保留
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_eq!(flags & 0x000F, 3); // NXDOMAIN
+    }
+
+    // ------------------------------------------------------------------------
+    // Fakes + new behavior tests (persistent session / resp_dest validation /
+    // no-proxy-upstream direct fallback)
+    // ------------------------------------------------------------------------
+
+    /// 可控的 fake UDP 会话：按序弹出 (来源, payload)，send 可配置失败。
+    #[derive(Clone)]
+    struct FakeUdpSession {
+        replies: Arc<tokio::sync::Mutex<VecDeque<(SocketAddr, Vec<u8>)>>>,
+        fail_send: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeUdpSession {
+        fn new(replies: VecDeque<(SocketAddr, Vec<u8>)>) -> Self {
+            Self {
+                replies: Arc::new(tokio::sync::Mutex::new(replies)),
+                fail_send: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+        fn fail_send(self) -> Self {
+            self.fail_send.store(true, Ordering::SeqCst);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UdpSession for FakeUdpSession {
+        async fn send(&self, _dest: &SocketAddr, _payload: &[u8]) -> anyhow::Result<()> {
+            if self.fail_send.load(Ordering::SeqCst) {
+                anyhow::bail!("simulated send failure");
+            }
+            Ok(())
+        }
+        async fn recv(&self) -> anyhow::Result<(SocketAddr, bytes::Bytes)> {
+            let mut q = self.replies.lock().await;
+            let Some((dest, payload)) = q.pop_front() else {
+                // 无更多预置数据 → 挂起（模拟真实会话持续等待），由外层超时中断。
+                drop(q);
+                std::future::pending::<()>().await;
+                unreachable!()
+            };
+            Ok((dest, payload.into()))
+        }
+    }
+
+    /// fake 拨号器：返回预置的 fake 会话，记录 udp_dial 调用次数。
+    struct FakeDialer {
+        session: FakeUdpSession,
+        dial_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundDialer for FakeDialer {
+        async fn dial(&self, _target: &str) -> anyhow::Result<ProxyConn> {
+            anyhow::bail!("fake dialer: dial not implemented")
+        }
+        async fn udp_dial(&self) -> anyhow::Result<Box<dyn UdpSession>> {
+            self.dial_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(self.session.clone()))
+        }
+        fn protocol_name(&self) -> &'static str {
+            "fake"
+        }
+        fn proxy_addr(&self) -> SocketAddr {
+            "127.0.0.1:1080".parse().unwrap()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// 来自错误来源（非目标 DNS 服务器）的杂散数据报应被忽略，等待正确来源。
+    #[tokio::test]
+    async fn test_forward_via_proxy_ignores_unexpected_dest() {
+        let f = test_forwarder(vec![], DnsOutbound::Direct);
+        let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let q = build_query(0x1234, "example.com", 1);
+
+        let mut replies = VecDeque::new();
+        replies.push_back(("9.9.9.9:53".parse().unwrap(), vec![0xde, 0xad])); // 杂散
+        replies.push_back((server, vec![0xbe, 0xef])); // 正确来源
+        let dialer = FakeDialer {
+            session: FakeUdpSession::new(replies),
+            dial_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let resp = f
+            .forward_via_proxy("proxy", &q, &dialer, server)
+            .await
+            .unwrap();
+        assert_eq!(resp, vec![0xbe, 0xef]);
+    }
+
+    /// 只有错误来源时，等待至超时并报错（不返回杂散数据）。
+    #[tokio::test]
+    async fn test_forward_via_proxy_timeout_on_wrong_dest_only() {
+        let mut cfg = DnsConfig::default();
+        cfg.query_timeout_ms = 200; // 缩短等待
+        let f = DnsForwarder::new(&cfg, vec![], HashMap::new(), DnsOutbound::Direct, None)
+            .unwrap();
+        let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let q = build_query(0x1234, "example.com", 1);
+
+        let mut replies = VecDeque::new();
+        replies.push_back(("9.9.9.9:53".parse().unwrap(), vec![0xde, 0xad])); // 只有杂散
+        let dialer = FakeDialer {
+            session: FakeUdpSession::new(replies),
+            dial_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let err = f
+            .forward_via_proxy("proxy", &q, &dialer, server)
+            .await
+            .expect_err("should time out waiting for correct source");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// send 失败会移除持久会话，后续调用重新 udp_dial。
+    #[tokio::test]
+    async fn test_forward_via_proxy_send_failure_removes_session() {
+        let f = test_forwarder(vec![], DnsOutbound::Direct);
+        let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let q = build_query(0x1234, "example.com", 1);
+        let dialer = FakeDialer {
+            session: FakeUdpSession::new(VecDeque::new()).fail_send(),
+            dial_count: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(f
+            .forward_via_proxy("proxy", &q, &dialer, server)
+            .await
+            .is_err());
+        assert!(f.proxy_sessions.lock().unwrap().get("proxy").is_none());
+    }
+
+    /// 持久会话复用：连续两次查询只调用一次 udp_dial。
+    #[tokio::test]
+    async fn test_forward_via_proxy_reuses_persistent_session() {
+        let f = test_forwarder(vec![], DnsOutbound::Direct);
+        let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let q = build_query(0x1234, "example.com", 1);
+
+        let mut replies = VecDeque::new();
+        replies.push_back((server, vec![1]));
+        replies.push_back((server, vec![2]));
+        let dialer = FakeDialer {
+            session: FakeUdpSession::new(replies),
+            dial_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let r1 = f
+            .forward_via_proxy("proxy", &q, &dialer, server)
+            .await
+            .unwrap();
+        let r2 = f
+            .forward_via_proxy("proxy", &q, &dialer, server)
+            .await
+            .unwrap();
+        assert_eq!(r1, vec![1]);
+        assert_eq!(r2, vec![2]);
+        assert_eq!(dialer.dial_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// 组有拨号器但 proxy_dns_servers 为空 → 回退直连（validator 声称的行为）；
+    /// 直连无上游时错误应为 "no direct upstream available" 而非 "no proxy DNS server"。
+    #[tokio::test]
+    async fn test_resolve_group_no_proxy_server_falls_back_to_direct() {
+        let mut cfg = DnsConfig::default();
+        cfg.proxy_dns_servers = Vec::new();
+        cfg.direct_dns_servers = Vec::new();
+        cfg.direct_use_system_dns = false;
+        let mut dialers: HashMap<String, Arc<dyn OutboundDialer>> = HashMap::new();
+        dialers.insert(
+            "proxy".into(),
+            Arc::new(FakeDialer {
+                session: FakeUdpSession::new(VecDeque::new()),
+                dial_count: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let f = DnsForwarder::new(&cfg, vec![], dialers, DnsOutbound::Group("proxy".into()), None)
+            .unwrap();
+        let q = build_query(0x1234, "example.com", 1);
+        let err = f.resolve(&q).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no direct upstream available"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// 持久会话绑定建会话时的节点：组内当前节点切换后应重建会话（重新 udp_dial），
+    /// 而不是继续复用绑定旧节点的会话。
+    #[tokio::test]
+    async fn test_forward_via_proxy_rebuilds_when_group_node_changes() {
+        let f = test_forwarder(vec![], DnsOutbound::Direct);
+        let server: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let q = build_query(0x1234, "example.com", 1);
+
+        // 单节点组，当前节点 = "a"。
+        let mut replies = VecDeque::new();
+        replies.push_back((server, vec![0xaa]));
+        let node_dialer = Arc::new(FakeDialer {
+            session: FakeUdpSession::new(replies),
+            dial_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let dial_count = node_dialer.dial_count.clone();
+        let group: Arc<dyn OutboundDialer> = Arc::new(GroupDialer::new(
+            "g".into(),
+            vec![GroupNode::new("a".into(), node_dialer)],
+            PolicyType::Fixed,
+        ));
+
+        // 预置一个绑定到其它节点名（"stale"）的持久会话 → 应识别为节点已切换而重建。
+        {
+            let mut sessions = f.proxy_sessions.lock().unwrap();
+            sessions.insert(
+                "proxy".to_string(),
+                ("stale".to_string(), Arc::new(FakeUdpSession::new(VecDeque::new()))),
+            );
+        }
+
+        let resp = f
+            .forward_via_proxy("proxy", &q, group.as_ref(), server)
+            .await
+            .unwrap();
+        assert_eq!(resp, vec![0xaa]);
+        // 重建 = 底层节点拨号器被调用一次，且会话按新节点名记录。
+        assert_eq!(dial_count.load(Ordering::SeqCst), 1);
+        let (stored_node, _) = f
+            .proxy_sessions
+            .lock()
+            .unwrap()
+            .get("proxy")
+            .cloned()
+            .expect("session should exist");
+        assert_eq!(stored_node, "a");
+    }
+
+    /// 组内节点全挂（udp_dial 失败）→ resolve 回退直连；直连无上游时报
+    /// "no direct upstream available"（证明走的是直连路径而非代理错误）。
+    #[tokio::test]
+    async fn test_resolve_group_unavailable_falls_back_to_direct() {
+        let mut cfg = DnsConfig::default();
+        cfg.proxy_dns_servers = vec!["8.8.8.8:53".into()];
+        cfg.direct_dns_servers = Vec::new();
+        cfg.direct_use_system_dns = false;
+        let mut dialers: HashMap<String, Arc<dyn OutboundDialer>> = HashMap::new();
+        dialers.insert("proxy".into(), Arc::new(AlwaysFailDialer));
+        let f = DnsForwarder::new(&cfg, vec![], dialers, DnsOutbound::Group("proxy".into()), None)
+            .unwrap();
+        let q = build_query(0x1234, "example.com", 1);
+        let err = f.resolve(&q).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no direct upstream available"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// udp_dial 总是失败的拨号器（模拟组内节点全部不可用）。
+    struct AlwaysFailDialer;
+
+    #[async_trait::async_trait]
+    impl OutboundDialer for AlwaysFailDialer {
+        async fn dial(&self, _target: &str) -> anyhow::Result<ProxyConn> {
+            anyhow::bail!("always fail dial")
+        }
+        async fn udp_dial(&self) -> anyhow::Result<Box<dyn UdpSession>> {
+            anyhow::bail!("simulated group udp dial failure")
+        }
+        fn protocol_name(&self) -> &'static str {
+            "fake"
+        }
+        fn proxy_addr(&self) -> SocketAddr {
+            "127.0.0.1:1080".parse().unwrap()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 }

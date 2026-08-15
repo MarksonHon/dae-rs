@@ -359,7 +359,7 @@ pub fn create_transparent_udp(
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             ) != 0
             {
-                unsafe { libc::close(fd) };
+                libc::close(fd);
                 return Err(io::Error::last_os_error());
             }
 
@@ -373,7 +373,7 @@ pub fn create_transparent_udp(
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 ) != 0
                 {
-                    unsafe { libc::close(fd) };
+                    libc::close(fd);
                     return Err(io::Error::last_os_error());
                 }
             }

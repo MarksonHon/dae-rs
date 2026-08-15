@@ -870,6 +870,10 @@ impl OutboundDialer for Socks5Dialer {
         self.proxy_addr
     }
 
+    fn is_socks5(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

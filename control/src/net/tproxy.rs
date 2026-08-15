@@ -1550,54 +1550,73 @@ impl UdpTproxyListener {
                     // 识别 53 端口 DNS 流量，交给 DNS 模块做域名分流（代理/直连）。
                     // 响应经透明响应 socket（bound 到原目标 DNS 地址）发回客户端，
                     // 客户端看到的就是"原 DNS 服务器"的应答，完全透明。
-                    if dest.port() == 53
-                        && self.dns_forwarder.is_some()
-                        && crate::net::dns::parse_dns_query(&buf[..n]).is_some()
-                    {
-                        let fwd = self.dns_forwarder.clone().unwrap();
-                        let resp_socks = resp_socks.clone();
-                        let peer = peer_addr;
-                        let peer_str = peer
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "unknown".into());
-                        let payload = buf[..n].to_vec();
-                        tokio::spawn(async move {
-                            match fwd.resolve(&payload).await {
-                                Ok(response) => {
-                                    if let Some(peer) = peer {
-                                        if let Some(sock) =
-                                            resp_socks.get(&dest, host_ns_fd).await
-                                        {
-                                            // Response write deadline: prevents blocking the
-                                            // reader forever when the client is not reading.
-                                            match tokio::time::timeout(
-                                                UDP_WRITE_TIMEOUT,
-                                                sock.send_to(&response, peer),
-                                            )
-                                            .await
+                    //
+                    // 可观测性：53 端口流量到达时明确记录是否被 DNS 模块接管，以及
+                    // 未接管的原因（无 forwarder / 非标准 DNS 报文）——便于排查
+                    // "DNS 模块无日志"：未接管时会按普通 UDP 中继，不会打 DNS 日志。
+                    if dest.port() == 53 {
+                        let has_fwd = self.dns_forwarder.is_some();
+                        let dns_parsed = crate::net::dns::parse_dns_query(&buf[..n]);
+                        if has_fwd && dns_parsed.is_some() {
+                            info!(
+                                peer = ?peer_addr,
+                                dest = %dest,
+                                bytes = n,
+                                "UDP 53 [DNS] handing query to DNS forwarder"
+                            );
+                            let fwd = self.dns_forwarder.clone().unwrap();
+                            let resp_socks = resp_socks.clone();
+                            let peer = peer_addr;
+                            let peer_str = peer
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "unknown".into());
+                            let payload = buf[..n].to_vec();
+                            tokio::spawn(async move {
+                                match fwd.resolve(&payload).await {
+                                    Ok(response) => {
+                                        if let Some(peer) = peer {
+                                            if let Some(sock) =
+                                                resp_socks.get(&dest, host_ns_fd).await
                                             {
-                                                Ok(Ok(_)) => {}
-                                                Ok(Err(e)) => debug!(
-                                                    "DNS response send failed: {}",
-                                                    e
-                                                ),
-                                                Err(_) => debug!(
-                                                    "DNS response send to {} timed out",
-                                                    peer
-                                                ),
+                                                // Response write deadline: prevents blocking the
+                                                // reader forever when the client is not reading.
+                                                match tokio::time::timeout(
+                                                    UDP_WRITE_TIMEOUT,
+                                                    sock.send_to(&response, peer),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(Ok(_)) => {}
+                                                    Ok(Err(e)) => debug!(
+                                                        "DNS response send failed: {}",
+                                                        e
+                                                    ),
+                                                    Err(_) => debug!(
+                                                        "DNS response send to {} timed out",
+                                                        peer
+                                                    ),
+                                                }
                                             }
                                         }
                                     }
+                                    Err(e) => {
+                                        debug!(
+                                            "DNS resolve failed for {} -> {}: {}",
+                                            peer_str, dest, e
+                                        );
+                                    }
                                 }
-                                Err(e) => {
-                                    debug!(
-                                        "DNS resolve failed for {} -> {}: {}",
-                                        peer_str, dest, e
-                                    );
-                                }
-                            }
-                        });
-                        continue;
+                            });
+                            continue;
+                        }
+                        // 53 端口但未接管：记录原因，随后按普通 UDP 中继（不打 DNS 日志）。
+                        debug!(
+                            peer = ?peer_addr,
+                            dest = %dest,
+                            has_dns_forwarder = has_fwd,
+                            is_dns_packet = dns_parsed.is_some(),
+                            "UDP 53 [DNS] NOT handed to DNS forwarder (ordinary UDP relay)"
+                        );
                     }
 
                     // ---- SOCKS5 UDP ASSOCIATE path ----

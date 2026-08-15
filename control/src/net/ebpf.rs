@@ -8,13 +8,11 @@
 
 use anyhow::{Context, Result};
 use bytemuck::{self, Zeroable};
-use libbpf_rs::{MapCore, MapFlags, ProgramType};
-use libbpf_rs::{Object, ObjectBuilder, TcHook, TC_EGRESS, TC_INGRESS};
+use libbpf_rs::{AsRawLibbpf, MapCore, MapFlags};
+use libbpf_rs::{Object, ObjectBuilder};
 use std::ffi::{CString, OsStr};
 use std::os::unix::io::AsFd;
 use std::path::Path;
-use std::collections::HashSet;
-use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, error, info, warn};
@@ -593,6 +591,23 @@ pub fn probe_redirect_peer() -> u8 {
     }
 }
 
+/// Probe kernel support for TCX (BPF_LINK_TYPE_TCX, requires Linux >= 6.6).
+///
+/// dae-rs attaches its datapath programs via TCX (no clsact qdisc / filter),
+/// so there is no classic-TC fallback — startup must fail if unsupported.
+pub fn probe_tcx_supported() -> bool {
+    let Some((major, minor)) = kernel_version() else {
+        return false;
+    };
+    if major > 6 || (major == 6 && minor >= 6) {
+        info!("Kernel {}.{}: TCX supported", major, minor);
+        true
+    } else {
+        info!("Kernel {}.{}: TCX not supported (need >= 6.6)", major, minor);
+        false
+    }
+}
+
 /// Get kernel version as (major, minor) by reading /proc/sys/kernel/osrelease.
 fn kernel_version() -> Option<(u32, u32)> {
     // Try /proc first, fallback to uname -r
@@ -626,108 +641,43 @@ fn find_map<'a>(obj: &'a Object, name: &str) -> Result<libbpf_rs::Map<'a>> {
     })
 }
 
-/// Delete the clsact qdisc on an interface (removes ALL filters on it).
+/// Attach a TCX program to an interface, returning the created bpf_link.
 ///
-/// A missing qdisc is not an error ("No such file"/"Cannot find specified
-/// qdisc"/"Invalid handle"/"handle of zero" are expected on first attach,
-/// depending on the iproute2 version). Depends on iproute2's `tc` binary —
-/// a clear error is returned if it is unavailable.
-fn delete_clsact_qdisc(ifname: &str) -> Result<(), EbpfError> {
-    let output = Command::new("tc")
-        .args(["qdisc", "del", "dev", ifname, "clsact"])
-        .output()
-        .map_err(|e| EbpfError::TcAttachError {
-            iface: ifname.to_string(),
-            detail: format!(
-                "failed to run `tc qdisc del dev {} clsact`: {} (is iproute2's `tc` installed?)",
-                ifname, e
-            ),
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_missing_qdisc_stderr(&stderr) {
-            debug!(
-                iface = ifname,
-                stderr = %stderr,
-                "clsact qdisc did not exist on {}, OK",
-                ifname,
-            );
-            return Ok(());
-        }
-        return Err(EbpfError::TcAttachError {
-            iface: ifname.to_string(),
-            detail: format!(
-                "Failed to delete clsact qdisc on {}: {}",
-                ifname,
-                stderr.trim(),
-            ),
-        });
+/// Thin wrapper over libbpf's `bpf_program__attach_tcx()` (which issues
+/// BPF_LINK_CREATE with BPF_LINK_TYPE_TCX, kernel >= 6.6). The
+/// ingress/egress direction is taken from the program's `tcx/ingress` /
+/// `tcx/egress` SEC section (tproxy.c). Unlike classic TC there is no clsact
+/// qdisc, filter handle or priority — TCX links form a chain per hook and are
+/// auto-detached by the kernel when the link fd is closed.
+fn attach_tcx(prog: &libbpf_rs::ProgramMut<'_>, ifindex: i32) -> Result<libbpf_rs::Link> {
+    // SAFETY: `as_libbpf_object` yields the raw libbpf program; opts=NULL is
+    // accepted by libbpf and appends the program to the end of the chain.
+    let ptr = unsafe {
+        libbpf_sys::bpf_program__attach_tcx(
+            prog.as_libbpf_object().as_ptr(),
+            ifindex,
+            std::ptr::null(),
+        )
+    };
+    if ptr.is_null() {
+        return Err(anyhow::anyhow!(
+            "bpf_program__attach_tcx failed on ifindex {}: {}",
+            ifindex,
+            std::io::Error::last_os_error()
+        ));
     }
-    Ok(())
-}
-
-/// Whether a `tc qdisc del dev <if> clsact` stderr indicates the qdisc simply
-/// does not exist — a benign, expected condition on first attach — as opposed
-/// to a real failure (permission denied, invalid interface, ...).
-///
-/// Different iproute2 versions phrase "no such qdisc" differently:
-/// - "No such file or directory"
-/// - "Cannot find specified qdisc"
-/// - "Error: Invalid handle."
-/// - "Error: Cannot delete qdisc with handle of zero."
-fn is_missing_qdisc_stderr(stderr: &str) -> bool {
-    stderr.contains("No such file")
-        || stderr.contains("Cannot find specified qdisc")
-        || stderr.contains("Invalid handle")
-        || stderr.contains("handle of zero")
-}
-
-// ============================================================================
-// Helpers: set program types for non-standard SEC() names
-// ============================================================================
-
-/// The C eBPF source (tproxy.c) uses non-standard TC section names like
-/// `SEC("tc/lan_egress_l2")`, `SEC("tc/dae0_ingress")`, etc.
-/// Standard libbpf only auto-detects `tc/ingress` and `tc/egress`.
-/// This function sets the correct program type for each unrecognized TC section
-/// so that `bpf_object__load()` will succeed.
-fn set_tc_prog_types(open_obj: &mut libbpf_rs::OpenObject) {
-    for mut prog in open_obj.progs_mut() {
-        let section = prog.section().to_str().unwrap_or("").to_string();
-        let name = prog.name().to_str().unwrap_or("").to_string();
-        if section.starts_with("tc/") {
-            let old_type = prog.prog_type();
-            if matches!(old_type, ProgramType::Unspec) {
-                prog.set_prog_type(ProgramType::SchedCls);
-                info!(
-                    "Set program type: '{}' (section '{}'): {:?} -> SchedCls",
-                    name, section, old_type
-                );
-            } else {
-                info!(
-                    "Program '{}' (section '{}') already has type {:?}, skipping",
-                    name, section, old_type
-                );
-            }
-        } else {
-            info!(
-                "Program '{}' (section '{}'): type is {:?} (auto-detected)",
-                name,
-                section,
-                prog.prog_type()
-            );
-        }
-    }
+    // SAFETY: libbpf returned a non-NULL, owned `bpf_link`; Link takes ownership.
+    Ok(unsafe { libbpf_rs::Link::from_ptr(std::ptr::NonNull::new_unchecked(ptr)) })
 }
 
 // ============================================================================
 // EbpfManager
 // ============================================================================
 
-/// Metadata for a TC hook attachment
+/// Metadata for a TCX link attachment
 #[derive(Debug)]
-struct TcAttachInfo {
-    hook: TcHook,
+struct TcxAttachInfo {
+    link: libbpf_rs::Link,
     iface: String,
     prog_name: String,
 }
@@ -735,20 +685,15 @@ struct TcAttachInfo {
 /// eBPF program lifecycle manager.
 pub struct EbpfManager {
     obj: Option<Object>,
-    tc_hooks: Vec<TcAttachInfo>,
+    tc_hooks: Vec<TcxAttachInfo>,
     cgroup_links: Vec<libbpf_rs::Link>,
     iface: String,
     bpf_path: String,
     param: Option<Daeparam>,
     /// eBPF map pinning path; if set, maps are automatically pinned after load
     pin_path: Option<String>,
-    /// Flip bit, used for TC handle flip (switching filter on hot reload)
-    flip: u32,
     /// conn_state_map max entries (synced from tproxy.c MAX_CONN_STATE_NUM)
     conn_state_map_max_entries: u32,
-    /// Track interfaces that have had clsact qdisc cleaned up, avoid duplicate removal
-    /// (duplicate removal destroys the mounted egress program)
-    clsact_cleaned: HashSet<String>,
 }
 
 // Safety: EbpfManager is only ever accessed through `Arc<Mutex<EbpfManager>>`.
@@ -768,9 +713,7 @@ impl EbpfManager {
             bpf_path: DEFAULT_EBPF_PATH.to_string(),
             param: None,
             pin_path: None,
-            flip: 0,
             conn_state_map_max_entries: CONN_STATE_MAX_ENTRIES,
-            clsact_cleaned: HashSet::new(),
         }
     }
 
@@ -783,21 +726,8 @@ impl EbpfManager {
             bpf_path: bpf_path.to_string(),
             param: None,
             pin_path: None,
-            flip: 0,
             conn_state_map_max_entries: CONN_STATE_MAX_ENTRIES,
-            clsact_cleaned: HashSet::new(),
         }
-    }
-
-    /// Get the current flip bit
-    pub fn flip(&self) -> u32 {
-        self.flip
-    }
-
-    /// Set the flip bit (used for TC handle flip on hot reload)
-    pub fn set_flip(&mut self, flip: u32) {
-        self.flip = flip;
-        info!("Flip set to {}", flip);
     }
 
     pub fn set_param(&mut self, param: &Daeparam) {
@@ -877,10 +807,6 @@ impl EbpfManager {
 
         // Write PARAM to .rodata BEFORE loading (read-only after load)
         self.update_param_pre_load(&mut open_obj)?;
-
-        // Fix program types for non-standard TC section names before loading
-        set_tc_prog_types(&mut open_obj);
-        debug!("Fixed TC program types for loaded object");
 
         let obj = open_obj
             .load()
@@ -963,9 +889,6 @@ impl EbpfManager {
                 }
             }
         }
-
-        // Fix program types for non-standard TC section names before loading
-        set_tc_prog_types(&mut open_obj);
 
         let obj = open_obj
             .load()
@@ -1229,133 +1152,56 @@ impl EbpfManager {
     }
 
     // ========================================================================
-    // Common TC attach — mount specified program list to target interface
+    // Common TCX attach — mount specified program list to target interface
     // ========================================================================
 
-    /// Derive TC attach point (ingress/egress) from program name
-    fn prog_attach_point(prog_name: &str) -> u32 {
-        if prog_name.contains("egress") {
-            TC_EGRESS
-        } else {
-            // Default ingress (if name contains "ingress" or uncertain)
-            TC_INGRESS
-        }
-    }
-
-    /// Common TC attach: mount specified program list to target interface
+    /// Common TCX attach: attach the specified programs to the target interface.
+    ///
+    /// Each program becomes a per-interface bpf_link (BPF_LINK_TYPE_TCX); the
+    /// ingress/egress direction comes from the program's `tcx/ingress` /
+    /// `tcx/egress` SEC section. No clsact qdisc / filter handle / priority is
+    /// involved, so stale-handle conflicts from previous runs are gone.
     ///
     /// # Parameters
     ///
     /// * `ifname` — target interface name
-    /// * `progs` — program list, each item is (program name, priority)
-    /// * `handle` — optional handle (caller has already merged flip bit into handle)
-    pub fn attach_tc(
-        &mut self,
-        ifname: &str,
-        progs: &[(&str, u32)],
-        handle: Option<u32>,
-    ) -> Result<()> {
+    /// * `progs` — program name list to attach (e.g. `tproxy_wan_egress`)
+    pub fn attach_tc(&mut self, ifname: &str, progs: &[&str]) -> Result<()> {
         let obj = self.obj.as_ref().ok_or(EbpfError::NotLoaded)?;
         let ifindex = if_nametoindex(ifname).map_err(|e| EbpfError::TcAttachError {
             iface: ifname.into(),
             detail: format!("if_nametoindex: {}", e),
         })?;
 
-        info!(iface = %ifname, ifindex = %ifindex, count = %progs.len(), "Attaching TC programs");
+        info!(iface = %ifname, ifindex = %ifindex, count = %progs.len(), "Attaching TCX programs");
 
-        for (prog_name, priority) in progs {
+        for prog_name in progs {
             let prog = match find_prog(obj, prog_name) {
                 Ok(p) => p,
                 Err(_) => {
-                    warn!("TC program '{}' not found, skipping", prog_name);
+                    warn!("TCX program '{}' not found, skipping", prog_name);
                     continue;
                 }
             };
 
-            let attach_point = Self::prog_attach_point(prog_name);
-            debug!(
-                prog_name = %prog_name,
-                attach_point = attach_point,
-                priority = priority,
-                handle = ?handle,
-                "Preparing TC hook"
-            );
-            let mut hook = TcHook::new(prog.as_fd());
-            hook.ifindex(ifindex);
-            hook.attach_point(attach_point);
-            hook.priority(*priority);
-
-            if let Some(h) = handle {
-                hook.handle(h);
-            }
-
-            // For all interfaces (including WAN, LAN, netkit devices), first remove existing clsact qdisc,
-            // then recreate. Reason:
-            // 1. On netkit devices, if clsact already exists, hook.create() is a no-op,
-            //    causing previously set priority to not take effect.
-            // 2. WAN/LAN interfaces may have old TC filters left from a previous dae-rs run,
-            //    "Exclusivity flag on, cannot modify" error prevents new filter from being installed,
-            //    causing egress_entered=0 and the entire proxy pipeline to fail.
-            //
-            // Note: the same interface may be called by attach_tc() multiple times (e.g. attach_wan first mounts
-            // egress then ingress), duplicate clsact removal destroys mounted programs.
-            // Ensure each interface is only cleaned once via clsact_cleaned HashSet.
-            if !self.clsact_cleaned.contains(ifname) {
-                delete_clsact_qdisc(ifname)?;
-                self.clsact_cleaned.insert(ifname.to_string());
-            } else {
-                debug!(
-                    iface = %ifname,
-                    "clsact qdisc already cleaned on {}, skipping delete",
-                    ifname,
-                );
-            }
-
-            // Create clsact qdisc (no-op if already exists)
-            hook.create().map_err(|e| EbpfError::TcAttachError {
+            let link = attach_tcx(&prog, ifindex).map_err(|e| EbpfError::TcAttachError {
                 iface: ifname.into(),
-                detail: format!("create({}): {}", prog_name, e),
+                detail: format!("attach_tcx({}): {}", prog_name, e),
             })?;
 
-            // Attach the program. If attach fails — typically a stale filter from
-            // a previous run/reload still holds the same handle ("Exclusivity flag
-            // on" / EEXIST), which would silently break interception on this
-            // interface — force-remove the whole clsact qdisc and retry once.
-            let attached = match hook.attach() {
-                Ok(attached) => attached,
-                Err(first_err) => {
-                    warn!(
-                        "TC attach failed on {} ({}): force-deleting clsact qdisc and retrying",
-                        ifname, first_err
-                    );
-                    delete_clsact_qdisc(ifname)?;
-                    hook.create().map_err(|e| EbpfError::TcAttachError {
-                        iface: ifname.into(),
-                        detail: format!("create(retry {}): {}", prog_name, e),
-                    })?;
-                    hook.attach().map_err(|e| EbpfError::TcAttachError {
-                        iface: ifname.into(),
-                        detail: format!(
-                            "attach({}) failed after clsact reset: {}",
-                            prog_name, e
-                        ),
-                    })?
-                }
-            };
-
-            self.tc_hooks.push(TcAttachInfo {
-                hook: attached,
+            self.tc_hooks.push(TcxAttachInfo {
+                link,
                 iface: ifname.into(),
                 prog_name: prog_name.to_string(),
             });
             info!(
-                "TC program '{}' attached to {} (ifindex={}, priority={}, handle={:?})",
-                prog_name, ifname, ifindex, priority, handle
+                "TCX program '{}' attached to {} (ifindex={})",
+                prog_name, ifname, ifindex
             );
         }
 
         info!(
-            "TC programs attached to {} (total hooks: {})",
+            "TCX programs attached to {} (total links: {})",
             ifname,
             self.tc_hooks.len()
         );
@@ -1366,151 +1212,49 @@ impl EbpfManager {
     // Group TC attach by interface
     // ========================================================================
 
-    /// Select L2 or L3 version of eBPF program to attach based on interface link header length
+    /// WAN interface: attach the unified L2/L3 TCX programs.
     ///
-    /// Read `/sys/class/net/<ifname>/type` to determine interface type.
-    /// Aligned with original dae Go behavior: dae uses netlink EncapType to determine,
-    /// if "none"/"ipip"/"ppp"/"tun" then L3, otherwise L2.
-    /// Here ARPHRD type is used for equivalent mapping.
-    fn get_link_header_len(ifname: &str) -> Result<u32> {
-        let path = format!("/sys/class/net/{}/type", ifname);
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read interface type for {}", ifname))?;
-        let if_type: u32 = content
-            .trim()
-            .parse()
-            .with_context(|| format!("Invalid interface type value for {}", ifname))?;
-
-        // Aligned with dae Go's EncapType determination:
-        // dae Go: EncapType in ["none", "ipip", "ppp", "tun"] → L3 (0), else → L2 (14)
-        // ARPHRD constant mapping:
-        //   ARPHRD_PPP = 512 (0x200)       → "ppp"
-        //   ARPHRD_TUNNEL = 768 (0x300)    → "tun"/"ipip"
-        //   ARPHRD_TUNNEL6 = 769 (0x301)   → "tun"
-        //   ARPHRD_SIT = 776 (0x308)       → "ipip"
-        //   ARPHRD_IPIP = 778 (0x30A)      → "ipip"
-        //   ARPHRD_NONE = 65534            → "none" (tun device)
-        match if_type {
-            512 |    // ARPHRD_PPP
-            768 |    // ARPHRD_TUNNEL
-            769 |    // ARPHRD_TUNNEL6
-            776 |    // ARPHRD_SIT
-            778 |    // ARPHRD_IPIP
-            65534    // ARPHRD_NONE
-            => Ok(0),   // L3: no link header
-            _ => Ok(14), // L2: default ethernet header (consistent with dae)
-        }
-    }
-
-    /// WAN interface: select L2 or L3 version based on link header length
-    ///
-    /// Aligned with original dae Go behavior:
-    /// - Egress direction priority 2, handle sub = 4
-    /// - Ingress direction priority 1, handle sub = 2
+    /// The merged programs detect the link header at runtime
+    /// (detect_link_h_len in tproxy.c), so no ARPHRD-based selection is
+    /// needed. TCX has no priority/handle concept.
     pub fn attach_wan(&mut self, ifname: &str) -> Result<()> {
-        let link_h_len = Self::get_link_header_len(ifname)?;
-        let handle_major = 0x2023u32;
-        let flip = self.flip;
-        info!(
-            "Attaching WAN TC programs to {} (link_h_len={}, flip={})",
-            ifname, link_h_len, flip
-        );
+        info!("Attaching WAN TCX programs to {}", ifname);
 
-        // Egress (priority 2, handle sub=4)
-        self.attach_tc(
-            ifname,
-            &[if link_h_len > 0 {
-                ("tproxy_wan_egress_l2", 2)
-            } else {
-                ("tproxy_wan_egress_l3", 2)
-            }],
-            Some((handle_major << 16) | ((4 & !1u32) | flip)),
-        )?;
+        // Egress
+        self.attach_tc(ifname, &["tproxy_wan_egress"])?;
 
-        // Ingress (priority 1, handle sub=2)
-        self.attach_tc(
-            ifname,
-            &[if link_h_len > 0 {
-                ("tproxy_wan_ingress_l2", 1)
-            } else {
-                ("tproxy_wan_ingress_l3", 1)
-            }],
-            Some((handle_major << 16) | ((2 & !1u32) | flip)),
-        )?;
+        // Ingress
+        self.attach_tc(ifname, &["tproxy_wan_ingress"])?;
 
         Ok(())
     }
 
-    /// LAN interface: select L2 or L3 version based on link header length
+    /// LAN interface: attach the unified L2/L3 TCX programs.
     ///
-    /// Aligned with original dae Go behavior:
-    /// - Ingress direction priority 2, handle sub = 4
-    /// - Egress direction priority 1, handle sub = 2
-    ///
-    /// Note: unlike WAN, LAN's Egress has higher priority.
+    /// The merged programs detect the link header at runtime, so no
+    /// ARPHRD-based selection is needed.
     pub fn attach_lan(&mut self, ifname: &str) -> Result<()> {
-        let link_h_len = Self::get_link_header_len(ifname)?;
-        let handle_major = 0x2023u32;
-        let flip = self.flip;
-        info!(
-            "Attaching LAN TC programs to {} (link_h_len={}, flip={})",
-            ifname, link_h_len, flip
-        );
+        info!("Attaching LAN TCX programs to {}", ifname);
 
-        // Ingress (priority 2, handle sub=4)
-        self.attach_tc(
-            ifname,
-            &[if link_h_len > 0 {
-                ("tproxy_lan_ingress_l2", 2)
-            } else {
-                ("tproxy_lan_ingress_l3", 2)
-            }],
-            Some((handle_major << 16) | ((4 & !1u32) | flip)),
-        )?;
+        // Ingress
+        self.attach_tc(ifname, &["tproxy_lan_ingress"])?;
 
-        // Egress (priority 1, handle sub=2)
-        self.attach_tc(
-            ifname,
-            &[if link_h_len > 0 {
-                ("tproxy_lan_egress_l2", 1)
-            } else {
-                ("tproxy_lan_egress_l3", 1)
-            }],
-            Some((handle_major << 16) | ((2 & !1u32) | flip)),
-        )?;
+        // Egress
+        self.attach_tc(ifname, &["tproxy_lan_egress"])?;
 
         Ok(())
     }
 
-    /// dae0 (host NS): attach tproxy_dae0_ingress
-    ///
-    /// Priority 0, handle major=0x2022, handle sub=2
+    /// dae0 (host NS): attach tproxy_dae0_ingress via TCX
     pub fn attach_dae0(&mut self, ifname: &str) -> Result<()> {
-        let handle_major = 0x2022u32;
-        let flip = self.flip;
-        info!("Attaching dae0 TC program to {} (flip={})", ifname, flip);
-        self.attach_tc(
-            ifname,
-            &[("tproxy_dae0_ingress", 0)],
-            Some((handle_major << 16) | ((2 & !1u32) | flip)),
-        )
+        info!("Attaching dae0 TCX program to {}", ifname);
+        self.attach_tc(ifname, &["tproxy_dae0_ingress"])
     }
 
-    /// dae0peer (proxy NS): attach tproxy_dae0peer_ingress
-    ///
-    /// Priority 0, handle major=0x2022, handle sub=2
+    /// dae0peer (proxy NS): attach tproxy_dae0peer_ingress via TCX
     pub fn attach_dae0peer(&mut self, ifname: &str) -> Result<()> {
-        let handle_major = 0x2022u32;
-        let flip = self.flip;
-        info!(
-            "Attaching dae0peer TC program to {} (flip={})",
-            ifname, flip
-        );
-        self.attach_tc(
-            ifname,
-            &[("tproxy_dae0peer_ingress", 0)],
-            Some((handle_major << 16) | ((2 & !1u32) | flip)),
-        )
+        info!("Attaching dae0peer TCX program to {}", ifname);
+        self.attach_tc(ifname, &["tproxy_dae0peer_ingress"])
     }
 
     // ========================================================================
@@ -1614,20 +1358,15 @@ impl EbpfManager {
         let start = std::time::Instant::now();
         debug!(count = self.tc_hooks.len(), cgroup_links = self.cgroup_links.len(), "detach_all starting");
 
-        // Collect the set of interfaces that had TC filters BEFORE detaching,
-        // so their clsact qdiscs can be removed afterwards (complete cleanup).
-        let ifaces: std::collections::HashSet<String> =
-            self.tc_hooks.iter().map(|i| i.iface.clone()).collect();
-
-        // Detach TC hooks
+        // Detach TCX links (dropping a bpf_link detaches it in the kernel).
         if !self.tc_hooks.is_empty() {
-            info!(count = self.tc_hooks.len(), "Detaching TC programs");
+            info!(count = self.tc_hooks.len(), "Detaching TCX programs");
             let mut detached = 0u32;
             let mut failed = 0u32;
             for info in self.tc_hooks.iter_mut() {
-                if let Err(e) = info.hook.detach() {
+                if let Err(e) = info.link.detach() {
                     warn!(
-                        "Failed to detach TC hook '{}' on {}: {}",
+                        "Failed to detach TCX link '{}' on {}: {}",
                         info.prog_name, info.iface, e
                     );
                     failed += 1;
@@ -1637,27 +1376,12 @@ impl EbpfManager {
             }
             self.tc_hooks.clear();
             debug!(
-                "TC detach: {} succeeded, {} failed ({}ms)",
+                "TCX detach: {} succeeded, {} failed ({}ms)",
                 detached,
                 failed,
                 start.elapsed().as_millis()
             );
         }
-
-        // Delete the clsact qdisc on every interface we detached from, so no TC
-        // mount point is left behind. Failures are logged but non-fatal.
-        for iface in &ifaces {
-            if let Err(e) = delete_clsact_qdisc(iface) {
-                warn!(
-                    "Failed to delete clsact qdisc on {} during detach_all: {}",
-                    iface, e
-                );
-            }
-        }
-
-        // Reset the per-interface "already cleaned" marker so a later re-attach
-        // starts from a clean slate (removes any stale filter).
-        self.clsact_cleaned.clear();
 
         // Detach cgroup links (drop the ProgramAttachment)
         if !self.cgroup_links.is_empty() {
@@ -1670,7 +1394,7 @@ impl EbpfManager {
         Ok(())
     }
 
-    /// Detach TC hooks for a specific interface only.
+    /// Detach TCX links for a specific interface only.
     /// Used for namespace-aware shutdown: dae0peer hooks must be detached
     /// in the proxy namespace before detaching host-NS hooks.
     pub fn detach_by_iface(&mut self, iface: &str) -> Result<()> {
@@ -1683,36 +1407,26 @@ impl EbpfManager {
             }
         }
         debug!(
-            "detach_by_iface: {} hooks match interface {}",
+            "detach_by_iface: {} links match interface {}",
             to_detach.len(),
             iface
         );
         // Detach in reverse order to preserve indices
         for &i in to_detach.iter().rev() {
-            let mut info = self.tc_hooks.swap_remove(i);
-            if let Err(e) = info.hook.detach() {
+            let info = self.tc_hooks.swap_remove(i);
+            if let Err(e) = info.link.detach() {
                 warn!(
-                    "Failed to detach TC hook '{}' on {}: {}",
+                    "Failed to detach TCX link '{}' on {}: {}",
                     info.prog_name, info.iface, e
                 );
             }
         }
         let detached = before - self.tc_hooks.len();
         if detached > 0 {
-            info!(iface = %iface, count = detached, "Detached TC hooks for interface");
-            // Delete the clsact qdisc so no mount point is left behind, and
-            // forget the "already cleaned" marker so a future re-attach starts
-            // from a clean slate (removes any stale filter).
-            if let Err(e) = delete_clsact_qdisc(iface) {
-                warn!(
-                    "Failed to delete clsact qdisc on {} during detach_by_iface: {}",
-                    iface, e
-                );
-            }
-            self.clsact_cleaned.remove(iface);
+            info!(iface = %iface, count = detached, "Detached TCX programs for interface");
         }
         debug!(
-            "detach_by_iface {}: {} hooks ({}ms)",
+            "detach_by_iface {}: {} links ({}ms)",
             iface,
             detached,
             start.elapsed().as_millis()
@@ -2086,13 +1800,22 @@ impl EbpfManager {
     ///  28 = DBG_REDIRECT_TUPLE_FAST_FALLBACK — fast parser fell back to slow path
     ///  29 = DBG_REDIRECT_TUPLE_SLOW_FAIL — slow parser failed to load tuple
     ///  30 = DBG_REDIRECT_INVALID_IFINDEX — redirect_track hit but ifindex is 0
-    ///  31 = DBG_REDIRECT_TRACK_REVERSE_HIT — redirect_track reverse-key lookup hit
+    ///  31 = DBG_REDIRECT_TRACK_REVERSE_HIT — (deprecated) reverse-key lookup hit
     ///  32 = DBG_REDIRECT_TRACK_UPDATE_FAIL — redirect_track map update failed
     ///  33 = DBG_ASSIGN_SELECT_TCP4 — assign_listener selected tcp4 listen key
     ///  34 = DBG_ASSIGN_SELECT_UDP  — assign_listener selected udp listen key
     ///  35 = DBG_ASSIGN_SELECT_TCP6 — assign_listener selected tcp6 listen key
-    pub fn read_debug_counters(&mut self) -> Result<[u64; 36]> {
-        let map = self.get_map_mut("debug_counter_map")?;
+    /// Read per-packet debug counters.
+    ///
+    /// Returns `Ok(None)` when the eBPF object was built without
+    /// `-DDEBUG_COUNTERS` (the `debug_counter_map` is compiled out), so callers
+    /// can distinguish "map absent" from "genuinely all-zero counters" without
+    /// doing a second map lookup.
+    pub fn read_debug_counters(&mut self) -> Result<Option<[u64; 36]>> {
+        let map = match self.get_map_mut("debug_counter_map") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
         let mut counters = [0u64; 36];
         for i in 0u32..36 {
             let key = i.to_ne_bytes();
@@ -2102,98 +1825,102 @@ impl EbpfManager {
                 }
             }
         }
-        Ok(counters)
+        Ok(Some(counters))
     }
 
     /// Log debug counters for diagnostic purposes.
     pub fn log_debug_counters(&mut self, label: &str) {
-        match self.read_debug_counters() {
-            Ok(counters) => {
-                debug!("[{}] Debug counters: egress_entered={} skipped={} tcp_entered={} tcp_direct={} tcp_proxy={} udp_entered={} udp_direct={} udp_proxy={} dae0peer_entered={} listen_null={} assign_fail={} redirect_fail={} route_fail={} outbound_dead={} parse_fail={}",
-                    label,
-                    counters[6],  // DBG_WAN_EGRESS_ENTERED
-                    counters[7],  // DBG_WAN_EGRESS_SKIPPED
-                    counters[8],  // DBG_WAN_TCP_ENTERED
-                    counters[9],  // DBG_WAN_TCP_DIRECT
-                    counters[10], // DBG_WAN_TCP_PROXY
-                    counters[11], // DBG_WAN_UDP_ENTERED
-                    counters[12], // DBG_WAN_UDP_DIRECT
-                    counters[13], // DBG_WAN_UDP_PROXY
-                    counters[14], // DBG_DAE0PEER_ENTERED
-                    counters[0],  // DBG_LISTEN_SOCKET_NULL
-                    counters[1],  // DBG_ASSIGN_LISTENER_FAIL
-                    counters[2],  // DBG_WAN_REDIRECT_FAIL
-                    counters[3],  // DBG_WAN_ROUTE_FAIL
-                    counters[4],  // DBG_WAN_OUTBOUND_DEAD
-                    counters[5],  // DBG_WAN_PARSE_FAIL
-                );
+        // Skip entirely when the eBPF object was built without DEBUG_COUNTERS.
+        let Some(counters) = self.read_debug_counters().ok().flatten() else {
+            debug!(
+                "[{}] debug_counter_map not present (built without DEBUG_COUNTERS); skipping counter dump",
+                label
+            );
+            return;
+        };
+        // Avoid spamming an "all zero" dump when no traffic has been seen yet.
+        if counters.iter().all(|&v| v == 0) {
+            debug!(
+                "[{}] All debug counters are zero — no failures detected in eBPF data path",
+                label
+            );
+            return;
+        }
+
+        debug!("[{}] Debug counters: egress_entered={} skipped={} tcp_entered={} tcp_direct={} tcp_proxy={} udp_entered={} udp_direct={} udp_proxy={} dae0peer_entered={} listen_null={} assign_fail={} redirect_fail={} route_fail={} outbound_dead={} parse_fail={}",
+            label,
+            counters[6],  // DBG_WAN_EGRESS_ENTERED
+            counters[7],  // DBG_WAN_EGRESS_SKIPPED
+            counters[8],  // DBG_WAN_TCP_ENTERED
+            counters[9],  // DBG_WAN_TCP_DIRECT
+            counters[10], // DBG_WAN_TCP_PROXY
+            counters[11], // DBG_WAN_UDP_ENTERED
+            counters[12], // DBG_WAN_UDP_DIRECT
+            counters[13], // DBG_WAN_UDP_PROXY
+            counters[14], // DBG_DAE0PEER_ENTERED
+            counters[0],  // DBG_LISTEN_SOCKET_NULL
+            counters[1],  // DBG_ASSIGN_LISTENER_FAIL
+            counters[2],  // DBG_WAN_REDIRECT_FAIL
+            counters[3],  // DBG_WAN_ROUTE_FAIL
+            counters[4],  // DBG_WAN_OUTBOUND_DEAD
+            counters[5],  // DBG_WAN_PARSE_FAIL
+        );
+        debug!(
+            "[{}] Assign counters: assign_called={} bpf_sk_assign_ok={}",
+            label,
+            counters[15], // DBG_ASSIGN_CALLED
+            counters[16], // DBG_BPF_SK_ASSIGN_OK
+        );
+        debug!(
+            "[{}] Assign listener selection: tcp4={} udp={} tcp6={}",
+            label,
+            counters[33], // DBG_ASSIGN_SELECT_TCP4
+            counters[34], // DBG_ASSIGN_SELECT_UDP
+            counters[35], // DBG_ASSIGN_SELECT_TCP6
+        );
+        debug!(
+            sk_match = counters[17],
+            sk_null = counters[18],
+            sk_mismatch = counters[19],
+            "[{}] skb->sk verification",
+            label,
+        );
+        debug!(
+            dae0_ingress_entered = counters[20],
+            dae0_redirect_tuple_ok = counters[21],
+            dae0_redirect_track_hit = counters[22],
+            dae0_redirect_success = counters[23],
+            chg_type_fail = counters[24],
+            "[{}] dae0_ingress return path",
+            label,
+        );
+        debug!(
+            redirect_track_publish = counters[25],
+            redirect_tuple_load_fail = counters[26],
+            redirect_track_miss = counters[27],
+            redirect_tuple_fast_fallback = counters[28],
+            redirect_tuple_slow_fail = counters[29],
+            redirect_invalid_ifindex = counters[30],
+            redirect_track_reverse_hit = counters[31],
+            redirect_track_update_fail = counters[32],
+            "[{}] redirect_track diagnostics",
+            label,
+        );
+        // Log individual failure counters for diagnostic detail
+        let failure_names = [
+            "listen_sock_null",
+            "assign_listener_fail",
+            "wan_redirect_fail",
+            "wan_route_fail",
+            "wan_outbound_dead",
+            "wan_parse_fail",
+        ];
+        for (i, &val) in counters[..6].iter().enumerate() {
+            if val > 0 {
                 debug!(
-                    "[{}] Assign counters: assign_called={} bpf_sk_assign_ok={}",
-                    label,
-                    counters[15], // DBG_ASSIGN_CALLED
-                    counters[16], // DBG_BPF_SK_ASSIGN_OK
+                    "[{}]  ! {} = {} (check tproxy.c for details)",
+                    label, failure_names[i], val
                 );
-                debug!(
-                    "[{}] Assign listener selection: tcp4={} udp={} tcp6={}",
-                    label,
-                    counters[33], // DBG_ASSIGN_SELECT_TCP4
-                    counters[34], // DBG_ASSIGN_SELECT_UDP
-                    counters[35], // DBG_ASSIGN_SELECT_TCP6
-                );
-                debug!(
-                    sk_match = counters[17],
-                    sk_null = counters[18],
-                    sk_mismatch = counters[19],
-                    "[{}] skb->sk verification",
-                    label,
-                );
-                debug!(
-                    dae0_ingress_entered = counters[20],
-                    dae0_redirect_tuple_ok = counters[21],
-                    dae0_redirect_track_hit = counters[22],
-                    dae0_redirect_success = counters[23],
-                    chg_type_fail = counters[24],
-                    "[{}] dae0_ingress return path",
-                    label,
-                );
-                debug!(
-                    redirect_track_publish = counters[25],
-                    redirect_tuple_load_fail = counters[26],
-                    redirect_track_miss = counters[27],
-                    redirect_tuple_fast_fallback = counters[28],
-                    redirect_tuple_slow_fail = counters[29],
-                    redirect_invalid_ifindex = counters[30],
-                    redirect_track_reverse_hit = counters[31],
-                    redirect_track_update_fail = counters[32],
-                    "[{}] redirect_track diagnostics",
-                    label,
-                );
-                // Log individual failure counters for diagnostic detail
-                let failure_names = [
-                    "listen_sock_null",
-                    "assign_listener_fail",
-                    "wan_redirect_fail",
-                    "wan_route_fail",
-                    "wan_outbound_dead",
-                    "wan_parse_fail",
-                ];
-                for (i, &val) in counters[..6].iter().enumerate() {
-                    if val > 0 {
-                        debug!(
-                            "[{}]  ! {} = {} (check tproxy.c for details)",
-                            label, failure_names[i], val
-                        );
-                    }
-                }
-                if counters.iter().all(|&v| v == 0) {
-                    debug!(
-                        "[{}] All debug counters are zero — no failures detected in eBPF data path",
-                        label
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("[{}] Failed to read debug counters: {}", label, e);
             }
         }
     }
@@ -2906,6 +2633,18 @@ impl EbpfManager {
         Ok(usage)
     }
 
+    /// Number of entries currently in conn_state_map, i.e. active connections.
+    ///
+    /// Iterates all map keys via `BPF_MAP_GET_NEXT_KEY` (O(N) over the map,
+    /// max `conn_state_map_max_entries`). This is only called from the
+    /// low-frequency metrics API, so the cost is acceptable; an incremental
+    /// userspace counter would drift because the eBPF side also evicts entries
+    /// (timeout / pressure / LRU), so a full scan is the only reliable count.
+    /// Returns 0 if eBPF is not loaded or the map is absent.
+    pub fn active_connection_count(&self) -> u64 {
+        self.count_map_entries("conn_state_map").unwrap_or(0) as u64
+    }
+
     /// Scan and delete expired entries from conn_state_map.
     ///
     /// Iterates all entries via raw BPF syscall, checks `last_seen_ns`
@@ -3338,27 +3077,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<Daeparam>(), 36);
     }
 
-    #[test]
-    fn test_is_missing_qdisc_stderr() {
-        // All iproute2 variants of "clsact does not exist" → benign
-        assert!(is_missing_qdisc_stderr("Error: Cannot find specified qdisc."));
-        assert!(is_missing_qdisc_stderr("Cannot find specified qdisc"));
-        assert!(is_missing_qdisc_stderr("Error: Invalid handle."));
-        assert!(is_missing_qdisc_stderr(
-            "Error: Cannot delete qdisc with handle of zero."
-        ));
-        assert!(is_missing_qdisc_stderr("Error: No such file or directory"));
-        assert!(is_missing_qdisc_stderr("RTNETLINK answers: No such file or directory"));
-
-        // Real failures must NOT be swallowed
-        assert!(!is_missing_qdisc_stderr(
-            "Error: Cannot delete qdisc: Operation not permitted"
-        ));
-        assert!(!is_missing_qdisc_stderr(
-            "Error: device wlp3s0 not found"
-        ));
-        assert!(!is_missing_qdisc_stderr(""));
-    }
     #[test]
     fn test_match_set_size() {
         assert_eq!(std::mem::size_of::<MatchSet>(), 24);

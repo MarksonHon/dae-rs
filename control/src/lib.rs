@@ -55,6 +55,7 @@
 pub mod api;
 pub mod dialer;
 pub mod config;
+pub mod group;
 pub mod net;
 pub mod routing;
 pub mod ruleset;
@@ -718,18 +719,16 @@ impl ControlPlane {
         }
         debug!("Step 1.5 completed: {}ms", step_start.elapsed().as_millis());
 
-        // ---- Step 1.75: Initialize flip bit for TC handle ----
-        // Check for pinned maps to determine if hot-reload/restart recovery
-        // If pinned maps exist, it means there was a previous running instance, need to flip the flip bit
-        // to avoid conflicts with old filter handles
-        let flip = if crate::net::ebpf::EbpfManager::pinned_maps_exist(crate::net::ebpf::BPFFS_PATH) {
-            info!("Pinned maps detected — setting flip=1 for TC handle rotation");
-            1u32
-        } else {
-            0u32
-        };
-        self.ebpf().set_flip(flip);
-        debug!("Flip bit set to {}", flip);
+        // ---- Step 1.75: Verify TCX kernel support ----
+        // TCX (BPF_LINK_TYPE_TCX) is the datapath attach mechanism and requires
+        // Linux >= 6.6. There is no classic-TC fallback, so fail fast. The old
+        // flip-bit handle rotation is gone: TCX links form a chain per hook and
+        // carry no handle, so stale-handle conflicts from previous runs cannot
+        // occur (links are auto-detached when the process exits).
+        if !crate::net::ebpf::probe_tcx_supported() {
+            anyhow::bail!("TCX requires Linux >= 6.6; current kernel is unsupported");
+        }
+        debug!("TCX kernel support verified");
 
         // ---- Step 2: Load eBPF program ----
         info!("Step 2/5: Loading eBPF program");
@@ -1175,10 +1174,9 @@ impl ControlPlane {
                 );
                 let entries = dc.rule_set.clone();
                 let dir = std::sync::Arc::new(ruleset::DataDir::default_dir());
-                // Proxy resolution: "first outbound group" name → SOCKS5 address of the group's currently selected node.
-                // Current architecture only supports single node (Config takes the first node address as proxy),
-                // so only the first outbound group can be resolved; other groups fall back to direct (scheduler logs a warning).
-                // TODO(Phase 3): intra-group node selection / alive node fallback logic.
+                // Proxy resolution: every outbound group name → SOCKS5 address
+                // of the group's currently selected (alive, policy-best) node.
+                // Group dialers are built earlier in start_tproxy().
                 let first_node_addr = dc
                     .outbounds
                     .nodes
@@ -1187,7 +1185,8 @@ impl ControlPlane {
                 let default_proxy = dc.outbounds.groups.first().map(|g| g.name.clone());
                 let proxy_resolver: std::sync::Arc<dyn ruleset::scheduler::ProxyResolver> =
                     std::sync::Arc::new(DefaultProxyResolver {
-                        addr: first_node_addr,
+                        group_dialers: std::sync::Arc::new(self.outbound_group_dialers.clone()),
+                        legacy_addr: first_node_addr,
                         default_group: default_proxy.clone(),
                     });
                 let scheduler = ruleset::scheduler::RuleSetScheduler::spawn(
@@ -1375,10 +1374,13 @@ impl ControlPlane {
 
     /// Build outbound dialers for every outbound **group**, keyed by group name.
     ///
-    /// Each group's node selection is resolved to its first concrete node (the
-    /// current architecture has no per-node liveness selection — the TProxy path
-    /// already uses only the first node). Groups that fail to resolve a node are
-    /// skipped.
+    /// Each group gets a [`group::GroupDialer`] wrapping **every** concrete
+    /// node its selectors reference. The group dialer implements the group's
+    /// selection policy and alive-node fallback: on a failed dial it marks the
+    /// node dead (with cooldown) and retries the next best candidate, so a
+    /// single group can span multiple nodes.
+    ///
+    /// Groups that fail to resolve any node are skipped.
     fn build_outbound_group_dialers(
         &self,
         host_ns_fd: Option<i32>,
@@ -1390,33 +1392,65 @@ impl ControlPlane {
         };
 
         for group in &cfg.outbounds.groups {
-            // Resolve the first concrete node referenced by the group's selectors.
-            let node = resolve_group_first_node(group, &cfg.outbounds.nodes);
-            match node {
-                Some(node) => match dialer::build_dialer(node, host_ns_fd, socket_mark) {
-                    Ok(d) => {
-                        debug!(
-                            group = %group.name,
-                            node = %node.name,
-                            "Outbound group dialer built"
-                        );
-                        map.insert(group.name.clone(), d);
-                    }
+            // Resolve every concrete node referenced by the group's selectors.
+            let candidates = resolve_group_nodes(group, &cfg.outbounds.nodes);
+            if candidates.is_empty() {
+                warn!(
+                    group = %group.name,
+                    "Outbound group has no resolvable node (skipped)"
+                );
+                continue;
+            }
+
+            // Build a dialer per candidate node; skip nodes that fail to build.
+            let mut group_nodes: Vec<group::GroupNode> = Vec::new();
+            for node in candidates {
+                match dialer::build_dialer(node, host_ns_fd, socket_mark) {
+                    Ok(d) => group_nodes.push(group::GroupNode::new(node.name.clone(), d)),
                     Err(e) => {
                         warn!(
                             group = %group.name,
-                            "Failed to build outbound group dialer (skipped): {}",
+                            node = %node.name,
+                            "Failed to build node dialer (skipped from group): {}",
                             e
                         );
                     }
-                },
-                None => {
-                    warn!(
-                        group = %group.name,
-                        "Outbound group has no resolvable node (skipped)"
-                    );
                 }
             }
+            if group_nodes.is_empty() {
+                warn!(
+                    group = %group.name,
+                    "Outbound group has no buildable node dialer (skipped)"
+                );
+                continue;
+            }
+
+            // `select` groups anchor on their chosen node: move it to the front
+            // and force Fixed selection (selection = the anchored node, with
+            // fallback to the rest when it's dead). `auto` groups use policy.
+            let (policy, group_nodes) = match (
+                group.group_type.clone(),
+                group.selected.clone().as_deref(),
+            ) {
+                (config::GroupType::Select, Some(selected)) => {
+                    let mut anchored = Vec::with_capacity(group_nodes.len());
+                    if let Some(pos) = group_nodes.iter().position(|n| n.name() == selected) {
+                        anchored.push(group_nodes.remove(pos));
+                    }
+                    anchored.extend(group_nodes);
+                    (config::PolicyType::Fixed, anchored)
+                }
+                _ => (group.policy.clone().unwrap_or_default(), group_nodes),
+            };
+
+            let dialer = group::GroupDialer::new(group.name.clone(), group_nodes, policy);
+            debug!(
+                group = %group.name,
+                nodes = dialer.node_count(),
+                policy = ?&dialer.policy(),
+                "Outbound group dialer built (node selection + fallback enabled)"
+            );
+            map.insert(group.name.clone(), Arc::new(dialer));
         }
         map
     }
@@ -1465,6 +1499,28 @@ impl ControlPlane {
                 "Per-group outbound dialers built"
             );
         }
+
+        // ---- Main data plane: use the default group's GroupDialer ----
+        // 主数据面（TCP/UDP 中继）默认走"第一个出站组"的 GroupDialer，从而获得
+        // 与 DNS/规则集调度器一致的组内节点选择 + 存活回退。无组配置
+        // （legacy 平铺单节点）时保留上面的单节点拨号器。
+        if let Some(default_group) = self
+            .daefile_config
+            .as_ref()
+            .and_then(|c| c.outbounds.groups.first())
+        {
+            if let Some(group_dialer) = self.outbound_group_dialers.get(&default_group.name) {
+                info!(
+                    group = %default_group.name,
+                    "Main data plane uses default outbound group dialer (node selection + fallback)"
+                );
+                self.outbound_dialer = Some(group_dialer.clone());
+            }
+        }
+        let dialer = self
+            .outbound_dialer
+            .clone()
+            .expect("outbound dialer must be present after start_tproxy");
 
         // ---- TProxy listener (in DAENS) ----
         // eBPF data flow:
@@ -2312,9 +2368,8 @@ impl ControlPlane {
     /// Hot-reload configuration without restarting eBPF or TProxy.
     ///
     /// Re-parses the daefile and updates all eBPF maps in-place.
-    /// TC hooks are NOT re-attached on reload, so the flip bit is not toggled
-    /// here: flipping it without re-attaching would make a later re-attach use a
-    /// different handle than the running filter, causing a duplicate/stale filter.
+    /// TCX hooks are NOT re-attached on reload (routing updates are applied via
+    /// the epoch double-buffer maps), so no re-attach / handle concerns apply.
     /// Safe to call even when eBPF is not loaded (maps are skipped).
     ///
     /// # Reload Coverage
@@ -2559,28 +2614,45 @@ impl Drop for ControlPlane {
 // Helper Functions
 // ============================================================================
 
-/// Default proxy resolution for Ruleset scheduler ("first outbound group → SOCKS5 address" semantics).
+/// Default proxy resolution for the ruleset scheduler.
 ///
-/// Current architecture only supports single node ([`Config::from_daefile`] takes the first node as proxy), therefore
-/// only the **first outbound group** name can be resolved to the first node's SOCKS5 address; other outbound group names are unavailable
-/// (returns `None`, scheduler falls back to direct and logs a warning).
+/// Resolves a proxy group name to the SOCKS5 address of the group's
+/// **currently selected** node via the group dialer ([`group::GroupDialer`]).
+/// Group dialers implement intra-group node selection + alive-node fallback, so
+/// the resolved address tracks the policy-best alive node.
 ///
-/// TODO(Phase 3): integrate real outbound group resolution (by `proxy` group name → current selected node / alive
-/// node SOCKS5 address).
+/// When no group dialers exist (legacy flat config with a single SOCKS5 node),
+/// `legacy_addr` is returned for the default proxy group as a fallback.
 struct DefaultProxyResolver {
-    /// SOCKS5 address of the first node.
-    addr: Option<SocketAddr>,
-    /// "First outbound group" name (the only resolvable outbound group).
+    /// Per-group dialers (group name → dialer), shared with the TProxy path.
+    group_dialers: Arc<HashMap<String, Arc<dyn OutboundDialer>>>,
+    /// Legacy single-node address used when the group map is empty.
+    legacy_addr: Option<SocketAddr>,
+    /// Default proxy group name (legacy fallback anchor).
     default_group: Option<String>,
 }
 
 impl ruleset::scheduler::ProxyResolver for DefaultProxyResolver {
     fn resolve(&self, proxy: &str) -> Option<SocketAddr> {
-        if self.default_group.as_deref() == Some(proxy) {
-            self.addr
-        } else {
-            None
+        if let Some(dialer) = self.group_dialers.get(proxy) {
+            // 调度器只会对解析到的地址做 SOCKS5 握手来下载规则集；只有当前选中
+            // 节点是真正的 SOCKS5 拨号器时才可复用该地址，否则（TUIC/vmess/
+            // trojan/shadowsocks/juicity）返回 None → 调度器回退直连下载。
+            if dialer.is_socks5() {
+                return Some(dialer.proxy_addr());
+            }
+            warn!(
+                proxy = proxy,
+                "proxy group does not resolve to a SOCKS5 node; \
+                 falling back to direct for rule-set download"
+            );
+            return None;
         }
+        // Legacy flat config: the default group maps to a single SOCKS5 node.
+        if self.default_group.as_deref() == Some(proxy) {
+            return self.legacy_addr;
+        }
+        None
     }
 }
 
@@ -2830,26 +2902,32 @@ fn configure_kernel_if(iface: &str) {
 // Unit Tests
 // ============================================================================
 
-/// Resolve an outbound group to its first concrete node.
+/// Resolve an outbound group to **all** concrete nodes its selectors reference.
 ///
-/// Evaluates the group's selectors in order:
-/// - `List` → look up each named node, return the first that exists;
-/// - `Regex` → return the first node whose name matches the pattern.
-///
-/// The current architecture has no per-node liveness selection (TProxy also
-/// only uses the first node), so the first matching node is used.
-fn resolve_group_first_node<'a>(
+/// Evaluates each selector in order, collecting the matching nodes without
+/// duplicates:
+/// - `List` → each named node that exists in `nodes`;
+/// - `Regex` → every node whose name matches the pattern.
+fn resolve_group_nodes<'a>(
     group: &config::OutboundGroupConfig,
     nodes: &'a [config::OutboundNodeConfig],
-) -> Option<&'a config::OutboundNodeConfig> {
-    let find_by_name = |name: &str| nodes.iter().find(|n| n.name == name);
+) -> Vec<&'a config::OutboundNodeConfig> {
+    let mut seen = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    let push = |node: &'a config::OutboundNodeConfig,
+                seen: &mut std::collections::HashSet<&'a str>,
+                result: &mut Vec<&'a config::OutboundNodeConfig>| {
+        if seen.insert(&node.name) {
+            result.push(node);
+        }
+    };
 
     for selector in &group.selectors {
         match selector {
             config::NodeSelector::List { nodes: names } => {
                 for name in names {
-                    if let Some(node) = find_by_name(name) {
-                        return Some(node);
+                    if let Some(node) = nodes.iter().find(|n| n.name == *name) {
+                        push(node, &mut seen, &mut result);
                     }
                 }
             }
@@ -2858,7 +2936,7 @@ fn resolve_group_first_node<'a>(
                     Ok(re) => {
                         for node in nodes {
                             if re.is_match(&node.name) {
-                                return Some(node);
+                                push(node, &mut seen, &mut result);
                             }
                         }
                     }
@@ -2874,7 +2952,7 @@ fn resolve_group_first_node<'a>(
             }
         }
     }
-    None
+    result
 }
 
 /// Collect all proxy server IP addresses from the configuration.
@@ -2914,6 +2992,7 @@ fn collect_proxy_server_ips(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ruleset::scheduler::ProxyResolver;
 
     #[test]
     fn test_config_default() {
@@ -2969,5 +3048,195 @@ mod tests {
     fn test_compile_rules_action_mapping() {
         // This test was removed - compile_rules in lib.rs is deprecated.
         // Routing tests are in routing::matcher::tests.
+    }
+
+    // ------------------------------------------------------------------------
+    // resolve_group_nodes
+    // ------------------------------------------------------------------------
+
+    fn node(name: &str, addr: &str) -> config::OutboundNodeConfig {
+        config::OutboundNodeConfig {
+            name: name.into(),
+            protocol: "socks5".into(),
+            address: addr.into(),
+            import: None,
+            username: None,
+            password: None,
+            cipher: None,
+            sni: None,
+            ca_sha256: None,
+            uuid: None,
+            congestion_control: None,
+            alpn: None,
+            security: None,
+            alter_id: None,
+            network: None,
+            ws_path: None,
+            ws_headers: None,
+            h2_path: None,
+            h2_host: None,
+            grpc_service_name: None,
+            dial_timeout_ms: 5000,
+        }
+    }
+
+    #[test]
+    fn test_resolve_group_nodes_list_and_regex() {
+        let nodes = vec![
+            node("hk-a", "1.1.1.1:443"),
+            node("hk-b", "2.2.2.2:443"),
+            node("us-c", "3.3.3.3:443"),
+            node("us-d", "4.4.4.4:443"),
+        ];
+        // List selector + regex selector, with a duplicate name to test dedup.
+        let group = config::OutboundGroupConfig {
+            name: "g".into(),
+            group_type: config::GroupType::Auto,
+            policy: None,
+            selected: None,
+            selectors: vec![
+                config::NodeSelector::List {
+                    nodes: vec!["hk-b".into(), "missing".into(), "hk-a".into(), "hk-b".into()],
+                },
+                config::NodeSelector::Regex {
+                    pattern: "^us-".into(),
+                },
+            ],
+        };
+        let resolved = resolve_group_nodes(&group, &nodes);
+        let names: Vec<&str> = resolved.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["hk-b", "hk-a", "us-c", "us-d"]);
+    }
+
+    #[test]
+    fn test_resolve_group_nodes_no_match() {
+        let nodes = vec![node("hk-a", "1.1.1.1:443")];
+        let group = config::OutboundGroupConfig {
+            name: "g".into(),
+            group_type: config::GroupType::Auto,
+            policy: None,
+            selected: None,
+            selectors: vec![config::NodeSelector::List {
+                nodes: vec!["nope".into()],
+            }],
+        };
+        assert!(resolve_group_nodes(&group, &nodes).is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // DefaultProxyResolver
+    // ------------------------------------------------------------------------
+
+    /// Minimal fake dialer exposing a fixed proxy address.
+    struct FixedAddrDialer(SocketAddr);
+
+    #[async_trait::async_trait]
+    impl protocols::OutboundDialer for FixedAddrDialer {
+        async fn dial(&self, _target: &str) -> anyhow::Result<protocols::ProxyConn> {
+            anyhow::bail!("unused in tests")
+        }
+        async fn udp_dial(&self) -> anyhow::Result<Box<dyn protocols::UdpSession>> {
+            anyhow::bail!("unused in tests")
+        }
+        fn protocol_name(&self) -> &'static str {
+            "fake"
+        }
+        fn proxy_addr(&self) -> SocketAddr {
+            self.0
+        }
+        fn is_socks5(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Fake dialer that does NOT advertise SOCKS5 (models TUIC/vmess/etc.).
+    struct NonSocks5Dialer(SocketAddr);
+
+    #[async_trait::async_trait]
+    impl protocols::OutboundDialer for NonSocks5Dialer {
+        async fn dial(&self, _target: &str) -> anyhow::Result<protocols::ProxyConn> {
+            anyhow::bail!("unused in tests")
+        }
+        async fn udp_dial(&self) -> anyhow::Result<Box<dyn protocols::UdpSession>> {
+            anyhow::bail!("unused in tests")
+        }
+        fn protocol_name(&self) -> &'static str {
+            "tuic"
+        }
+        fn proxy_addr(&self) -> SocketAddr {
+            self.0
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_default_proxy_resolver_resolves_any_group() {
+        let mut dialers: HashMap<String, Arc<dyn OutboundDialer>> = HashMap::new();
+        let group_dialer = group::GroupDialer::new(
+            "proxy_a".into(),
+            vec![group::GroupNode::new(
+                "node1".into(),
+                Arc::new(FixedAddrDialer("10.0.0.1:443".parse().unwrap())),
+            )],
+            config::PolicyType::Fixed,
+        );
+        dialers.insert("proxy_a".into(), Arc::new(group_dialer));
+        dialers.insert(
+            "proxy_b".into(),
+            Arc::new(FixedAddrDialer("10.0.0.2:8443".parse().unwrap())),
+        );
+
+        let resolver = DefaultProxyResolver {
+            group_dialers: Arc::new(dialers),
+            legacy_addr: Some("127.0.0.1:1080".parse().unwrap()),
+            default_group: Some("proxy_a".into()),
+        };
+
+        // Any configured group name resolves (to its selected node's addr).
+        assert_eq!(resolver.resolve("proxy_a"), Some("10.0.0.1:443".parse().unwrap()));
+        assert_eq!(resolver.resolve("proxy_b"), Some("10.0.0.2:8443".parse().unwrap()));
+        // Unknown group → None.
+        assert_eq!(resolver.resolve("unknown"), None);
+    }
+
+    #[test]
+    fn test_default_proxy_resolver_non_socks5_falls_back_to_none() {
+        // 规则集调度器只会做 SOCKS5 握手：非 SOCKS5 组（TUIC/vmess 等）不得
+        // 被当作 SOCKS5 地址返回 → resolve 返回 None（调度器回退直连）。
+        let mut dialers: HashMap<String, Arc<dyn OutboundDialer>> = HashMap::new();
+        dialers.insert("proxy_tuic".into(), Arc::new(NonSocks5Dialer("1.2.3.4:443".parse().unwrap())));
+        let group_dialer = group::GroupDialer::new(
+            "proxy_vmess".into(),
+            vec![group::GroupNode::new(
+                "n".into(),
+                Arc::new(NonSocks5Dialer("5.6.7.8:443".parse().unwrap())),
+            )],
+            config::PolicyType::Fixed,
+        );
+        dialers.insert("proxy_vmess".into(), Arc::new(group_dialer));
+
+        let resolver = DefaultProxyResolver {
+            group_dialers: Arc::new(dialers),
+            legacy_addr: None,
+            default_group: None,
+        };
+        assert_eq!(resolver.resolve("proxy_tuic"), None);
+        assert_eq!(resolver.resolve("proxy_vmess"), None);
+    }
+
+    #[test]
+    fn test_default_proxy_resolver_legacy_fallback() {
+        let resolver = DefaultProxyResolver {
+            group_dialers: Arc::new(HashMap::new()),
+            legacy_addr: Some("127.0.0.1:1080".parse().unwrap()),
+            default_group: Some("proxy_a".into()),
+        };
+        assert_eq!(resolver.resolve("proxy_a"), Some("127.0.0.1:1080".parse().unwrap()));
+        assert_eq!(resolver.resolve("proxy_b"), None);
     }
 }

@@ -44,6 +44,7 @@ outbounds         # proxy nodes and groups
 routing           # which traffic goes direct / proxy / block
 api               # optional REST API
 rule_set          # rule sets (text domain/IP lists) download & scheduling
+dns               # optional DNS forwarder (domain-based split)
 ```
 
 Example skeleton:
@@ -65,6 +66,8 @@ routing { ... }
 api { ... }
 
 rule_set { ... }
+
+dns { ... }
 ```
 
 ## 4. Section Details
@@ -312,6 +315,49 @@ rule_set {
   through the first proxy group (or the entry's explicit `proxy`).
 - Reference syntax: see §4.5 "Rule-set reference syntax".
 
+### 4.8 `dns`
+
+Optional. dae-rs removed the original dae eBPF DNS-hijack module in favor of a
+**userspace DNS forwarder**: port-53 queries are still intercepted as ordinary
+UDP by TProxy, recognized in userspace, and split by **domain**. The outbound is
+derived from the existing `routing` rules (`domain` / `target_domain` → the
+proxy group the domain matches; each group — and direct — keeps its own TTL
+cache and reuses a persistent UDP relay session).
+
+```
+dns {
+  listen_addr: 169.254.0.1:53        # optional listen entry point
+  proxy_dns_servers: 1.1.1.1:53, 8.8.8.8   # unified upstream for proxied queries
+  direct_dns_servers: 223.5.5.5      # upstream for direct queries
+  direct_use_system_dns: true        # fall back to /etc/resolv.conf when direct list is empty
+  query_timeout_ms: 5000             # query timeout (100–60000)
+  enable_cache: true                 # per-group TTL cache
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `listen_addr` | no | Internal listen address (default `169.254.0.1:53`, dae-internal only). Bound on host-NS `lo`; clients must explicitly point DNS at it. |
+| `proxy_dns_servers` | no | Unified upstream used for proxied queries (`ip` or `ip:port`). When empty, proxied queries fall back to direct. |
+| `direct_dns_servers` | no | Upstream for direct queries (`ip` or `ip:port`); when empty, falls back to system `/etc/resolv.conf`. |
+| `direct_use_system_dns` | no | Whether to fall back to system DNS when the direct list is empty (default `true`). |
+| `query_timeout_ms` | no | Query timeout in ms (default `5000`, range 100–60000). |
+| `enable_cache` | no | Enable per-group TTL cache (default `true`). |
+
+Behavior notes:
+
+- **Domain split**: DNS defines no proxy rules of its own. `domain(...)` /
+  `target_domain(...)`-matched proxy groups decide the outbound; unmatched
+  queries go to `routing.fallback`.
+- **Group unavailable** (no dialer / no proxy upstream / all nodes down) →
+  falls back to direct with a warning, so queries are not dropped.
+- **Persistent sessions**: each proxy group reuses one full-cone UDP session to
+  avoid per-query re-handshakes; the session is bound to the node it was
+  created on and is rebuilt automatically when the group's selected node
+  changes.
+- Without a `dns` section, DNS is treated as ordinary UDP traffic (default
+  TProxy path).
+
 ## 5. Configuration Validation
 
 `validate_config()` performs semantic validation and produces diagnostics with
@@ -342,11 +388,17 @@ non-fatal issues such as missing policies.
 
 ## 7. Known Limitations (as implemented today)
 
-- Only `socks5` outbound nodes are supported (Phase 1).
-- Only one SOCKS5 upstream address is actively used by the control plane
-  (the first node in the config); outbound groups select nodes and feed the
-  connectivity map, but node-to-node switching is a work in progress.
+- Outbound nodes support `socks5`, `shadowsocks`, `trojan`, `vmess`, `tuic`
+  and `juicity` (feature-gated at build time).
+- **Group selection & fallback**: `GroupDialer` implements in-group node
+  selection (select-anchored / auto policies) and alive-node fallback (dead
+  marking + cooldown), wired into the DNS forwarder, rule-set download proxy
+  and the **default group** of the main data plane. However, the main data
+  plane (TProxy relay) currently always dials through the **default (first)
+  group's** dialer — traffic routed to other groups still goes out via the
+  default group; per-group relaying for non-default groups is not wired yet.
 - Rule-set data (`domain_list` / `ip_list`) is downloaded via the URLs
   configured in `rule_set` into `/var/lib/dae-rs/` and parsed by dae-rs.
   `set:<name>` is wired into the data path. A missing dataset referenced at
-  compile time raises E2103.
+  compile time raises E2103; DNS domain routing skips the affected rule with a
+  warning (fallback applies) instead of failing data-plane startup.

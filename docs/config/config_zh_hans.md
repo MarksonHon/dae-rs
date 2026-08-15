@@ -39,6 +39,7 @@ outbounds         # 代理节点与分组
 routing           # 哪些流量直连 / 代理 / 阻断
 api               # 可选 REST API
 rule_set          # 规则集（文本域名/IP 列表）下载与调度
+dns               # 可选 DNS 转发器（按域名分流）
 ```
 
 示例骨架：
@@ -60,6 +61,8 @@ routing { ... }
 api { ... }
 
 rule_set { ... }
+
+dns { ... }
 ```
 
 ## 4. 各区块说明
@@ -299,6 +302,42 @@ rule_set {
   校验、原子替换与损坏恢复；缺失时通过第一个代理组（或条目显式 `proxy`）下载。
 - 路由引用语法见 §4.5「规则集引用语法」。
 
+### 4.8 `dns`
+
+可选。dae-rs 移除了原版 dae 的 eBPF DNS 劫持模块，改为**纯用户空间 DNS 转发器**：
+53 端口查询仍被 TProxy 当作普通 UDP 拦截，在用户空间识别出 DNS 报文后按
+**域名**分流（去向由现有 `routing` 规则的 `domain` / `target_domain` 推导，
+命中哪个代理组就走哪个组；每组含直连独立 TTL 缓存，并复用持久 UDP 会话）。
+
+```
+dns {
+  listen_addr: 169.254.0.1:53        # 监听版入口地址（可选）
+  proxy_dns_servers: 1.1.1.1:53, 8.8.8.8   # 走代理查询的统一上游
+  direct_dns_servers: 223.5.5.5      # 直连查询上游
+  direct_use_system_dns: true        # 直连上游为空时回退 /etc/resolv.conf
+  query_timeout_ms: 5000             # 查询超时（100–60000）
+  enable_cache: true                 # 按组 TTL 缓存
+}
+```
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `listen_addr` | 否 | 内部监听地址（默认 `169.254.0.1:53`，仅 dae 内部、不对外）。配到 host NS `lo`，需客户端显式指向该地址。 |
+| `proxy_dns_servers` | 否 | 走代理查询时统一使用的上游 DNS（`ip` 或 `ip:port`）。为空时，代理组的查询回退直连。 |
+| `direct_dns_servers` | 否 | 直连查询使用的上游（`ip` 或 `ip:port`）；为空则回退系统 `/etc/resolv.conf`。 |
+| `direct_use_system_dns` | 否 | 直连上游为空时是否回退系统 DNS（默认 `true`）。 |
+| `query_timeout_ms` | 否 | 查询超时毫秒数（默认 `5000`，范围 100–60000）。 |
+| `enable_cache` | 否 | 是否启用按组 TTL 缓存（默认 `true`）。 |
+
+行为说明：
+
+- **域名分流**：DNS 自身不定义代理规则。`domain(...)` / `target_domain(...)`
+  命中的代理组决定查询走向；未命中走 `routing.fallback`。
+- **组不可用**（无拨号器 / 无代理上游 / 节点全挂）→ 回退直连并告警，避免丢查询。
+- **持久会话**：每个代理组复用一条 full-cone UDP 会话，避免每个查询重新握手；
+  会话绑定建会话时的节点，组内节点切换时自动重建。
+- 未配置 `dns` 区块时，DNS 按普通 UDP 流量处理（走 TProxy 默认路径）。
+
 ## 5. 配置校验
 
 `validate_config()` 做语义校验并给出带稳定错误码的诊断信息：
@@ -328,9 +367,13 @@ rule_set {
 
 ## 7. 当前已知限制（按已实现代码）
 
-- 仅支持 `socks5` 出站节点（阶段一）。
-- 控制面实际只使用一个 SOCKS5 上游地址（配置文件中的第一个节点）；
-  出站分组会做节点选择并写入连通性 map，但节点间切换仍在开发中。
+- 出站节点支持 `socks5`、`shadowsocks`、`trojan`、`vmess`、`tuic`、`juicity`
+  （按编译特性开关）。
+- **分组选择与回退**：`GroupDialer` 已实现组内节点选择（select 锚定 / auto 策略）
+  与存活回退（失败标记死亡 + 冷却），已接入 DNS 转发器、规则集下载代理与
+  主数据面**默认组**。但主数据面（TProxy 中继）目前统一走**默认（第一个）组**的
+  拨号器——路由到其它组的流量仍经默认组发出，非默认组尚未接入逐组中继。
 - 规则集数据（`domain_list` / `ip_list`）通过 `rule_set` 区块配置的 URL
   下载到 `/var/lib/dae-rs/` 并由 dae-rs 解析加载；`set:<name>` 已接入
-  数据面求值。编译期若引用的数据缺失会报错（E2103）。
+  数据面求值。编译期若引用的数据缺失会报错（E2103）；DNS 域名路由在规则集
+  缺失时跳过对应规则并告警（回退 fallback），不影响数据面启动。

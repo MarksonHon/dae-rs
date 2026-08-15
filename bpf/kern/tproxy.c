@@ -29,6 +29,11 @@
 #define __PRINT_ROUTING_RESULT
 // #define __PRINT_SETUP_PROCESS_CONNNECTION
 // #define __UNROLL_ROUTE_LOOP
+// Per-packet debug counters (debug_counter_map) are DISABLED by default: each
+// counter adds a per-CPU array lookup + increment on the hot path (~2-5% CPU
+// at high packet rates). Enable by passing -DDEBUG_COUNTERS on the clang
+// command line (see build.rs), or uncomment the line below.
+// #define DEBUG_COUNTERS
 
 #ifndef __DEBUG
 #undef bpf_printk
@@ -503,11 +508,12 @@ enum bpf_stats_key {
 //  28: redirect_tuple fast path fallback to slow path
 //  29: redirect_tuple slow path load failed
 //  30: redirect_track hit but ifindex is invalid (0)
-//  31: redirect_track reverse-key lookup hit
+//  31: (deprecated) redirect_track reverse-key lookup hit
 //  32: redirect_track map update failed
 //  33: assign_listener selected TCP/IPv4 listener key
 //  34: assign_listener selected UDP listener key
 //  35: assign_listener selected TCP/IPv6 listener key
+#ifdef DEBUG_COUNTERS
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, __u32);
@@ -554,6 +560,8 @@ enum debug_counter_key {
 	DBG_REDIRECT_TUPLE_FAST_FALLBACK = 28,
 	DBG_REDIRECT_TUPLE_SLOW_FAIL = 29,
 	DBG_REDIRECT_INVALID_IFINDEX = 30,
+	// Deprecated: lookup key is now canonicalized, so a reverse-key hit
+	// can never occur.
 	DBG_REDIRECT_TRACK_REVERSE_HIT = 31,
 	DBG_REDIRECT_TRACK_UPDATE_FAIL = 32,
 	DBG_ASSIGN_SELECT_TCP4 = 33,
@@ -568,6 +576,10 @@ enum debug_counter_key {
 	__u64 *_dbg_cnt = bpf_map_lookup_elem(&debug_counter_map, &_dbg_key); \
 	if (_dbg_cnt) (*_dbg_cnt) += 1; \
 } while (0)
+#else
+// Debug counters disabled: compile out every increment on the hot path.
+#define increment_counter(skb, key) ((void)0)
+#endif /* DEBUG_COUNTERS */
 
 static __always_inline void normalize_redirect_ip(union ip6 *ip)
 {
@@ -637,6 +649,36 @@ static __always_inline __u32 detect_tcp_listener_key(struct __sk_buff *skb)
 
 fallback:
 	return skb->protocol == bpf_htons(ETH_P_IPV6) ? 2 : 0;
+}
+
+/* detect_link_h_len determines whether the packet carries an Ethernet
+ * (L2) header or starts directly at the L3 header (netkit L3 mode).
+ * Returns ETH_HLEN for L2, 0 for L3.
+ *
+ * The check reuses the proven pattern from load_redirect_tuple_fast():
+ * an Ethernet header is present iff the ethertype at data[12..14]
+ * matches skb->protocol and is a valid IP ethertype. In netkit L3 mode
+ * those bytes are part of the IP header, so they won't match skb->protocol.
+ */
+static __always_inline __u32 detect_link_h_len(struct __sk_buff *skb)
+{
+	void *data, *data_end;
+
+	if (bpf_skb_pull_data(skb, ETH_HLEN + 2) < 0)
+		return 0;
+
+	data = (void *)(long)skb->data;
+	data_end = (void *)(long)skb->data_end;
+
+	if ((void *)(data + ETH_HLEN + 2) <= data_end) {
+		struct ethhdr *eth = data;
+
+		if ((eth->h_proto == bpf_htons(ETH_P_IP) ||
+		     eth->h_proto == bpf_htons(ETH_P_IPV6)) &&
+		    eth->h_proto == skb->protocol)
+			return ETH_HLEN;
+	}
+	return 0;
 }
 
 // Events delivered to userspace via ring buffer.
@@ -1762,23 +1804,31 @@ static __always_inline __attribute__((unused)) int assign_listener(struct __sk_b
 	increment_counter(skb, DBG_ASSIGN_CALLED);
 	struct bpf_sock *sk;
 	const __u32 *key = &one_key;
+#ifdef DEBUG_COUNTERS
 	__u32 select_counter = DBG_ASSIGN_SELECT_UDP;
+#endif
 
 	if (l4proto == IPPROTO_TCP) {
 		__u32 tcp_key = detect_tcp_listener_key(skb);
 		key = tcp_key == 2 ? &two_key : &zero_key;
+#ifdef DEBUG_COUNTERS
 		select_counter = tcp_key == 2 ? DBG_ASSIGN_SELECT_TCP6
 					      : DBG_ASSIGN_SELECT_TCP4;
+#endif
 	}
 
+#ifdef DEBUG_COUNTERS
 	increment_counter(skb, select_counter);
+#endif
 
 	sk = bpf_map_lookup_elem(&listen_socket_map, key);
 
 	if (!sk) {
+#ifdef DEBUG_COUNTERS
 		__u32 k = DBG_LISTEN_SOCKET_NULL;
 		__u64 *cnt = bpf_map_lookup_elem(&debug_counter_map, &k);
 		if (cnt) __sync_fetch_and_add(cnt, 1);
+#endif
 		return -1;
 	}
 
@@ -1797,9 +1847,11 @@ static __always_inline __attribute__((unused)) int assign_listener(struct __sk_b
 			increment_counter(skb, DBG_BPF_SK_ASSIGN_SK_MISMATCH);
 		}
 	} else {
+#ifdef DEBUG_COUNTERS
 		__u32 k = DBG_ASSIGN_LISTENER_FAIL;
 		__u64 *cnt = bpf_map_lookup_elem(&debug_counter_map, &k);
 		if (cnt) __sync_fetch_and_add(cnt, 1);
+#endif
 	}
 
 	bpf_sk_release(sk);
@@ -2357,16 +2409,10 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 	return TC_ACT_PIPE;
 }
 
-SEC("tc/lan_egress_l2")
-int tproxy_lan_egress_l2(struct __sk_buff *skb)
+SEC("tcx/egress")
+int tproxy_lan_egress(struct __sk_buff *skb)
 {
-	return do_tproxy_lan_egress(skb, 14);
-}
-
-SEC("tc/lan_egress_l3")
-int tproxy_lan_egress_l3(struct __sk_buff *skb)
-{
-	return do_tproxy_lan_egress(skb, 0);
+	return do_tproxy_lan_egress(skb, detect_link_h_len(skb));
 }
 
 static __noinline bool
@@ -2707,16 +2753,10 @@ block:
 	return TC_ACT_SHOT;
 }
 
-SEC("tc/lan_ingress_l2")
-int tproxy_lan_ingress_l2(struct __sk_buff *skb)
+SEC("tcx/ingress")
+int tproxy_lan_ingress(struct __sk_buff *skb)
 {
-	return do_tproxy_lan_ingress(skb, 14);
-}
-
-SEC("tc/lan_ingress_l3")
-int tproxy_lan_ingress_l3(struct __sk_buff *skb)
-{
-	return do_tproxy_lan_ingress(skb, 0);
+	return do_tproxy_lan_ingress(skb, detect_link_h_len(skb));
 }
 
 // Cookie will change after the first packet, so we just use it for
@@ -2808,16 +2848,10 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 	return TC_ACT_PIPE;
 }
 
-SEC("tc/wan_ingress_l2")
-int tproxy_wan_ingress_l2(struct __sk_buff *skb)
+SEC("tcx/ingress")
+int tproxy_wan_ingress(struct __sk_buff *skb)
 {
-	return do_tproxy_wan_ingress(skb, 14);
-}
-
-SEC("tc/wan_ingress_l3")
-int tproxy_wan_ingress_l3(struct __sk_buff *skb)
-{
-	return do_tproxy_wan_ingress(skb, 0);
+	return do_tproxy_wan_ingress(skb, detect_link_h_len(skb));
 }
 
 // Routing and redirect the packet back.
@@ -2899,9 +2933,11 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		if (s64_ret < 0) {
 			bpf_printk("wan_egress_tcp: route FAILED ret=%lld",
 				   s64_ret);
+#ifdef DEBUG_COUNTERS
 			__u32 _k = DBG_WAN_ROUTE_FAIL;
 			__u64 *_cnt = bpf_map_lookup_elem(&debug_counter_map, &_k);
 			if (_cnt) __sync_fetch_and_add(_cnt, 1);
+#endif
 			return TC_ACT_SHOT;
 		}
 
@@ -2993,9 +3029,11 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	if (!wan_outbound_is_alive(skb, outbound, IPPROTO_TCP)) {
 		bpf_printk("wan_egress_tcp: outbound NOT alive, outbound=%u",
 			   outbound);
+#ifdef DEBUG_COUNTERS
 		__u32 _k = DBG_WAN_OUTBOUND_DEAD;
 		__u64 *_cnt = bpf_map_lookup_elem(&debug_counter_map, &_k);
 		if (_cnt) __sync_fetch_and_add(_cnt, 1);
+#endif
 		return TC_ACT_SHOT;
 	}
 
@@ -3028,9 +3066,11 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		if (redirect_ret < 0) {
 			bpf_printk("wan_egress_tcp: redirect FAILED ret=%d ifindex=%u",
 				   redirect_ret, get_dae0_ifindex());
+#ifdef DEBUG_COUNTERS
 			__u32 _k = DBG_WAN_REDIRECT_FAIL;
 			__u64 *_cnt = bpf_map_lookup_elem(&debug_counter_map, &_k);
 			if (_cnt) __sync_fetch_and_add(_cnt, 1);
+#endif
 			return TC_ACT_SHOT;
 		}
 		bpf_printk("wan_egress_tcp: redirect OK ret=%d", redirect_ret);
@@ -3230,9 +3270,11 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 	if (ret) {
 		if (ret < 0) {
 			bpf_printk("wan_egress parse error: %d, dropping", ret);
+#ifdef DEBUG_COUNTERS
 			__u32 _k = DBG_WAN_PARSE_FAIL;
 			__u64 *_cnt = bpf_map_lookup_elem(&debug_counter_map, &_k);
 			if (_cnt) __sync_fetch_and_add(_cnt, 1);
+#endif
 			return TC_ACT_SHOT;
 		}
 		return TC_ACT_OK;
@@ -3247,19 +3289,13 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 	return TC_ACT_OK;
 }
 
-SEC("tc/wan_egress_l2")
-int tproxy_wan_egress_l2(struct __sk_buff *skb)
+SEC("tcx/egress")
+int tproxy_wan_egress(struct __sk_buff *skb)
 {
-	return do_tproxy_wan_egress(skb, 14);
+	return do_tproxy_wan_egress(skb, detect_link_h_len(skb));
 }
 
-SEC("tc/wan_egress_l3")
-int tproxy_wan_egress_l3(struct __sk_buff *skb)
-{
-	return do_tproxy_wan_egress(skb, 0);
-}
-
-SEC("tc/dae0peer_ingress")
+SEC("tcx/ingress")
 int tproxy_dae0peer_ingress(struct __sk_buff *skb) {
 	increment_counter(skb, DBG_DAE0PEER_ENTERED);
 
@@ -3456,14 +3492,29 @@ load_redirect_tuple(struct __sk_buff *skb,
 	if (ret == LOAD_REDIRECT_TUPLE_FALLBACK) {
 		increment_counter(skb, DBG_REDIRECT_TUPLE_FAST_FALLBACK);
 		ret = load_redirect_tuple_slow(skb, redirect_tuple);
-		if (ret)
+		if (ret) {
 			increment_counter(skb, DBG_REDIRECT_TUPLE_SLOW_FAIL);
+			return ret;
+		}
+	} else if (ret) {
 		return ret;
 	}
-	return ret;
+
+	/* Canonicalize the lookup key identically to the insert side in
+	 * publish_redirect_track_for_packet(): normalize IPv4-mapped form and
+	 * sort sip/dip. This guarantees a single direct map lookup hits.
+	 */
+	normalize_redirect_tuple(redirect_tuple);
+	if (redirect_ip_gt(&redirect_tuple->sip, &redirect_tuple->dip)) {
+		union ip6 tmp_sip = redirect_tuple->sip;
+
+		redirect_tuple->sip = redirect_tuple->dip;
+		redirect_tuple->dip = tmp_sip;
+	}
+	return 0;
 }
 
-SEC("tc/dae0_ingress")
+SEC("tcx/ingress")
 int tproxy_dae0_ingress(struct __sk_buff *skb)
 {
 	increment_counter(skb, DBG_DAE0_INGRESS_ENTERED);
@@ -3476,50 +3527,19 @@ int tproxy_dae0_ingress(struct __sk_buff *skb)
 		increment_counter(skb, DBG_REDIRECT_TUPLE_LOAD_FAIL);
 		return TC_ACT_OK;
 	}
-	normalize_redirect_tuple(&redirect_tuple);
 
 	increment_counter(skb, DBG_DAE0_REDIRECT_TUPLE_OK);
 
+	/* load_redirect_tuple() already canonicalizes the key (IPv4-mapped
+	 * normalization + sip/dip sort), matching the single insert side in
+	 * publish_redirect_track_for_packet(). A single lookup always hits.
+	 */
 	struct redirect_entry *redirect_entry =
 		bpf_map_lookup_elem(&redirect_track, &redirect_tuple);
 
 	if (!redirect_entry) {
-		/* Fallback: try reverse key. Some paths may publish tuple in
-		 * src->dst order while reply packets are decoded as dst->src.
-		 */
-		struct redirect_tuple reversed = {};
-		reversed.sip = redirect_tuple.dip;
-		reversed.dip = redirect_tuple.sip;
-		redirect_entry = bpf_map_lookup_elem(&redirect_track, &reversed);
-		if (!redirect_entry) {
-			/* IPv4 compatibility fallback: try key without IPv4-mapped
-			 * ffff marker in case publish-side tuple used raw v4 encoding.
-			 */
-			struct redirect_tuple v4_raw = redirect_tuple;
-			struct redirect_tuple v4_raw_reversed = {};
-			bool maybe_v4_mapped =
-				(v4_raw.sip.u6_addr32[0] == 0) &&
-				(v4_raw.sip.u6_addr32[1] == 0) &&
-				(v4_raw.dip.u6_addr32[0] == 0) &&
-				(v4_raw.dip.u6_addr32[1] == 0);
-
-			if (maybe_v4_mapped) {
-				v4_raw.sip.u6_addr32[2] = 0;
-				v4_raw.dip.u6_addr32[2] = 0;
-				redirect_entry = bpf_map_lookup_elem(&redirect_track, &v4_raw);
-				if (!redirect_entry) {
-					v4_raw_reversed.sip = v4_raw.dip;
-					v4_raw_reversed.dip = v4_raw.sip;
-					redirect_entry = bpf_map_lookup_elem(&redirect_track,
-									 &v4_raw_reversed);
-				}
-			}
-			if (!redirect_entry) {
-				increment_counter(skb, DBG_REDIRECT_TRACK_MISS);
-				return TC_ACT_OK;
-			}
-		}
-		increment_counter(skb, DBG_REDIRECT_TRACK_REVERSE_HIT);
+		increment_counter(skb, DBG_REDIRECT_TRACK_MISS);
+		return TC_ACT_OK;
 	}
 	increment_counter(skb, DBG_DAE0_REDIRECT_TRACK_HIT);
 	if (!redirect_entry->ifindex) {

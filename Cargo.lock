@@ -572,10 +572,12 @@ name = "control"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.9",
  "base64",
  "bincode",
  "bytemuck",
+ "bytes",
  "chrono",
  "fastrand",
  "futures",

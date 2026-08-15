@@ -107,7 +107,8 @@ const TCP_CLOSING: u8 = 7;   // include/uapi/linux/tcp.h 中的 TCP_CLOSING
 ### 3.6 其他
 
 - `RespSocketPool` 淘汰（LRU，上限 256）时无日志。
-- DNS-over-TCP 劫持使用硬编码的 5s 超时。
+- DNS-over-TCP 劫持模块已随 DNS 重构移除（DNS 视为普通流量），不再有相关
+  超时。
 - `UdpConnStateTracker` 已实现 retain/release 两阶段清理，功能上等价于
   kdae 的 "pinned" 概念。
 
@@ -140,7 +141,7 @@ const TCP_CLOSING: u8 = 7;   // include/uapi/linux/tcp.h 中的 TCP_CLOSING
 |---|------|------|
 | 5 | `RespSocketPool` 淘汰时记录 WARN 日志 | `tproxy.rs` |
 | 6 | 添加第三档 janitor 扫描节奏（最大退避 30s） | `lib.rs` |
-| 7 | DNS-over-TCP 劫持超时改为可配置 | `tproxy.rs` |
+| 7 | ~~DNS-over-TCP 劫持超时改为可配置~~（DNS 劫持模块已移除，不再适用） | — |
 
 ## 6. 实现细节
 

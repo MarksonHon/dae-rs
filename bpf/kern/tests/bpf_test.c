@@ -23,7 +23,7 @@ struct {
 	__array(values, int());
 } entry_call_map SEC(".maps") = {
 	.values = {
-		[0] = &tproxy_wan_egress_l2,
+		[0] = &tproxy_wan_egress,
 	},
 };
 

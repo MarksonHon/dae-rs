@@ -71,7 +71,6 @@
 #define MAX_ROUTING_HANDOFF_NUM 65536
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
 #define MAX_DOMAIN_ROUTING_NUM 65536
-#define MAX_ARG_LEN 128
 #define IPV6_MAX_EXTENSIONS 8
 
 #define ipv6_optlen(p) (((p)+1) << 3)
@@ -200,7 +199,10 @@ struct dae_param {
 	__u8 dae0peer_mac[6];
 	__u8 padding_after_mac[2]; // pad to align use_redirect_peer
 	__u8 use_redirect_peer;
-	__u8 has_bpf_get_current_task;
+	// Previously has_bpf_get_current_task (always 0 in the Rust port; the
+	// bpf_get_current_task/argv[0] real-name path was dead code and is removed).
+	// Kept as a reserved byte to preserve struct layout. Keep in sync with Rust.
+	__u8 reserved_task;
 	// Reserved (DNS logic removed — DNS traffic is treated as ordinary traffic).
 	// Keep in sync with the Rust Daeparam struct.
 	__u8 reserved_dns;
@@ -232,19 +234,6 @@ struct {
 	__type(value, __u32);
 	__uint(max_entries, 1);
 } dae_ifindex_map SEC(".maps");
-
-/* fast_sock map and sk_msg programs are preserved here strictly for ABI compatibility
- * with Go's generated bpf2go code (bpf_stub.go) and tcp_offload_linux.go.
- * BPF_PROG_TYPE_SOCK_OPS + BPF_PROG_TYPE_SK_MSG (bpf_msg_redirect_hash) combination
- * has been proven to cause Kernel Panic. We use TC-based redirect instead.
- * The Go side will still interact with these stubs, but they do nothing in the kernel.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_SOCKHASH);
-	__type(key, struct tuples_key);
-	__type(value, __u64);
-	__uint(max_entries, 1);
-} fast_sock SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -3564,80 +3553,21 @@ int tproxy_dae0_ingress(struct __sk_buff *skb)
 	return bpf_redirect(redirect_entry->ifindex, flags);
 }
 
-struct get_real_comm_ctx {
-	char *arg_buf;
-	u8 l;
-};
-
-static int __noinline get_real_comm_loop_cb(__u32 index, void *data)
-{
-	/*
-	* For string like: /usr/lib/sddm/sddm-helper --socket /tmp/sddm-auth1
-	* We extract "sddm-helper" from it.
-	*/
-	struct get_real_comm_ctx *ctx = (struct get_real_comm_ctx *)data;
-
-	if (index >= MAX_ARG_LEN) // always false, just to make verifier happy
-		return 1;
-	if (unlikely(ctx->arg_buf[index] == '/'))
-		ctx->l = index + 1;
-	if (unlikely(ctx->arg_buf[index] == ' ' ||
-		     ctx->arg_buf[index] == '\0')) {
-		// Write to dst.
-		ctx->arg_buf[index] = '\0';
-		return 1;
-	}
-	return 0;
-}
-
-/// Parse command line arguments to get the real command name and tgid.
+/// Populate tgid and process name (task comm) for the current process.
+/// Note: original dae derived the "real" name from argv[0] via
+/// bpf_get_current_task() + BPF_CORE_READ(task, mm, arg_start). That path was
+/// gated behind PARAM.has_bpf_get_current_task, which the Rust port never set
+/// (always 0), so it was dead code here and is removed. bpf_get_current_comm
+/// reads task->comm directly and is fully supported on all kernels dae-rs
+/// targets (>= 6.6).
 static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 {
-	int ret;
-
-	// Populate tgid and timestamp first
+	// Populate tgid and timestamp first.
 	pid_pname->last_seen_ns = bpf_ktime_get_ns();
 	pid_pname->pid = bpf_get_current_pid_tgid() >> 32;
 
-	if (!PARAM.has_bpf_get_current_task) {
-		if (bpf_get_current_comm(&pid_pname->pname, sizeof(pid_pname->pname)))
-			pid_pname->pname[0] = '\0';
-		return 0;
-	}
-
-	// Get pointer to args string.
-	struct task_struct *task = (void *)bpf_get_current_task();
-	char *args = (void *)BPF_CORE_READ(task, mm, arg_start);
-
-	// Read args to buffer.
-	char arg_buf[MAX_ARG_LEN]; // Allocate it out of ctx to pass CO-RE
-	struct get_real_comm_ctx ctx = {};
-
-	ctx.arg_buf = arg_buf;
-	ret = bpf_core_read_user_str(arg_buf, MAX_ARG_LEN, args);
-	if (unlikely(ret < 0)) {
-		bpf_printk(
-			"failed to read process name: bpf_core_read_user_str: %d",
-			ret);
-		return ret;
-	}
-
-	// Find range of command name.
-	ret = bpf_loop(MAX_ARG_LEN, get_real_comm_loop_cb, &ctx, 0);
-	if (unlikely(ret < 0))
-		return ret;
-
-	u8 offset = ctx.l;
-
-	for (u8 i = 0; i < TASK_COMM_LEN; i++) {
-		if (offset + i < MAX_ARG_LEN && arg_buf[offset + i] != '\0') {
-			pid_pname->pname[i] = arg_buf[offset + i];
-		} else {
-			pid_pname->pname[i] = '\0';
-			break;
-		}
-	}
-
+	if (bpf_get_current_comm(&pid_pname->pname, sizeof(pid_pname->pname)))
+		pid_pname->pname[0] = '\0';
 	return 0;
 }
 
@@ -3742,20 +3672,9 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 	return 1;
 }
 
-// tproxy_sockops is a placeholder for future sockops-based socket tracking.
-// Preserved for Go ABI compatibility.
-SEC("sockops")
-int tproxy_sockops(struct bpf_sock_ops *skops)
-{
-	return BPF_OK;
-}
-
-// tproxy_sk_msg_redir is DISABLED due to kernel panic issues with
-// bpf_msg_redirect_hash(). Preserved for Go ABI compatibility.
-SEC("sk_msg")
-int tproxy_sk_msg_redir(struct sk_msg_md *msg)
-{
-	return SK_PASS;
-}
+// tproxy_sockops / tproxy_sk_msg_redir (and the fast_sock SOCKHASH map) were
+// removed: they were preserved only for Go bpf2go ABI compatibility and the
+// sk_msg path (bpf_msg_redirect_hash) had caused a kernel panic. This is a
+// pure-Rust port with no Go generated code, so the stubs are dead code.
 
 SEC("license") const char __license[] = "Dual BSD/GPL";

@@ -1093,8 +1093,9 @@ set_routing_fallback(__u8 outbound, bool must)
 }
 
 // BUG-002 test helper: Create a minimal IPv4 UDP packet (42 bytes total)
-// This is the smallest valid UDP packet, used to test the bug where
-// parse_transport_fast incorrectly uses sizeof(struct tcphdr) for boundary check.
+// This is the smallest valid UDP packet; parse_transport (dynptr-based) must
+// slice the exact UDP header size and parse it correctly (regression for the
+// old fast path's sizeof(struct tcphdr) boundary check bug).
 static __always_inline int
 set_minimal_ipv4_udp(struct __sk_buff *skb,
 		     __u32 saddr, __u32 daddr,
@@ -1544,21 +1545,18 @@ set_ipv4_tcp_first_fragment_with_flags(struct __sk_buff *skb,
 	return TC_ACT_OK;
 }
 
-// BUG-001 test helper: Create IPv6 packet with large extension headers
-// The extension headers are sized to exceed 512 bytes total after IPv6 base header,
-// triggering the bug where parse_transport_fast returns -EFAULT instead of -1.
-//
-// NOTE: This test uses a fixed 512-byte packet which forces parse_transport_fast
-// to hit the boundary check limit. The test verifies that packets at the exact
-// boundary are handled correctly (fallback to slow path) rather than rejected.
+// BUG-001 test helper: Create IPv6 packet with large extension headers.
+// The extension headers push the L4 header far past the IPv6 base header,
+// exercising parse_transport's extension-header loop (dynptr-based, bounded by
+// IPV6_MAX_EXTENSIONS). Regression test for the old fast path's premature
+// -EFAULT on large packets.
 static __always_inline int
 set_ipv6_with_large_extensions(struct __sk_buff *skb,
 				__u32 saddr0, __u32 saddr1, __u32 saddr2, __u32 saddr3,
 				__u32 daddr0, __u32 daddr1, __u32 daddr2, __u32 daddr3,
 				__u16 sport, __u16 dport, __u8 l4proto)
 {
-	// Use exactly 512 bytes which is the HEADER_PULL_SIZE limit in parse_transport_fast
-	// This forces the fast path to handle extension headers at the boundary
+	// Use exactly 512 bytes to exercise the extension-header loop at scale.
 #define PACKET_SIZE 512
 
 	if (bpf_skb_change_tail(skb, PACKET_SIZE, 0))

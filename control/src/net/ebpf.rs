@@ -91,7 +91,10 @@ pub struct Daeparam {
     pub dae0peer_mac: [u8; 6],
     pub padding_after_mac: [u8; 2],
     pub use_redirect_peer: u8,
-    pub has_bpf_get_current_task: u8,
+    /// Previously has_bpf_get_current_task (always 0; the argv[0] real-name path
+    /// in tproxy.c was dead code in the Rust port and is removed). Kept as a
+    /// reserved byte to preserve struct layout. Keep in sync with tproxy.c.
+    pub reserved_task: u8,
     /// Reserved (DNS logic removed — DNS traffic is treated as ordinary traffic).
     /// Keeps the struct layout in sync with `struct dae_param` in tproxy.c.
     pub reserved_dns: u8,
@@ -115,7 +118,7 @@ impl Default for Daeparam {
             dae0peer_mac: [0u8; 6],
             padding_after_mac: [0u8; 2],
             use_redirect_peer: 0,
-            has_bpf_get_current_task: 0,
+            reserved_task: 0,
             reserved_dns: 0,
             reserved: 0,
             datapath_generation: 0,
@@ -749,23 +752,8 @@ impl EbpfManager {
 
     /// Adjust eBPF map parameters during the OpenObject phase (before load).
     /// Includes:
-    /// - fast_sock: set max_entries=1 to disable sockhash path
     /// - conn_state_map: set configurable max_entries
     fn adjust_maps_pre_load(&self, open_obj: &mut libbpf_rs::OpenObject) {
-        // fast_sock: set max_entries=1 to disable sockhash path
-        if let Some(mut map) = open_obj
-            .maps_mut()
-            .find(|m| m.name().to_str().unwrap_or("") == "fast_sock")
-        {
-            if let Err(e) = map.set_max_entries(1) {
-                warn!("Failed to set fast_sock max_entries=1: {}", e);
-            } else {
-                info!("fast_sock max_entries set to 1 (sockhash path disabled)");
-            }
-        } else {
-            debug!("fast_sock map not found in eBPF object (may be removed)");
-        }
-
         // conn_state_map: use configurable max_entries
         if let Some(mut map) = open_obj
             .maps_mut()

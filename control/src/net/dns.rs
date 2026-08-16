@@ -60,6 +60,10 @@ pub struct DnsQuery {
     pub qname: String,
     /// 查询类型（如 1=A, 28=AAAA, 5=CNAME）。
     pub qtype: u16,
+    /// 查询是否携带 EDNS(0) OPT 记录（影响响应是否含 OPT）。
+    pub has_edns: bool,
+    /// EDNS DO 位（DNSSEC OK）：影响响应是否包含 RRSIG 等 DNSSEC 记录。
+    pub do_bit: bool,
 }
 
 /// 解析 DNS 查询报文的最小实现：只读取 header + 第一个 question。
@@ -101,12 +105,49 @@ pub fn parse_dns_query(buf: &[u8]) -> Option<DnsQuery> {
         return None;
     }
     let qtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    pos += 4; // QTYPE + QCLASS
+
+    // 扫描 additional 段，识别 EDNS(0) OPT 记录与 DO 位（影响响应内容与缓存键）。
+    let (has_edns, do_bit) = parse_edns(buf, pos);
 
     Some(DnsQuery {
         id,
         qname: labels.join("."),
         qtype,
+        has_edns,
+        do_bit,
     })
+}
+
+/// 扫描 DNS 报文 additional 段，寻找 EDNS(0) OPT 记录（TYPE 41）。
+///
+/// OPT 的 TTL 字段（4 字节）编码为：ext-rcode(8) | version(8) | DO+Z(8) | Z(16)，
+/// DO 位是第 3 个字节的最高位（bit 15）。返回 `(has_edns, do_bit)`。
+fn parse_edns(buf: &[u8], mut pos: usize) -> (bool, bool) {
+    const TYPE_OPT: u16 = 41;
+    loop {
+        if pos + 11 > buf.len() {
+            return (false, false);
+        }
+        pos = match skip_name(buf, pos) {
+            Some(p) => p,
+            None => return (false, false),
+        };
+        if pos + 10 > buf.len() {
+            return (false, false);
+        }
+        let rtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let ttl = [buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]];
+        let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > buf.len() {
+            return (false, false);
+        }
+        if rtype == TYPE_OPT {
+            return (true, ttl[2] & 0x80 != 0);
+        }
+        pos += rdlength;
+    }
 }
 
 /// 读取系统 DNS 服务器（`/etc/resolv.conf` 的 `nameserver` 行）。
@@ -134,6 +175,16 @@ pub fn read_system_dns() -> Vec<SocketAddr> {
 }
 
 /// DNS 转发器。
+/// 直连路径 in-flight 查询合并的键（与缓存键一致：域/类型/EDNS/DO）。
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct FlightKey {
+    outbound: String,
+    qname: String,
+    qtype: u16,
+    has_edns: bool,
+    do_bit: bool,
+}
+
 pub struct DnsForwarder {
     /// 监听地址（内部地址，默认 `169.254.0.1:53`）。
     listen_addr: SocketAddr,
@@ -163,6 +214,9 @@ pub struct DnsForwarder {
     proxy_sessions: Mutex<HashMap<String, (String, Arc<dyn UdpSession>)>>,
     /// 每组合并锁：持久会话共享时同一时刻每组至多一个 in-flight 查询。
     group_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 直连路径 in-flight 查询合并：key → 完成通知器。同一 key（域/类型/EDNS/DO）
+    /// 的并发查询共享一次上游请求——发起者转发并写缓存后唤醒等待者重查缓存。
+    inflight: Mutex<HashMap<FlightKey, Arc<Notify>>>,
     /// 运行标志。
     running: Arc<AtomicBool>,
     /// 停止信号。
@@ -210,6 +264,7 @@ impl DnsForwarder {
             caches: Mutex::new(HashMap::new()),
             proxy_sessions: Mutex::new(HashMap::new()),
             group_locks: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             running: Arc::new(AtomicBool::new(false)),
             stop_signal: Arc::new(Notify::new()),
         })
@@ -340,22 +395,70 @@ impl DnsForwarder {
             DnsOutbound::Direct => {
                 let server = self.pick_direct_server()?;
                 let cache = self.get_cache("direct");
-                if let Some(resp) =
-                    self.cached_lookup(&cache, &parsed.qname, parsed.qtype, parsed.id)
-                {
+                if let Some(resp) = self.cached_lookup(
+                    &cache,
+                    &parsed.qname,
+                    parsed.qtype,
+                    parsed.has_edns,
+                    parsed.do_bit,
+                    parsed.id,
+                ) {
                     return Ok(resp);
                 }
-                let response = self.forward_direct(query, server).await?;
+                // In-flight 合并：同 key（域/类型/EDNS/DO）的并发查询共享一次上游请求。
+                let fkey = FlightKey {
+                    outbound: "direct".to_string(),
+                    qname: parsed.qname.clone(),
+                    qtype: parsed.qtype,
+                    has_edns: parsed.has_edns,
+                    do_bit: parsed.do_bit,
+                };
+                let (is_creator, notifier) = self.begin_inflight(&fkey);
+                if !is_creator {
+                    // 等待发起者完成；发起者成功后已写缓存，重查即可命中。
+                    notifier.notified().await;
+                    if let Some(resp) = self.cached_lookup(
+                        &cache,
+                        &parsed.qname,
+                        parsed.qtype,
+                        parsed.has_edns,
+                        parsed.do_bit,
+                        parsed.id,
+                    ) {
+                        return Ok(resp);
+                    }
+                    // 发起者失败未写缓存 → 自己转发保证响应（不重复登记）。
+                }
+                let response = match self.forward_direct(query, server).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.end_inflight(&fkey);
+                        return Err(e);
+                    }
+                };
+                self.end_inflight(&fkey);
                 Self::log_dns_result(&parsed.qname, "direct", server, &response);
-                self.cache_store(&cache, &parsed.qname, parsed.qtype, &response);
+                self.cache_store(
+                    &cache,
+                    &parsed.qname,
+                    parsed.qtype,
+                    parsed.has_edns,
+                    parsed.do_bit,
+                    &response,
+                );
                 Ok(response)
             }
             DnsOutbound::Group(group) => {
                 let cache_key = format!("group:{}", group);
                 let cache = self.get_cache(&cache_key);
-                if let Some(resp) =
-                    self.cached_lookup(&cache, &parsed.qname, parsed.qtype, parsed.id)
-                {
+                if let Some(resp) = self.cached_lookup(
+                    &cache,
+                    &parsed.qname,
+                    parsed.qtype,
+                    parsed.has_edns,
+                    parsed.do_bit,
+                    parsed.id,
+                ) {
                     return Ok(resp);
                 }
                 match self.group_dialers.get(&group) {
@@ -365,9 +468,14 @@ impl DnsForwarder {
                             // 查询，否则并发查询会在共享会话上互相抢走对方响应。
                             let _lock = self.group_lock(&group).await;
                             // 等锁期间前面的查询可能已填充本组缓存。
-                            if let Some(resp) =
-                                self.cached_lookup(&cache, &parsed.qname, parsed.qtype, parsed.id)
-                            {
+                            if let Some(resp) = self.cached_lookup(
+                                &cache,
+                                &parsed.qname,
+                                parsed.qtype,
+                                parsed.has_edns,
+                                parsed.do_bit,
+                                parsed.id,
+                            ) {
                                 return Ok(resp);
                             }
                             let response = match self
@@ -388,13 +496,25 @@ impl DnsForwarder {
                                     let response = self.forward_direct(query, server).await?;
                                     Self::log_dns_result(&parsed.qname, "direct-fallback", server, &response);
                                     self.cache_store(
-                                        &dcache, &parsed.qname, parsed.qtype, &response,
+                                        &dcache,
+                                        &parsed.qname,
+                                        parsed.qtype,
+                                        parsed.has_edns,
+                                        parsed.do_bit,
+                                        &response,
                                     );
                                     return Ok(response);
                                 }
                             };
                             Self::log_dns_result(&parsed.qname, "proxy", server, &response);
-                            self.cache_store(&cache, &parsed.qname, parsed.qtype, &response);
+                            self.cache_store(
+                                &cache,
+                                &parsed.qname,
+                                parsed.qtype,
+                                parsed.has_edns,
+                                parsed.do_bit,
+                                &response,
+                            );
                             Ok(response)
                         }
                         None => {
@@ -407,7 +527,14 @@ impl DnsForwarder {
                             let dcache = self.get_cache("direct");
                             let response = self.forward_direct(query, server).await?;
                             Self::log_dns_result(&parsed.qname, "direct-fallback", server, &response);
-                            self.cache_store(&dcache, &parsed.qname, parsed.qtype, &response);
+                            self.cache_store(
+                                &dcache,
+                                &parsed.qname,
+                                parsed.qtype,
+                                parsed.has_edns,
+                                parsed.do_bit,
+                                &response,
+                            );
                             Ok(response)
                         }
                     },
@@ -421,7 +548,14 @@ impl DnsForwarder {
                         let dcache = self.get_cache("direct");
                         let response = self.forward_direct(query, server).await?;
                         Self::log_dns_result(&parsed.qname, "direct-fallback", server, &response);
-                        self.cache_store(&dcache, &parsed.qname, parsed.qtype, &response);
+                        self.cache_store(
+                            &dcache,
+                            &parsed.qname,
+                            parsed.qtype,
+                            parsed.has_edns,
+                            parsed.do_bit,
+                            &response,
+                        );
                         Ok(response)
                     }
                 }
@@ -467,20 +601,30 @@ impl DnsForwarder {
         cache: &Mutex<DnsCache>,
         qname: &str,
         qtype: u16,
+        has_edns: bool,
+        do_bit: bool,
         id: u16,
     ) -> Option<Vec<u8>> {
         if !self.enable_cache {
             return None;
         }
         let cache = cache.lock().unwrap();
-        let mut resp = cache.get(qname, qtype)?;
+        let mut resp = cache.get(qname, qtype, has_edns, do_bit)?;
         rewrite_response_id(&mut resp, id);
         debug!(domain = %qname, "DNS cache hit");
         Some(resp)
     }
 
     /// 将新响应按 TTL 存入所属组的缓存（未启用缓存或 TTL 为 0 时跳过）。
-    fn cache_store(&self, cache: &Mutex<DnsCache>, qname: &str, qtype: u16, response: &[u8]) {
+    fn cache_store(
+        &self,
+        cache: &Mutex<DnsCache>,
+        qname: &str,
+        qtype: u16,
+        has_edns: bool,
+        do_bit: bool,
+        response: &[u8],
+    ) {
         if !self.enable_cache {
             return;
         }
@@ -488,7 +632,7 @@ impl DnsForwarder {
             cache
                 .lock()
                 .unwrap()
-                .insert(qname.to_string(), qtype, response.to_vec(), ttl);
+                .insert(qname.to_string(), qtype, has_edns, do_bit, response.to_vec(), ttl);
             debug!(domain = %qname, ttl = ttl, "DNS cache updated");
         }
     }
@@ -533,6 +677,32 @@ impl DnsForwarder {
             .with_context(|| format!("DNS direct query to {} timed out", server))??;
         buf.truncate(n);
         Ok(buf)
+    }
+
+    /// 登记一个 in-flight 查询。
+    ///
+    /// 返回 `(is_creator, notifier)`：
+    /// - `is_creator == true`：本调用是发起者，需要转发上游、写缓存，最后调用
+    ///   [`Self::end_inflight`] 唤醒等待者。
+    /// - `is_creator == false`：已有同 key 查询在途，`notifier` 是其完成通知器；
+    ///   等待其触发后应重查缓存（发起者成功后会写缓存）。
+    fn begin_inflight(&self, key: &FlightKey) -> (bool, Arc<Notify>) {
+        let mut inflight = self.inflight.lock().unwrap();
+        match inflight.get(key) {
+            Some(n) => (false, n.clone()),
+            None => {
+                let n = Arc::new(Notify::new());
+                inflight.insert(key.clone(), n.clone());
+                (true, n)
+            }
+        }
+    }
+
+    /// 结束一个 in-flight 查询并唤醒所有等待者。
+    fn end_inflight(&self, key: &FlightKey) {
+        if let Some(n) = self.inflight.lock().unwrap().remove(key) {
+            n.notify_waiters();
+        }
     }
 
     /// 取（或懒创建）某个代理组的合并锁，串行化该组的 in-flight 查询。
@@ -660,7 +830,7 @@ struct CacheEntry {
 ///
 /// 各组的缓存互不共享——不同代理组解析同一域名可能得到不同结果（污染隔离）。
 struct DnsCache {
-    entries: HashMap<(String, u16), CacheEntry>,
+    entries: HashMap<(String, u16, bool, bool), CacheEntry>,
 }
 
 impl DnsCache {
@@ -671,8 +841,11 @@ impl DnsCache {
     }
 
     /// 命中且未过期时返回缓存响应；否则 `None`。
-    fn get(&self, qname: &str, qtype: u16) -> Option<Vec<u8>> {
-        let e = self.entries.get(&(qname.to_string(), qtype))?;
+    ///
+    /// 缓存键包含 `has_edns` / `do_bit`：EDNS 或 DNSSEC(DO) 查询与普通查询互不
+    /// 共享响应，避免缓存中带 OPT / RRSIG 的响应被错误提供给普通查询（反之亦然）。
+    fn get(&self, qname: &str, qtype: u16, has_edns: bool, do_bit: bool) -> Option<Vec<u8>> {
+        let e = self.entries.get(&(qname.to_string(), qtype, has_edns, do_bit))?;
         if Instant::now() < e.expires {
             Some(e.response.clone())
         } else {
@@ -681,7 +854,15 @@ impl DnsCache {
     }
 
     /// 存入缓存（TTL 为 0 不缓存）。超容量时先清理过期项，仍满则整体清空。
-    fn insert(&mut self, qname: String, qtype: u16, response: Vec<u8>, ttl: u32) {
+    fn insert(
+        &mut self,
+        qname: String,
+        qtype: u16,
+        has_edns: bool,
+        do_bit: bool,
+        response: Vec<u8>,
+        ttl: u32,
+    ) {
         if ttl == 0 {
             return;
         }
@@ -692,7 +873,10 @@ impl DnsCache {
             }
         }
         let expires = Instant::now() + Duration::from_secs(u64::from(ttl));
-        self.entries.insert((qname, qtype), CacheEntry { response, expires });
+        self.entries.insert(
+            (qname, qtype, has_edns, do_bit),
+            CacheEntry { response, expires },
+        );
     }
 }
 
@@ -712,9 +896,7 @@ fn parse_response_min_ttl(response: &[u8]) -> Option<u32> {
     }
     let qdcount = u16::from_be_bytes([response[4], response[5]]) as usize;
     let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
-    if ancount == 0 {
-        return Some(0);
-    }
+    let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
 
     // 跳过 question 段
     let mut pos = DNS_HEADER_LEN;
@@ -724,6 +906,16 @@ fn parse_response_min_ttl(response: &[u8]) -> Option<u32> {
             return None;
         }
         pos += 4; // QTYPE + QCLASS
+    }
+
+    if ancount == 0 {
+        // 负缓存（RFC 2308）：仅对 NODATA(rcode=0) / NXDOMAIN(rcode=3) 生效，
+        // TTL 取 authority 段 SOA 的 min(TTL, MINIMUM)，上限 1 小时；无 SOA 不缓存。
+        let rcode = flags & 0x000F;
+        if rcode != 0 && rcode != 3 {
+            return Some(0);
+        }
+        return parse_negative_ttl(response, pos, nscount);
     }
 
     let mut min_ttl: Option<u32> = None;
@@ -750,6 +942,48 @@ fn parse_response_min_ttl(response: &[u8]) -> Option<u32> {
         });
     }
     min_ttl
+}
+
+/// RFC 2308 负缓存 TTL：在 authority 段找 SOA 记录，返回 `min(SOA TTL, MINIMUM)`，
+/// 上限 1 小时；无 SOA 返回 0（不缓存）。`pos` 为 question 段结束位置。
+const TYPE_SOA: u16 = 6;
+const NEGATIVE_TTL_CAP_SECS: u32 = 3600;
+
+fn parse_negative_ttl(response: &[u8], mut pos: usize, nscount: usize) -> Option<u32> {
+    for _ in 0..nscount {
+        pos = skip_name(response, pos)?;
+        if pos + 10 > response.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
+        let ttl = u32::from_be_bytes([
+            response[pos + 4],
+            response[pos + 5],
+            response[pos + 6],
+            response[pos + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlength > response.len() {
+            return None;
+        }
+        if rtype == TYPE_SOA {
+            // SOA RDATA = MNAME + RNAME + 5×u32（serial/refresh/retry/expire/minimum），
+            // MINIMUM 是 RDATA 末尾 4 字节；最小 RDATA 为 22 字节（两个根名 + 20）。
+            if rdlength < 22 {
+                return None;
+            }
+            let minimum = u32::from_be_bytes([
+                response[pos + rdlength - 4],
+                response[pos + rdlength - 3],
+                response[pos + rdlength - 2],
+                response[pos + rdlength - 1],
+            ]);
+            return Some(ttl.min(minimum).min(NEGATIVE_TTL_CAP_SECS));
+        }
+        pos += rdlength;
+    }
+    Some(0)
 }
 
 /// 跳过 DNS 名称（普通 label 序列或压缩指针），返回名称结束后的位置。
@@ -1036,24 +1270,170 @@ mod tests {
         // 每组独立缓存：组 A 有该条目，组 B 没有
         let f = test_forwarder(vec![], DnsOutbound::Direct);
         let cache_a = f.get_cache("group:a");
-        cache_a
-            .lock()
-            .unwrap()
-            .insert("example.com".into(), 1, build_response(1, "example.com", 300), 300);
+        cache_a.lock().unwrap().insert(
+            "example.com".into(),
+            1,
+            false,
+            false,
+            build_response(1, "example.com", 300),
+            300,
+        );
         let cache_b = f.get_cache("group:b");
-        assert!(cache_b.lock().unwrap().get("example.com", 1).is_none());
-        assert!(cache_a.lock().unwrap().get("example.com", 1).is_some());
+        assert!(cache_b.lock().unwrap().get("example.com", 1, false, false).is_none());
+        assert!(cache_a.lock().unwrap().get("example.com", 1, false, false).is_some());
     }
 
     #[test]
     fn test_cache_ttl_zero_not_cached() {
         let f = test_forwarder(vec![], DnsOutbound::Direct);
         let cache = f.get_cache("direct");
-        cache
-            .lock()
-            .unwrap()
-            .insert("example.com".into(), 1, build_response(1, "example.com", 300), 0);
-        assert!(cache.lock().unwrap().get("example.com", 1).is_none());
+        cache.lock().unwrap().insert(
+            "example.com".into(),
+            1,
+            false,
+            false,
+            build_response(1, "example.com", 300),
+            0,
+        );
+        assert!(cache.lock().unwrap().get("example.com", 1, false, false).is_none());
+    }
+
+    /// 构造带 EDNS(0) OPT 的查询（DO 位可选）。
+    fn build_query_edns(id: u16, qname: &str, qtype: u16, do_bit: bool) -> Vec<u8> {
+        let mut buf = build_query(id, qname, qtype);
+        buf[11] = 1; // ARCOUNT=1
+        buf.push(0); // OPT NAME = root
+        buf.extend_from_slice(&[0, 41]); // TYPE=OPT
+        buf.extend_from_slice(&[0x10, 0x00]); // CLASS = UDP payload 4096
+        let mut ttl = [0u8, 0, 0, 0];
+        if do_bit {
+            ttl[2] = 0x80; // DO
+        }
+        buf.extend_from_slice(&ttl);
+        buf.extend_from_slice(&[0, 0]); // RDLENGTH=0
+        buf
+    }
+
+    /// 构造 NXDOMAIN 响应：authority 段含一条 SOA（负缓存用）。
+    fn build_nxdomain_response(id: u16, qname: &str, soa_ttl: u32, soa_minimum: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&id.to_be_bytes());
+        buf.extend_from_slice(&[0x81, 0x83]); // QR=1, RD=1, RA=1, RCODE=3
+        buf.extend_from_slice(&[0, 1]); // QDCOUNT
+        buf.extend_from_slice(&[0, 0]); // ANCOUNT
+        buf.extend_from_slice(&[0, 1]); // NSCOUNT=1
+        buf.extend_from_slice(&[0, 0]); // ARCOUNT
+        for label in qname.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0);
+        buf.extend_from_slice(&[0, 1, 0, 1]); // QTYPE=A, QCLASS=IN
+        // authority: NAME = 压缩指针 → question QNAME
+        buf.extend_from_slice(&[0xC0, 0x0C]);
+        buf.extend_from_slice(&[0, 6]); // TYPE=SOA
+        buf.extend_from_slice(&[0, 1]); // CLASS=IN
+        buf.extend_from_slice(&soa_ttl.to_be_bytes());
+        // RDATA: MNAME(1 root) + RNAME(1 root) + 5×u32
+        let mut rdata = Vec::new();
+        rdata.push(0);
+        rdata.push(0);
+        rdata.extend_from_slice(&1u32.to_be_bytes()); // serial
+        rdata.extend_from_slice(&3600u32.to_be_bytes()); // refresh
+        rdata.extend_from_slice(&600u32.to_be_bytes()); // retry
+        rdata.extend_from_slice(&86400u32.to_be_bytes()); // expire
+        rdata.extend_from_slice(&soa_minimum.to_be_bytes()); // MINIMUM
+        buf.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&rdata);
+        buf
+    }
+
+    #[test]
+    fn test_parse_dns_query_edns_do() {
+        // 普通查询：无 EDNS
+        let parsed = parse_dns_query(&build_query(1, "example.com", 1)).unwrap();
+        assert!(!parsed.has_edns);
+        assert!(!parsed.do_bit);
+
+        // EDNS 无 DO
+        let parsed = parse_dns_query(&build_query_edns(1, "example.com", 1, false)).unwrap();
+        assert!(parsed.has_edns);
+        assert!(!parsed.do_bit);
+
+        // EDNS + DO
+        let parsed = parse_dns_query(&build_query_edns(1, "example.com", 1, true)).unwrap();
+        assert!(parsed.has_edns);
+        assert!(parsed.do_bit);
+    }
+
+    #[test]
+    fn test_cache_isolates_edns_do() {
+        let f = test_forwarder(vec![], DnsOutbound::Direct);
+        let cache = f.get_cache("direct");
+        cache.lock().unwrap().insert(
+            "example.com".into(),
+            1,
+            true, // has_edns
+            true, // do_bit
+            build_response(1, "example.com", 300),
+            300,
+        );
+        // 不同 EDNS/DO 组合互不命中
+        assert!(cache.lock().unwrap().get("example.com", 1, false, false).is_none());
+        assert!(cache.lock().unwrap().get("example.com", 1, true, false).is_none());
+        assert!(cache.lock().unwrap().get("example.com", 1, true, true).is_some());
+    }
+
+    #[test]
+    fn test_parse_response_min_ttl_nxdomain_soa() {
+        // NXDOMAIN + SOA：负缓存 TTL = min(TTL, MINIMUM)
+        let resp = build_nxdomain_response(1, "example.com", 600, 300);
+        assert_eq!(parse_response_min_ttl(&resp), Some(300));
+        // MINIMUM 更大时取 TTL
+        let resp = build_nxdomain_response(1, "example.com", 120, 300);
+        assert_eq!(parse_response_min_ttl(&resp), Some(120));
+        // 上限 1 小时
+        let resp = build_nxdomain_response(1, "example.com", 7200, 7200);
+        assert_eq!(parse_response_min_ttl(&resp), Some(3600));
+        // NXDOMAIN 但无 SOA → 不缓存
+        let mut no_soa = build_query(1, "example.com", 1);
+        no_soa[2] = 0x81;
+        no_soa[3] = 0x83; // RCODE=3
+        assert_eq!(parse_response_min_ttl(&no_soa), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_negative_cache_nxdomain() {
+        let f = test_forwarder(vec![], DnsOutbound::Direct);
+        let cache = f.get_cache("direct");
+        let nx = build_nxdomain_response(0xAAAA, "example.com", 600, 300);
+        f.cache_store(&cache, "example.com", 1, false, false, &nx);
+        // 命中并重写事务 ID
+        let resp = f
+            .cached_lookup(&cache, "example.com", 1, false, false, 0x1234)
+            .expect("NXDOMAIN should be negatively cached");
+        assert_eq!(resp[..2], [0x12, 0x34]);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_eq!(flags & 0x000F, 3); // NXDOMAIN
+    }
+
+    #[test]
+    fn test_inflight_coalescing_helpers() {
+        let f = test_forwarder(vec![], DnsOutbound::Direct);
+        let key = FlightKey {
+            outbound: "direct".to_string(),
+            qname: "example.com".to_string(),
+            qtype: 1,
+            has_edns: false,
+            do_bit: false,
+        };
+        // 第一个是发起者，第二个是等待者
+        assert!(f.begin_inflight(&key).0);
+        assert!(!f.begin_inflight(&key).0);
+        // 结束后可重新成为发起者
+        f.end_inflight(&key);
+        assert!(f.begin_inflight(&key).0);
+        f.end_inflight(&key);
     }
 
     #[test]
